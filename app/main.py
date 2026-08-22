@@ -116,6 +116,20 @@ def run_assignment(
     return {"status": "assignment pass complete"}
 
 
+@app.delete("/orders/all")
+def delete_all_orders(
+    current_user: models.User = Depends(auth.require_role("team_lead")),
+    db: Session = Depends(get_db),
+):
+    """
+    Deletes every work order — used to clear test/imported data for a fresh
+    run. Does NOT touch user accounts (Team Lead / colleague logins stay).
+    """
+    deleted_count = db.query(models.WorkOrder).delete()
+    db.commit()
+    return {"deleted": deleted_count}
+
+
 # ---------------------------------------------------------------------------
 # Inventory import (E-O) — Team Lead bulk-loads from the existing Excel export
 # ---------------------------------------------------------------------------

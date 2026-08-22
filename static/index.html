@@ -59,6 +59,7 @@
       <input type="file" id="import-file" style="display:none;">
       <button class="action-btn" id="import-btn" style="display:none;" onclick="document.getElementById('import-file').click()">Import Inventory CSV</button>
       <button class="action-btn" id="run-assign-btn" style="display:none;" onclick="runAssignment()">Run Assignment Now</button>
+      <button class="action-btn" id="clear-data-btn" style="display:none; background:#b23b3b;" onclick="clearAllData()">Clear All Data</button>
       <button class="action-btn" onclick="loadOrders()">Refresh</button>
     </div>
     <div id="grid-container"></div>
@@ -156,6 +157,7 @@ function showApp() {
   if (role === "team_lead") {
     document.getElementById("import-btn").style.display = "inline-block";
     document.getElementById("run-assign-btn").style.display = "inline-block";
+    document.getElementById("clear-data-btn").style.display = "inline-block";
     document.getElementById("import-file").addEventListener("change", importCSV);
   }
   loadOrders();
@@ -186,6 +188,24 @@ async function runAssignment() {
     return;
   }
   alert("Assignment pass complete.");
+  loadOrders();
+}
+
+async function clearAllData() {
+  const sure = confirm("This will permanently delete ALL imported work orders (not user logins). This cannot be undone. Continue?");
+  if (!sure) return;
+  const typed = prompt('Type DELETE to confirm.');
+  if (typed !== "DELETE") {
+    alert("Cancelled — nothing was deleted.");
+    return;
+  }
+  const res = await authFetch("/orders/all", {method:"DELETE"});
+  if (!res.ok) {
+    alert("Delete failed: " + (await res.text()));
+    return;
+  }
+  const data = await res.json();
+  alert(`Deleted ${data.deleted} work order(s).`);
   loadOrders();
 }
 
