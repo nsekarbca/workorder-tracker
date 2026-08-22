@@ -30,10 +30,7 @@ app.add_middleware(
 def bootstrap_first_team_lead():
     """
     Creates the very first Team Lead login automatically, from environment
-    variables, if no users exist yet. This means no local script and no
-    Python install is needed on your machine — just set BOOTSTRAP_USERNAME
-    and BOOTSTRAP_PASSWORD as env vars on Render and the account is ready
-    the moment the app deploys.
+    variables, if no users exist yet.
     """
     db = SessionLocal()
     try:
@@ -90,6 +87,8 @@ def register_user(
     db.add(user)
     db.commit()
     db.refresh(user)
+    if role == "colleague":
+        _auto_assign_open_slots(db)
     return user
 
 
