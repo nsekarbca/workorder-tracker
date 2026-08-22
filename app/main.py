@@ -1,0 +1,273 @@
+from datetime import date, datetime
+from typing import List, Optional
+
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy.orm import Session
+import csv
+import io
+
+import os
+
+from . import models, schemas, auth
+from .database import Base, engine, get_db, SessionLocal
+
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Work Order Allocation Tracker")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def bootstrap_first_team_lead():
+    """
+    Creates the very first Team Lead login automatically, from environment
+    variables, if no users exist yet. This means no local script and no
+    Python install is needed on your machine — just set BOOTSTRAP_USERNAME
+    and BOOTSTRAP_PASSWORD as env vars on Render and the account is ready
+    the moment the app deploys.
+    """
+    db = SessionLocal()
+    try:
+        if db.query(models.User).first() is not None:
+            return
+        username = os.getenv("BOOTSTRAP_USERNAME")
+        password = os.getenv("BOOTSTRAP_PASSWORD")
+        if not username or not password:
+            return
+        db.add(models.User(
+            username=username,
+            full_name="Team Lead",
+            role="team_lead",
+            password_hash=auth.hash_password(password),
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
+@app.post("/auth/login")
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.username == form_data.username).first()
+    if not user or not auth.verify_password(form_data.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    token = auth.create_access_token({"sub": user.username})
+    return {"access_token": token, "token_type": "bearer", "role": user.role, "full_name": user.full_name}
+
+
+@app.post("/auth/register", response_model=schemas.UserOut)
+def register_user(
+    username: str,
+    full_name: str,
+    password: str,
+    role: str,
+    current_user: models.User = Depends(auth.require_role("team_lead")),
+    db: Session = Depends(get_db),
+):
+    """Only a team lead can create new logins (colleagues or other leads)."""
+    if role not in ("team_lead", "colleague"):
+        raise HTTPException(status_code=400, detail="role must be 'team_lead' or 'colleague'")
+    if db.query(models.User).filter(models.User.username == username).first():
+        raise HTTPException(status_code=400, detail="username already exists")
+    user = models.User(
+        username=username,
+        full_name=full_name,
+        password_hash=auth.hash_password(password),
+        role=role,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@app.get("/auth/me", response_model=schemas.UserOut)
+def read_me(current_user: models.User = Depends(auth.get_current_user)):
+    return current_user
+
+
+# ---------------------------------------------------------------------------
+# Inventory import (E-O) — Team Lead bulk-loads from the existing Excel export
+# ---------------------------------------------------------------------------
+
+@app.post("/orders/import")
+def import_inventory(
+    file: UploadFile = File(...),
+    current_user: models.User = Depends(auth.require_role("team_lead")),
+    db: Session = Depends(get_db),
+):
+    """
+    Accepts a CSV with columns matching E-O:
+    edm,status,created,image_count,doc_count,def_doc_type,amount,description,division,deposit_date
+    Creates one unassigned WorkOrder row per line.
+    """
+    content = file.file.read().decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(content))
+    created_count = 0
+    for row in reader:
+        order = models.WorkOrder(
+            edm=row.get("edm") or None,
+            status=row.get("status") or None,
+            created=_parse_dt(row.get("created")),
+            image_count=_parse_int(row.get("image_count")),
+            doc_count=_parse_int(row.get("doc_count")),
+            def_doc_type=row.get("def_doc_type") or None,
+            amount=_parse_float(row.get("amount")),
+            description=row.get("description") or None,
+            division=row.get("division") or None,
+            deposit_date=_parse_date(row.get("deposit_date")),
+            last_edited_by=current_user.username,
+        )
+        db.add(order)
+        created_count += 1
+    db.commit()
+    _auto_assign_open_slots(db)
+    return {"imported": created_count}
+
+
+def _parse_date(v: Optional[str]) -> Optional[date]:
+    if not v:
+        return None
+    return datetime.strptime(v.strip(), "%Y-%m-%d").date()
+
+
+def _parse_dt(v: Optional[str]) -> Optional[datetime]:
+    if not v:
+        return None
+    return datetime.strptime(v.strip(), "%Y-%m-%d %H:%M:%S")
+
+
+def _parse_int(v: Optional[str]) -> Optional[int]:
+    return int(v) if v not in (None, "") else None
+
+
+def _parse_float(v: Optional[str]) -> Optional[float]:
+    return float(v) if v not in (None, "") else None
+
+
+# ---------------------------------------------------------------------------
+# Assignment logic — one open file per colleague at a time (round-robin)
+# ---------------------------------------------------------------------------
+
+def _auto_assign_open_slots(db: Session):
+    """
+    For every colleague who currently has no open (non-completed) order,
+    hand them the oldest unassigned order. Mirrors the 'application-based'
+    model: one open file per user; finishing it pulls the next one in.
+    """
+    colleagues = db.query(models.User).filter(models.User.role == "colleague").all()
+    for colleague in colleagues:
+        has_open = (
+            db.query(models.WorkOrder)
+            .filter(
+                models.WorkOrder.assigned_to_id == colleague.id,
+                models.WorkOrder.posting_status != "Completed",
+            )
+            .first()
+        )
+        if has_open:
+            continue
+        next_order = (
+            db.query(models.WorkOrder)
+            .filter(models.WorkOrder.assigned_to_id.is_(None))
+            .order_by(models.WorkOrder.id.asc())
+            .first()
+        )
+        if next_order:
+            next_order.assigned_to_id = colleague.id
+            next_order.assigned_date = date.today()
+            db.add(next_order)
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Read endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/orders", response_model=List[schemas.WorkOrderOut])
+def list_orders(current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
+    query = db.query(models.WorkOrder)
+    if current_user.role == "colleague":
+        query = query.filter(models.WorkOrder.assigned_to_id == current_user.id)
+    return query.order_by(models.WorkOrder.id.asc()).all()
+
+
+@app.get("/orders/{order_id}", response_model=schemas.WorkOrderOut)
+def get_order(order_id: int, current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
+    order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if current_user.role == "colleague" and order.assigned_to_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not your assigned order")
+    return order
+
+
+# ---------------------------------------------------------------------------
+# Write endpoints — split by role, matching column ownership A-D / P-Z
+# ---------------------------------------------------------------------------
+
+@app.patch("/orders/{order_id}/team-lead", response_model=schemas.WorkOrderOut)
+def update_team_lead_fields(
+    order_id: int,
+    payload: schemas.TeamLeadUpdate,
+    current_user: models.User = Depends(auth.require_role("team_lead")),
+    db: Session = Depends(get_db),
+):
+    order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    for field, value in payload.dict(exclude_unset=True).items():
+        setattr(order, field, value)
+    order.last_edited_by = current_user.username
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+@app.patch("/orders/{order_id}/colleague", response_model=schemas.WorkOrderOut)
+def update_colleague_fields(
+    order_id: int,
+    payload: schemas.ColleagueUpdate,
+    current_user: models.User = Depends(auth.require_role("colleague")),
+    db: Session = Depends(get_db),
+):
+    order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.assigned_to_id != current_user.id:
+        raise HTTPException(status_code=403, detail="This order is not assigned to you")
+
+    for field, value in payload.dict(exclude_unset=True).items():
+        setattr(order, field, value)
+    order.last_edited_by = current_user.username
+
+    # TAT = Posted Date - Received Date, excluding the issue pause window
+    if order.posted_date and order.received_date:
+        pause_days = 0
+        if order.issue_raised_date and order.issue_closed_date:
+            pause_days = (order.issue_closed_date - order.issue_raised_date).days
+        order.tat_days = (order.posted_date - order.received_date).days - pause_days
+
+    db.commit()
+    db.refresh(order)
+
+    if order.posting_status == "Completed":
+        _auto_assign_open_slots(db)
+
+    return order
+
+
+# Serve the single-file frontend prototype
+app.mount("/", StaticFiles(directory="static", html=True), name="static")

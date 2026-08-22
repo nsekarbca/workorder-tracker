@@ -1,0 +1,4 @@
+edm,status,created,image_count,doc_count,def_doc_type,amount,description,division,deposit_date
+EDM-1001,Open,2026-08-01 09:15:00,3,2,EOB,1250.00,Manual EFT EOB batch,Division A,2026-08-01
+EDM-1002,Open,2026-08-01 09:20:00,1,1,Unmatched EOB,430.50,Unmatched payment,Division B,2026-08-01
+EDM-1003,Open,2026-08-01 09:25:00,2,2,Collection,980.00,Collections line item,Division A,2026-08-01

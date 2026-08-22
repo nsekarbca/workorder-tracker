@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Work Order Allocation Tracker</title>
+<style>
+  :root {
+    --brown: #7a3b1e;
+    --teal: #1a6b8a;
+    --purple: #7a2a6b;
+    --green: #2fa63f;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: Segoe UI, Arial, sans-serif; margin: 0; background: #f4f4f6; color: #222; }
+  header { background: var(--purple); color: white; padding: 14px 20px; display: flex; justify-content: space-between; align-items: center; }
+  header h1 { font-size: 18px; margin: 0; }
+  #login-screen { max-width: 340px; margin: 80px auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.1); }
+  #login-screen input { width: 100%; padding: 8px; margin: 6px 0 14px; border: 1px solid #ccc; border-radius: 4px; }
+  #login-screen button, .action-btn { background: var(--teal); color: white; border: none; padding: 9px 16px; border-radius: 4px; cursor: pointer; }
+  #login-screen button:hover, .action-btn:hover { opacity: .9; }
+  #app { display: none; padding: 16px; }
+  table { border-collapse: collapse; width: 100%; background: white; font-size: 12px; }
+  th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; white-space: nowrap; }
+  th.tl { background: var(--brown); color: white; }
+  th.inv { background: var(--teal); color: white; }
+  th.col { background: var(--purple); color: white; }
+  th.tat { background: var(--green); color: white; }
+  tr:nth-child(even) { background: #fafafa; }
+  input.cell-edit { width: 90px; font-size: 12px; padding: 2px 4px; }
+  #toolbar { margin-bottom: 12px; display: flex; gap: 10px; align-items: center; }
+  .badge { background: #eee; padding: 4px 10px; border-radius: 12px; font-size: 12px; }
+  #error-msg { color: #c0392b; font-size: 13px; min-height: 18px; }
+</style>
+</head>
+<body>
+
+<div id="login-screen">
+  <h2>Work Order Tracker</h2>
+  <label>Username</label>
+  <input id="login-username" autocomplete="username">
+  <label>Password</label>
+  <input id="login-password" type="password" autocomplete="current-password">
+  <div id="error-msg"></div>
+  <button onclick="login()">Log In</button>
+</div>
+
+<div id="app">
+  <header>
+    <h1>Work Order Allocation Tracker</h1>
+    <div>
+      <span id="whoami" class="badge"></span>
+      <button class="action-btn" onclick="logout()">Log out</button>
+    </div>
+  </header>
+
+  <div style="padding: 16px;">
+    <div id="toolbar">
+      <span id="role-note" class="badge"></span>
+      <input type="file" id="import-file" style="display:none;">
+      <button class="action-btn" id="import-btn" style="display:none;" onclick="document.getElementById('import-file').click()">Import Inventory CSV</button>
+      <button class="action-btn" onclick="loadOrders()">Refresh</button>
+    </div>
+    <div id="grid-container"></div>
+  </div>
+</div>
+
+<script>
+const API = ""; // same origin
+let token = localStorage.getItem("wot_token") || "";
+let role = localStorage.getItem("wot_role") || "";
+let fullName = localStorage.getItem("wot_name") || "";
+
+const COLUMNS = [
+  {k:"received_date", label:"Received Date", group:"tl"},
+  {k:"assigned_date", label:"Assigned Date", group:"tl"},
+  {k:"employee_id", label:"Employee", group:"tl"},
+  {k:"employee_name", label:"Employee Name", group:"tl"},
+  {k:"edm", label:"EDM", group:"inv"},
+  {k:"status", label:"Status", group:"inv"},
+  {k:"created", label:"Created", group:"inv"},
+  {k:"image_count", label:"Image", group:"inv"},
+  {k:"doc_count", label:"Doc", group:"inv"},
+  {k:"def_doc_type", label:"Def Doc Type", group:"inv"},
+  {k:"amount", label:"Amount", group:"inv"},
+  {k:"last_edited_by", label:"Last Edited By", group:"inv"},
+  {k:"description", label:"Description", group:"inv"},
+  {k:"division", label:"Division", group:"inv"},
+  {k:"deposit_date", label:"Deposit Date", group:"inv"},
+  {k:"posted_amount", label:"Posted $", group:"col"},
+  {k:"pending_amount", label:"Pending $", group:"col"},
+  {k:"bar_batch", label:"BAR Batch", group:"col"},
+  {k:"trans_count", label:"Trans Count", group:"col"},
+  {k:"posting_status", label:"Posting Status", group:"col"},
+  {k:"poster_comment", label:"Poster Comment", group:"col"},
+  {k:"ventra_comment", label:"VENTRA Comment", group:"col"},
+  {k:"escalation_category", label:"Escalation Category", group:"col"},
+  {k:"issue_raised_date", label:"Issue Raised Date", group:"col"},
+  {k:"issue_closed_date", label:"Issue Closed Date", group:"col"},
+  {k:"posted_date", label:"Posted Date", group:"col"},
+  {k:"tat_days", label:"TAT", group:"tat"},
+];
+
+const TL_FIELDS = ["received_date","assigned_date","employee_id","employee_name"];
+const COL_FIELDS = ["posted_amount","pending_amount","bar_batch","trans_count","posting_status",
+  "poster_comment","ventra_comment","escalation_category","issue_raised_date","issue_closed_date","posted_date"];
+
+if (token) showApp();
+
+async function login() {
+  const username = document.getElementById("login-username").value;
+  const password = document.getElementById("login-password").value;
+  const body = new URLSearchParams({username, password});
+  const res = await fetch(API + "/auth/login", {method:"POST", body});
+  if (!res.ok) {
+    document.getElementById("error-msg").textContent = "Login failed. Check username/password.";
+    return;
+  }
+  const data = await res.json();
+  token = data.access_token; role = data.role; fullName = data.full_name;
+  localStorage.setItem("wot_token", token);
+  localStorage.setItem("wot_role", role);
+  localStorage.setItem("wot_name", fullName);
+  showApp();
+}
+
+function logout() {
+  localStorage.clear();
+  location.reload();
+}
+
+function showApp() {
+  document.getElementById("login-screen").style.display = "none";
+  document.getElementById("app").style.display = "block";
+  document.getElementById("whoami").textContent = `${fullName} (${role})`;
+  document.getElementById("role-note").textContent = role === "team_lead"
+    ? "Editing: Received/Assigned Date, Employee, Employee Name"
+    : "Editing: your assigned order's Posted $, Pending $, Posting Status, comments, dates";
+  if (role === "team_lead") {
+    document.getElementById("import-btn").style.display = "inline-block";
+    document.getElementById("import-file").addEventListener("change", importCSV);
+  }
+  loadOrders();
+}
+
+async function authFetch(path, opts={}) {
+  opts.headers = Object.assign({}, opts.headers, {"Authorization": "Bearer " + token});
+  const res = await fetch(API + path, opts);
+  if (res.status === 401) { logout(); throw new Error("Session expired"); }
+  return res;
+}
+
+async function importCSV(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append("file", file);
+  const res = await authFetch("/orders/import", {method:"POST", body: form});
+  const data = await res.json();
+  alert(`Imported ${data.imported} rows`);
+  loadOrders();
+}
+
+async function loadOrders() {
+  const res = await authFetch("/orders");
+  const orders = await res.json();
+  renderGrid(orders);
+}
+
+function renderGrid(orders) {
+  let html = "<table><thead><tr>";
+  COLUMNS.forEach(c => html += `<th class="${c.group}">${c.label}</th>`);
+  html += "</tr></thead><tbody>";
+  orders.forEach(o => {
+    html += `<tr>`;
+    COLUMNS.forEach(c => {
+      const editable = (role === "team_lead" && TL_FIELDS.includes(c.k)) ||
+                        (role === "colleague" && COL_FIELDS.includes(c.k));
+      const val = o[c.k] ?? "";
+      if (editable) {
+        html += `<td><input class="cell-edit" data-id="${o.id}" data-field="${c.k}" value="${val}" onchange="saveField(this)"></td>`;
+      } else {
+        html += `<td>${val}</td>`;
+      }
+    });
+    html += `</tr>`;
+  });
+  html += "</tbody></table>";
+  document.getElementById("grid-container").innerHTML = html || "<p>No orders.</p>";
+}
+
+async function saveField(input) {
+  const id = input.dataset.id;
+  const field = input.dataset.field;
+  const value = input.value;
+  const endpoint = role === "team_lead" ? `/orders/${id}/team-lead` : `/orders/${id}/colleague`;
+  const res = await authFetch(endpoint, {
+    method: "PATCH",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({[field]: value === "" ? null : value})
+  });
+  if (!res.ok) {
+    alert("Save failed: " + (await res.text()));
+    return;
+  }
+  loadOrders();
+}
+</script>
+</body>
+</html>
