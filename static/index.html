@@ -58,6 +58,7 @@
       <span id="role-note" class="badge"></span>
       <input type="file" id="import-file" style="display:none;">
       <button class="action-btn" id="import-btn" style="display:none;" onclick="document.getElementById('import-file').click()">Import Inventory CSV</button>
+      <button class="action-btn" id="run-assign-btn" style="display:none;" onclick="runAssignment()">Run Assignment Now</button>
       <button class="action-btn" onclick="loadOrders()">Refresh</button>
     </div>
     <div id="grid-container"></div>
@@ -137,6 +138,7 @@ function showApp() {
     : "Editing: your assigned order's Posted $, Pending $, Posting Status, comments, dates";
   if (role === "team_lead") {
     document.getElementById("import-btn").style.display = "inline-block";
+    document.getElementById("run-assign-btn").style.display = "inline-block";
     document.getElementById("import-file").addEventListener("change", importCSV);
   }
   loadOrders();
@@ -157,6 +159,16 @@ async function importCSV(e) {
   const res = await authFetch("/orders/import", {method:"POST", body: form});
   const data = await res.json();
   alert(`Imported ${data.imported} rows`);
+  loadOrders();
+}
+
+async function runAssignment() {
+  const res = await authFetch("/orders/run-assignment", {method:"POST"});
+  if (!res.ok) {
+    alert("Assignment run failed: " + (await res.text()));
+    return;
+  }
+  alert("Assignment pass complete.");
   loadOrders();
 }
 
