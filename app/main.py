@@ -30,7 +30,10 @@ app.add_middleware(
 def bootstrap_first_team_lead():
     """
     Creates the very first Team Lead login automatically, from environment
-    variables, if no users exist yet.
+    variables, if no users exist yet. This means no local script and no
+    Python install is needed on your machine — just set BOOTSTRAP_USERNAME
+    and BOOTSTRAP_PASSWORD as env vars on Render and the account is ready
+    the moment the app deploys.
     """
     db = SessionLocal()
     try:
@@ -95,6 +98,20 @@ def register_user(
 @app.get("/auth/me", response_model=schemas.UserOut)
 def read_me(current_user: models.User = Depends(auth.get_current_user)):
     return current_user
+
+
+@app.post("/orders/run-assignment")
+def run_assignment(
+    current_user: models.User = Depends(auth.require_role("team_lead")),
+    db: Session = Depends(get_db),
+):
+    """
+    Manually re-runs the auto-assignment pass. Use this any time a colleague
+    ends up with no open order and needs to be caught up — e.g. right after
+    creating a new colleague account, in case it wasn't picked up automatically.
+    """
+    _auto_assign_open_slots(db)
+    return {"status": "assignment pass complete"}
 
 
 # ---------------------------------------------------------------------------
