@@ -82,13 +82,12 @@ const COLUMNS = [
   {k:"image_count", label:"Image", group:"inv"},
   {k:"doc_count", label:"Doc", group:"inv"},
   {k:"def_doc_type", label:"Def Doc Type", group:"inv"},
-  {k:"amount", label:"Amount", group:"inv"},
-  {k:"last_edited_by", label:"Last Edited By", group:"inv"},
+  {k:"amount", label:"Amount", group:"inv", currency:true},
   {k:"description", label:"Description", group:"inv"},
   {k:"division", label:"Division", group:"inv"},
   {k:"deposit_date", label:"Deposit Date", group:"inv"},
-  {k:"posted_amount", label:"Posted $", group:"col"},
-  {k:"pending_amount", label:"Pending $", group:"col"},
+  {k:"posted_amount", label:"Posted $", group:"col", currency:true},
+  {k:"pending_amount", label:"Pending $", group:"col", currency:true},
   {k:"bar_batch", label:"BAR Batch", group:"col"},
   {k:"trans_count", label:"Trans Count", group:"col"},
   {k:"posting_status", label:"Posting Status", group:"col"},
@@ -101,9 +100,27 @@ const COLUMNS = [
   {k:"tat_days", label:"TAT", group:"tat"},
 ];
 
-const TL_FIELDS = ["received_date","assigned_date","employee_id","employee_name"];
+// A-D fields are now auto-populated on import/assignment, never manually typed.
+const TL_FIELDS = [];
 const COL_FIELDS = ["posted_amount","pending_amount","bar_batch","trans_count","posting_status",
   "poster_comment","ventra_comment","escalation_category","issue_raised_date","issue_closed_date","posted_date"];
+// Colleagues don't need to see the Team-Lead-owned columns at all.
+const HIDDEN_FOR_COLLEAGUE = ["received_date","assigned_date","employee_id","employee_name"];
+const POSTING_STATUS_OPTIONS = ["In-Process", "Clarification", "Completed"];
+const ESCALATION_OPTIONS = ["Patient not found", "DUVA Verification", "EOB not found", "Invoice Creation", "Other"];
+
+function formatCurrency(val) {
+  if (val === null || val === undefined || val === "") return "";
+  const num = parseFloat(val);
+  if (isNaN(num)) return val;
+  return "$" + num.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+}
+
+function parseCurrency(val) {
+  if (val === "" || val === null || val === undefined) return null;
+  const cleaned = String(val).replace(/[^0-9.-]/g, "");
+  return cleaned === "" ? null : cleaned;
+}
 
 if (token) showApp();
 
@@ -134,8 +151,8 @@ function showApp() {
   document.getElementById("app").style.display = "block";
   document.getElementById("whoami").textContent = `${fullName} (${role})`;
   document.getElementById("role-note").textContent = role === "team_lead"
-    ? "Editing: Received/Assigned Date, Employee, Employee Name"
-    : "Editing: your assigned order's Posted $, Pending $, Posting Status, comments, dates";
+    ? "Received Date, Assigned Date, Employee, and Employee Name are set automatically"
+    : "Editing: your assigned order's Posted $, Pending $, Posting Status, comments, dates \u2014 locked once Completed";
   if (role === "team_lead") {
     document.getElementById("import-btn").style.display = "inline-block";
     document.getElementById("run-assign-btn").style.display = "inline-block";
@@ -178,20 +195,69 @@ async function loadOrders() {
   renderGrid(orders);
 }
 
+function visibleColumns() {
+  if (role === "colleague") {
+    return COLUMNS.filter(c => !HIDDEN_FOR_COLLEAGUE.includes(c.k));
+  }
+  return COLUMNS;
+}
+
 function renderGrid(orders) {
+  const cols = visibleColumns();
   let html = "<table><thead><tr>";
-  COLUMNS.forEach(c => html += `<th class="${c.group}">${c.label}</th>`);
+  cols.forEach(c => html += `<th class="${c.group}">${c.label}</th>`);
   html += "</tr></thead><tbody>";
+
   orders.forEach(o => {
+    const locked = role === "colleague" && o.posting_status === "Completed";
     html += `<tr>`;
-    COLUMNS.forEach(c => {
-      const editable = (role === "team_lead" && TL_FIELDS.includes(c.k)) ||
-                        (role === "colleague" && COL_FIELDS.includes(c.k));
-      const val = o[c.k] ?? "";
+    cols.forEach(c => {
+      const editableBase = (role === "team_lead" && TL_FIELDS.includes(c.k)) ||
+                            (role === "colleague" && COL_FIELDS.includes(c.k));
+      const editable = editableBase && !locked;
+      const rawVal = o[c.k] ?? "";
+
+      if (c.k === "posting_status" && editable) {
+        html += `<td><select class="cell-edit" data-id="${o.id}" data-field="posting_status" onchange="saveField(this)">`;
+        POSTING_STATUS_OPTIONS.forEach(opt => {
+          html += `<option value="${opt}" ${opt === rawVal ? "selected" : ""}>${opt}</option>`;
+        });
+        html += `</select></td>`;
+        return;
+      }
+
+      if (c.k === "escalation_category") {
+        const enabled = editable && o.posting_status === "Clarification";
+        if (role === "colleague") {
+          html += `<td><select class="cell-edit" data-id="${o.id}" data-field="escalation_category" onchange="saveField(this)" ${enabled ? "" : "disabled"}>`;
+          html += `<option value=""></option>`;
+          ESCALATION_OPTIONS.forEach(opt => {
+            html += `<option value="${opt}" ${opt === rawVal ? "selected" : ""}>${opt}</option>`;
+          });
+          html += `</select></td>`;
+          return;
+        }
+      }
+
+      if (c.k === "poster_comment" && role === "colleague") {
+        const enabled = editable && o.posting_status === "Clarification";
+        html += `<td><input class="cell-edit" data-id="${o.id}" data-field="poster_comment" value="${rawVal}" onchange="saveField(this)" ${enabled ? "" : "disabled"}></td>`;
+        return;
+      }
+
+      if (c.currency) {
+        if (editable) {
+          html += `<td><input class="cell-edit" data-id="${o.id}" data-field="${c.k}" data-currency="1" value="${formatCurrency(rawVal)}" onchange="saveField(this)"></td>`;
+        } else {
+          html += `<td>${formatCurrency(rawVal)}</td>`;
+        }
+        return;
+      }
+
       if (editable) {
-        html += `<td><input class="cell-edit" data-id="${o.id}" data-field="${c.k}" value="${val}" onchange="saveField(this)"></td>`;
+        html += `<td><input class="cell-edit" data-id="${o.id}" data-field="${c.k}" value="${rawVal}" onchange="saveField(this)"></td>`;
       } else {
-        html += `<td>${val}</td>`;
+        html += `<td>${rawVal}</td>`;
       }
     });
     html += `</tr>`;
@@ -203,12 +269,14 @@ function renderGrid(orders) {
 async function saveField(input) {
   const id = input.dataset.id;
   const field = input.dataset.field;
-  const value = input.value;
+  let value = input.value;
+  if (input.dataset.currency) value = parseCurrency(value);
+  if (value === "") value = null;
   const endpoint = role === "team_lead" ? `/orders/${id}/team-lead` : `/orders/${id}/colleague`;
   const res = await authFetch(endpoint, {
     method: "PATCH",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({[field]: value === "" ? null : value})
+    body: JSON.stringify({[field]: value})
   });
   if (!res.ok) {
     alert("Save failed: " + (await res.text()));

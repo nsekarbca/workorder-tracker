@@ -73,6 +73,7 @@ def register_user(
     full_name: str,
     password: str,
     role: str,
+    employee_id: Optional[str] = None,
     current_user: models.User = Depends(auth.require_role("team_lead")),
     db: Session = Depends(get_db),
 ):
@@ -86,6 +87,7 @@ def register_user(
         full_name=full_name,
         password_hash=auth.hash_password(password),
         role=role,
+        employee_id=employee_id,
     )
     db.add(user)
     db.commit()
@@ -132,8 +134,10 @@ def import_inventory(
     content = file.file.read().decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(content))
     created_count = 0
+    today = date.today()
     for row in reader:
         order = models.WorkOrder(
+            received_date=today,
             edm=row.get("edm") or None,
             status=row.get("status") or None,
             created=_parse_dt(row.get("created")),
@@ -204,6 +208,9 @@ def _auto_assign_open_slots(db: Session):
         if next_order:
             next_order.assigned_to_id = colleague.id
             next_order.assigned_date = date.today()
+            next_order.employee_id = colleague.employee_id or colleague.username
+            next_order.employee_name = colleague.full_name
+            next_order.posting_status = "In-Process"
             db.add(next_order)
     db.commit()
 
@@ -264,10 +271,26 @@ def update_colleague_fields(
         raise HTTPException(status_code=404, detail="Order not found")
     if order.assigned_to_id != current_user.id:
         raise HTTPException(status_code=403, detail="This order is not assigned to you")
+    if order.posting_status == "Completed":
+        raise HTTPException(status_code=403, detail="This order is completed and locked for further edits")
 
-    for field, value in payload.dict(exclude_unset=True).items():
+    payload_data = payload.dict(exclude_unset=True)
+    if "posting_status" in payload_data and payload_data["posting_status"] not in (
+        "Completed", "In-Process", "Clarification"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="posting_status must be 'Completed', 'In-Process', or 'Clarification'",
+        )
+
+    for field, value in payload_data.items():
         setattr(order, field, value)
     order.last_edited_by = current_user.username
+
+    # Auto-set Issue Raised Date the moment a colleague flags Clarification,
+    # if it isn't already set.
+    if order.posting_status == "Clarification" and not order.issue_raised_date:
+        order.issue_raised_date = date.today()
 
     # TAT = Posted Date - Received Date, excluding the issue pause window
     if order.posted_date and order.received_date:

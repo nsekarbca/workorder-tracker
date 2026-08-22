@@ -13,6 +13,9 @@ class User(Base):
     password_hash = Column(String, nullable=False)
     # role: "team_lead" or "colleague"
     role = Column(String, nullable=False, default="colleague")
+    # Optional staff/employee ID, copied onto WorkOrder.employee_id automatically
+    # at assignment time. Falls back to username if not set.
+    employee_id = Column(String, nullable=True)
 
     orders = relationship("WorkOrder", back_populates="assignee")
 
