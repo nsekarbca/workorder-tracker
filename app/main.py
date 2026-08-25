@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
@@ -297,6 +297,48 @@ def update_colleague_fields(
             detail="posting_status must be 'Completed', 'In-Process', or 'Clarification'",
         )
 
+    previous_status = order.posting_status
+
+    # Pending $ is always derived, never accepted directly from the client.
+    payload_data.pop("pending_amount", None)
+
+    # Final posting_status after this update is applied (may be unchanged).
+    final_status = payload_data.get("posting_status", order.posting_status)
+
+    # Posted $, BAR Batch, and Trans Count are the core figures — nothing
+    # else can be saved until all three are filled in (existing value or
+    # part of this update).
+    final_posted_amount = payload_data.get("posted_amount", order.posted_amount)
+    final_bar_batch = payload_data.get("bar_batch", order.bar_batch)
+    final_trans_count = payload_data.get("trans_count", order.trans_count)
+    missing_core = []
+    if final_posted_amount is None:
+        missing_core.append("Posted $")
+    if not final_bar_batch:
+        missing_core.append("BAR Batch")
+    if final_trans_count is None:
+        missing_core.append("Trans Count")
+    if missing_core:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot save — missing required: {', '.join(missing_core)}",
+        )
+
+    # While Posting Status is (or remains) In-Process, the later-stage fields
+    # are locked — they only open up once a Clarification is raised or the
+    # order is being marked Completed.
+    LOCKED_WHILE_IN_PROCESS = [
+        "poster_comment", "ventra_comment", "escalation_category",
+        "issue_raised_date", "issue_closed_date", "posted_date",
+    ]
+    if final_status == "In-Process":
+        attempted = [f for f in LOCKED_WHILE_IN_PROCESS if f in payload_data]
+        if attempted:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot edit {', '.join(attempted)} while Posting Status is In-Process",
+            )
+
     for field, value in payload_data.items():
         setattr(order, field, value)
     order.last_edited_by = current_user.username
@@ -306,12 +348,44 @@ def update_colleague_fields(
     if order.posting_status == "Clarification" and not order.issue_raised_date:
         order.issue_raised_date = date.today()
 
-    # TAT = Posted Date - Received Date, excluding the issue pause window
+    # Leaving Clarification for any other status clears the fields that only
+    # make sense while a clarification is open.
+    if previous_status == "Clarification" and order.posting_status != "Clarification":
+        order.escalation_category = None
+        order.issue_raised_date = None
+
+    # Pending $ = Amount - Posted $, recalculated any time either changes.
+    if order.amount is not None:
+        order.pending_amount = order.amount - (order.posted_amount or 0)
+
+    # Completing an order requires the core figures to already be filled in
+    # (redundant with the check above, kept as a final guard), plus a Posted
+    # Date — otherwise TAT can never be calculated and the row locks with it
+    # permanently missing.
+    if order.posting_status == "Completed":
+        missing = []
+        if order.posted_amount is None:
+            missing.append("Posted $")
+        if not order.bar_batch:
+            missing.append("BAR Batch")
+        if order.trans_count is None:
+            missing.append("Trans Count")
+        if not order.posted_date:
+            missing.append("Posted Date")
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot mark Completed — missing: {', '.join(missing)}",
+            )
+
+    # TAT = business days (Mon-Fri) between Received Date and Posted Date,
+    # minus business days spent in an open Clarification pause window.
     if order.posted_date and order.received_date:
-        pause_days = 0
+        total_bdays = _count_business_days(order.received_date, order.posted_date)
+        pause_bdays = 0
         if order.issue_raised_date and order.issue_closed_date:
-            pause_days = (order.issue_closed_date - order.issue_raised_date).days
-        order.tat_days = (order.posted_date - order.received_date).days - pause_days
+            pause_bdays = _count_business_days(order.issue_raised_date, order.issue_closed_date)
+        order.tat_days = total_bdays - pause_bdays
 
     db.commit()
     db.refresh(order)
@@ -320,6 +394,19 @@ def update_colleague_fields(
         _auto_assign_open_slots(db)
 
     return order
+
+
+def _count_business_days(start: date, end: date) -> int:
+    """Counts weekdays (Mon-Fri) strictly after `start` up to and including `end`."""
+    if not start or not end or end <= start:
+        return 0
+    count = 0
+    current = start + timedelta(days=1)
+    while current <= end:
+        if current.weekday() < 5:  # 0=Mon ... 4=Fri
+            count += 1
+        current += timedelta(days=1)
+    return count
 
 
 # Serve the single-file frontend prototype
