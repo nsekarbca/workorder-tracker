@@ -103,8 +103,10 @@ const COLUMNS = [
 
 // A-D fields are now auto-populated on import/assignment, never manually typed.
 const TL_FIELDS = [];
-const COL_FIELDS = ["posted_amount","pending_amount","bar_batch","trans_count","posting_status",
+const COL_FIELDS = ["posted_amount","bar_batch","trans_count","posting_status",
   "poster_comment","ventra_comment","escalation_category","issue_raised_date","issue_closed_date","posted_date"];
+const LOCKED_WHILE_IN_PROCESS = ["poster_comment","ventra_comment","escalation_category",
+  "issue_raised_date","issue_closed_date","posted_date"];
 // Colleagues don't need to see the Team-Lead-owned columns at all.
 const HIDDEN_FOR_COLLEAGUE = ["received_date","assigned_date","employee_id","employee_name"];
 const POSTING_STATUS_OPTIONS = ["In-Process", "Clarification", "Completed"];
@@ -124,6 +126,8 @@ function parseCurrency(val) {
 }
 
 if (token) showApp();
+let currentOrders = [];
+let drafts = {}; // order.id -> {field: value} pending unsaved edits
 
 async function login() {
   const username = document.getElementById("login-username").value;
@@ -153,7 +157,7 @@ function showApp() {
   document.getElementById("whoami").textContent = `${fullName} (${role})`;
   document.getElementById("role-note").textContent = role === "team_lead"
     ? "Received Date, Assigned Date, Employee, and Employee Name are set automatically"
-    : "Editing: your assigned order's Posted $, Pending $, Posting Status, comments, dates \u2014 locked once Completed";
+    : "Edit fields, then click Save. Pending $ is auto-calculated. Locked once Completed.";
   if (role === "team_lead") {
     document.getElementById("import-btn").style.display = "inline-block";
     document.getElementById("run-assign-btn").style.display = "inline-block";
@@ -211,8 +215,15 @@ async function clearAllData() {
 
 async function loadOrders() {
   const res = await authFetch("/orders");
-  const orders = await res.json();
-  renderGrid(orders);
+  currentOrders = await res.json();
+  drafts = {};
+  renderGrid(currentOrders);
+}
+
+function effectiveValue(o, field) {
+  const d = drafts[o.id];
+  if (d && Object.prototype.hasOwnProperty.call(d, field)) return d[field];
+  return o[field];
 }
 
 function visibleColumns() {
@@ -226,19 +237,27 @@ function renderGrid(orders) {
   const cols = visibleColumns();
   let html = "<table><thead><tr>";
   cols.forEach(c => html += `<th class="${c.group}">${c.label}</th>`);
+  if (role === "colleague") html += `<th class="col">Save</th>`;
   html += "</tr></thead><tbody>";
 
   orders.forEach(o => {
-    const locked = role === "colleague" && o.posting_status === "Completed";
+    const savedCompleted = o.posting_status === "Completed";
+    const locked = role === "colleague" && savedCompleted;
+    const effStatus = effectiveValue(o, "posting_status");
+    const hasDraft = drafts[o.id] && Object.keys(drafts[o.id]).length > 0;
+
     html += `<tr>`;
     cols.forEach(c => {
       const editableBase = (role === "team_lead" && TL_FIELDS.includes(c.k)) ||
                             (role === "colleague" && COL_FIELDS.includes(c.k));
-      const editable = editableBase && !locked;
-      const rawVal = o[c.k] ?? "";
+      let editable = editableBase && !locked;
+      if (editable && LOCKED_WHILE_IN_PROCESS.includes(c.k) && effStatus === "In-Process") {
+        editable = false;
+      }
+      const rawVal = effectiveValue(o, c.k) ?? "";
 
       if (c.k === "posting_status" && editable) {
-        html += `<td><select class="cell-edit" data-id="${o.id}" data-field="posting_status" onchange="saveField(this)">`;
+        html += `<td><select class="cell-edit" data-id="${o.id}" data-field="posting_status" onchange="updateDraft(this)">`;
         POSTING_STATUS_OPTIONS.forEach(opt => {
           html += `<option value="${opt}" ${opt === rawVal ? "selected" : ""}>${opt}</option>`;
         });
@@ -246,28 +265,26 @@ function renderGrid(orders) {
         return;
       }
 
-      if (c.k === "escalation_category") {
-        const enabled = editable && o.posting_status === "Clarification";
-        if (role === "colleague") {
-          html += `<td><select class="cell-edit" data-id="${o.id}" data-field="escalation_category" onchange="saveField(this)" ${enabled ? "" : "disabled"}>`;
-          html += `<option value=""></option>`;
-          ESCALATION_OPTIONS.forEach(opt => {
-            html += `<option value="${opt}" ${opt === rawVal ? "selected" : ""}>${opt}</option>`;
-          });
-          html += `</select></td>`;
-          return;
-        }
+      if (c.k === "escalation_category" && role === "colleague") {
+        const enabled = editable && effStatus === "Clarification";
+        html += `<td><select class="cell-edit" data-id="${o.id}" data-field="escalation_category" onchange="updateDraft(this)" ${enabled ? "" : "disabled"}>`;
+        html += `<option value=""></option>`;
+        ESCALATION_OPTIONS.forEach(opt => {
+          html += `<option value="${opt}" ${opt === rawVal ? "selected" : ""}>${opt}</option>`;
+        });
+        html += `</select></td>`;
+        return;
       }
 
       if (c.k === "poster_comment" && role === "colleague") {
-        const enabled = editable && o.posting_status === "Clarification";
-        html += `<td><input class="cell-edit" data-id="${o.id}" data-field="poster_comment" value="${rawVal}" onchange="saveField(this)" ${enabled ? "" : "disabled"}></td>`;
+        const enabled = editable && effStatus === "Clarification";
+        html += `<td><input class="cell-edit" data-id="${o.id}" data-field="poster_comment" value="${rawVal}" onchange="updateDraft(this)" ${enabled ? "" : "disabled"}></td>`;
         return;
       }
 
       if (c.currency) {
         if (editable) {
-          html += `<td><input class="cell-edit" data-id="${o.id}" data-field="${c.k}" data-currency="1" value="${formatCurrency(rawVal)}" onchange="saveField(this)"></td>`;
+          html += `<td><input class="cell-edit" data-id="${o.id}" data-field="${c.k}" data-currency="1" value="${rawVal === "" ? "" : formatCurrency(rawVal)}" onchange="updateDraft(this)"></td>`;
         } else {
           html += `<td>${formatCurrency(rawVal)}</td>`;
         }
@@ -275,33 +292,90 @@ function renderGrid(orders) {
       }
 
       if (editable) {
-        html += `<td><input class="cell-edit" data-id="${o.id}" data-field="${c.k}" value="${rawVal}" onchange="saveField(this)"></td>`;
+        html += `<td><input class="cell-edit" data-id="${o.id}" data-field="${c.k}" value="${rawVal}" onchange="updateDraft(this)"></td>`;
       } else {
         html += `<td>${rawVal}</td>`;
       }
     });
+
+    if (role === "colleague") {
+      if (locked) {
+        html += `<td>Locked</td>`;
+      } else {
+        html += `<td><button class="action-btn" onclick="saveRow(${o.id})" ${hasDraft ? "" : "disabled"}>Save</button></td>`;
+      }
+    }
     html += `</tr>`;
   });
   html += "</tbody></table>";
   document.getElementById("grid-container").innerHTML = html || "<p>No orders.</p>";
 }
 
-async function saveField(input) {
-  const id = input.dataset.id;
+function updateDraft(input) {
+  const id = parseInt(input.dataset.id);
   const field = input.dataset.field;
   let value = input.value;
-  if (input.dataset.currency) value = parseCurrency(value);
   if (value === "") value = null;
-  const endpoint = role === "team_lead" ? `/orders/${id}/team-lead` : `/orders/${id}/colleague`;
-  const res = await authFetch(endpoint, {
+  if (!drafts[id]) drafts[id] = {};
+  drafts[id][field] = value;
+
+  // Leaving Clarification clears the fields that only make sense while one
+  // is open, mirrored here so the UI reflects it immediately.
+  if (field === "posting_status") {
+    const order = currentOrders.find(o => o.id === id);
+    const wasClarification = effectiveValue(order, "posting_status") === "Clarification" || order.posting_status === "Clarification";
+    if (value !== "Clarification") {
+      drafts[id]["escalation_category"] = null;
+      drafts[id]["issue_raised_date"] = null;
+    }
+  }
+  renderGrid(currentOrders);
+}
+
+async function saveRow(orderId) {
+  const draft = drafts[orderId];
+  if (!draft || Object.keys(draft).length === 0) return;
+  const order = currentOrders.find(o => o.id === orderId);
+
+  const finalStatus = draft.posting_status !== undefined ? draft.posting_status : order.posting_status;
+  const finalPosted = draft.posted_amount !== undefined ? draft.posted_amount : order.posted_amount;
+  const finalBar = draft.bar_batch !== undefined ? draft.bar_batch : order.bar_batch;
+  const finalTrans = draft.trans_count !== undefined ? draft.trans_count : order.trans_count;
+  const finalPostedDate = draft.posted_date !== undefined ? draft.posted_date : order.posted_date;
+
+  const missing = [];
+  if (finalPosted === null || finalPosted === undefined || finalPosted === "") missing.push("Posted $");
+  if (!finalBar) missing.push("BAR Batch");
+  if (finalTrans === null || finalTrans === undefined || finalTrans === "") missing.push("Trans Count");
+  if (finalStatus === "Completed" && !finalPostedDate) missing.push("Posted Date");
+  if (missing.length) {
+    alert("Cannot save \u2014 missing required: " + missing.join(", "));
+    return;
+  }
+
+  if (finalStatus === "In-Process") {
+    const blocked = LOCKED_WHILE_IN_PROCESS.filter(f => f in draft);
+    if (blocked.length) {
+      alert("Cannot edit " + blocked.join(", ") + " while Posting Status is In-Process");
+      return;
+    }
+  }
+
+  const payload = {};
+  for (const [field, value] of Object.entries(draft)) {
+    payload[field] = (field === "posted_amount") ? parseCurrency(value) : value;
+  }
+
+  const res = await authFetch(`/orders/${orderId}/colleague`, {
     method: "PATCH",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({[field]: value})
+    body: JSON.stringify(payload)
   });
   if (!res.ok) {
     alert("Save failed: " + (await res.text()));
     return;
   }
+  delete drafts[orderId];
   loadOrders();
 }
 </script>
