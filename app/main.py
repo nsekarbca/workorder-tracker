@@ -299,8 +299,10 @@ def update_colleague_fields(
 
     previous_status = order.posting_status
 
-    # Pending $ is always derived, never accepted directly from the client.
+    # Pending $ and Posted Date are always system-derived, never accepted
+    # directly from the client.
     payload_data.pop("pending_amount", None)
+    payload_data.pop("posted_date", None)
 
     # Final posting_status after this update is applied (may be unchanged).
     final_status = payload_data.get("posting_status", order.posting_status)
@@ -324,19 +326,19 @@ def update_colleague_fields(
             detail=f"Cannot save — missing required: {', '.join(missing_core)}",
         )
 
-    # While Posting Status is (or remains) In-Process, the later-stage fields
-    # are locked — they only open up once a Clarification is raised or the
-    # order is being marked Completed.
-    LOCKED_WHILE_IN_PROCESS = [
+    # Poster Comment, VENTRA Comment, Escalation Category, Issue Raised/Closed
+    # Date only ever make sense while a Clarification is open — locked both
+    # during In-Process and once Completed.
+    CLARIFICATION_ONLY_FIELDS = [
         "poster_comment", "ventra_comment", "escalation_category",
-        "issue_raised_date", "issue_closed_date", "posted_date",
+        "issue_raised_date", "issue_closed_date",
     ]
-    if final_status == "In-Process":
-        attempted = [f for f in LOCKED_WHILE_IN_PROCESS if f in payload_data]
+    if final_status != "Clarification":
+        attempted = [f for f in CLARIFICATION_ONLY_FIELDS if f in payload_data]
         if attempted:
             raise HTTPException(
                 status_code=400,
-                detail=f"Cannot edit {', '.join(attempted)} while Posting Status is In-Process",
+                detail=f"{', '.join(attempted)} can only be edited while Posting Status is Clarification",
             )
 
     for field, value in payload_data.items():
@@ -347,6 +349,11 @@ def update_colleague_fields(
     # if it isn't already set.
     if order.posting_status == "Clarification" and not order.issue_raised_date:
         order.issue_raised_date = date.today()
+
+    # Auto-set Posted Date the moment a colleague marks Completed — no manual
+    # entry needed, and it guarantees TAT can always be calculated below.
+    if order.posting_status == "Completed" and not order.posted_date:
+        order.posted_date = date.today()
 
     # Leaving Clarification for any other status clears the fields that only
     # make sense while a clarification is open.
