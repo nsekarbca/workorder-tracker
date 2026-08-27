@@ -104,9 +104,9 @@ const COLUMNS = [
 // A-D fields are now auto-populated on import/assignment, never manually typed.
 const TL_FIELDS = [];
 const COL_FIELDS = ["posted_amount","bar_batch","trans_count","posting_status",
-  "poster_comment","ventra_comment","escalation_category","issue_raised_date","issue_closed_date","posted_date"];
-const LOCKED_WHILE_IN_PROCESS = ["poster_comment","ventra_comment","escalation_category",
-  "issue_raised_date","issue_closed_date","posted_date"];
+  "poster_comment","ventra_comment","escalation_category","issue_raised_date","issue_closed_date"];
+const CLARIFICATION_ONLY_FIELDS = ["poster_comment","ventra_comment","escalation_category",
+  "issue_raised_date","issue_closed_date"];
 // Colleagues don't need to see the Team-Lead-owned columns at all.
 const HIDDEN_FOR_COLLEAGUE = ["received_date","assigned_date","employee_id","employee_name"];
 const POSTING_STATUS_OPTIONS = ["In-Process", "Clarification", "Completed"];
@@ -251,7 +251,7 @@ function renderGrid(orders) {
       const editableBase = (role === "team_lead" && TL_FIELDS.includes(c.k)) ||
                             (role === "colleague" && COL_FIELDS.includes(c.k));
       let editable = editableBase && !locked;
-      if (editable && LOCKED_WHILE_IN_PROCESS.includes(c.k) && effStatus === "In-Process") {
+      if (editable && CLARIFICATION_ONLY_FIELDS.includes(c.k) && effStatus !== "Clarification") {
         editable = false;
       }
       const rawVal = effectiveValue(o, c.k) ?? "";
@@ -266,8 +266,7 @@ function renderGrid(orders) {
       }
 
       if (c.k === "escalation_category" && role === "colleague") {
-        const enabled = editable && effStatus === "Clarification";
-        html += `<td><select class="cell-edit" data-id="${o.id}" data-field="escalation_category" onchange="updateDraft(this)" ${enabled ? "" : "disabled"}>`;
+        html += `<td><select class="cell-edit" data-id="${o.id}" data-field="escalation_category" onchange="updateDraft(this)" ${editable ? "" : "disabled"}>`;
         html += `<option value=""></option>`;
         ESCALATION_OPTIONS.forEach(opt => {
           html += `<option value="${opt}" ${opt === rawVal ? "selected" : ""}>${opt}</option>`;
@@ -276,9 +275,15 @@ function renderGrid(orders) {
         return;
       }
 
-      if (c.k === "poster_comment" && role === "colleague") {
-        const enabled = editable && effStatus === "Clarification";
-        html += `<td><input class="cell-edit" data-id="${o.id}" data-field="poster_comment" value="${rawVal}" onchange="updateDraft(this)" ${enabled ? "" : "disabled"}></td>`;
+      if ((c.k === "poster_comment" || c.k === "ventra_comment") && role === "colleague") {
+        html += `<td><input class="cell-edit" data-id="${o.id}" data-field="${c.k}" value="${rawVal}" onchange="updateDraft(this)" ${editable ? "" : "disabled"}></td>`;
+        return;
+      }
+
+      if (c.k === "posted_date") {
+        // System-set the moment an order is marked Completed — never a
+        // manual input.
+        html += `<td>${rawVal}</td>`;
         return;
       }
 
@@ -319,6 +324,18 @@ function updateDraft(input) {
   if (!drafts[id]) drafts[id] = {};
   drafts[id][field] = value;
 
+  // Live Pending $ preview: Amount - Posted $, recalculated the moment
+  // Posted $ changes, before the row is even saved.
+  if (field === "posted_amount") {
+    const order = currentOrders.find(o => o.id === id);
+    const parsedPosted = parseFloat(parseCurrency(value));
+    if (order && order.amount !== null && order.amount !== undefined && !isNaN(parsedPosted)) {
+      drafts[id]["pending_amount"] = (order.amount - parsedPosted).toString();
+    } else {
+      delete drafts[id]["pending_amount"];
+    }
+  }
+
   // Leaving Clarification clears the fields that only make sense while one
   // is open, mirrored here so the UI reflects it immediately.
   if (field === "posting_status") {
@@ -341,28 +358,27 @@ async function saveRow(orderId) {
   const finalPosted = draft.posted_amount !== undefined ? draft.posted_amount : order.posted_amount;
   const finalBar = draft.bar_batch !== undefined ? draft.bar_batch : order.bar_batch;
   const finalTrans = draft.trans_count !== undefined ? draft.trans_count : order.trans_count;
-  const finalPostedDate = draft.posted_date !== undefined ? draft.posted_date : order.posted_date;
 
   const missing = [];
   if (finalPosted === null || finalPosted === undefined || finalPosted === "") missing.push("Posted $");
   if (!finalBar) missing.push("BAR Batch");
   if (finalTrans === null || finalTrans === undefined || finalTrans === "") missing.push("Trans Count");
-  if (finalStatus === "Completed" && !finalPostedDate) missing.push("Posted Date");
   if (missing.length) {
     alert("Cannot save \u2014 missing required: " + missing.join(", "));
     return;
   }
 
-  if (finalStatus === "In-Process") {
-    const blocked = LOCKED_WHILE_IN_PROCESS.filter(f => f in draft);
+  if (finalStatus !== "Clarification") {
+    const blocked = CLARIFICATION_ONLY_FIELDS.filter(f => f in draft);
     if (blocked.length) {
-      alert("Cannot edit " + blocked.join(", ") + " while Posting Status is In-Process");
+      alert("Cannot edit " + blocked.join(", ") + " unless Posting Status is Clarification");
       return;
     }
   }
 
   const payload = {};
   for (const [field, value] of Object.entries(draft)) {
+    if (field === "pending_amount") continue; // preview-only, server recalculates
     payload[field] = (field === "posted_amount") ? parseCurrency(value) : value;
   }
 
