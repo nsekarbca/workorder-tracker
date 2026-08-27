@@ -336,16 +336,11 @@ function updateDraft(input) {
     }
   }
 
-  // Leaving Clarification clears the fields that only make sense while one
-  // is open, mirrored here so the UI reflects it immediately.
-  if (field === "posting_status") {
-    const order = currentOrders.find(o => o.id === id);
-    const wasClarification = effectiveValue(order, "posting_status") === "Clarification" || order.posting_status === "Clarification";
-    if (value !== "Clarification") {
-      drafts[id]["escalation_category"] = null;
-      drafts[id]["issue_raised_date"] = null;
-    }
-  }
+  // Note: Escalation Category / Issue Raised Date are cleared automatically
+  // by the backend when Posting Status leaves Clarification — intentionally
+  // not mirrored here, since sending explicit nulls for them would itself
+  // trip the "only editable during Clarification" check.
+
   renderGrid(currentOrders);
 }
 
@@ -369,7 +364,9 @@ async function saveRow(orderId) {
   }
 
   if (finalStatus !== "Clarification") {
-    const blocked = CLARIFICATION_ONLY_FIELDS.filter(f => f in draft);
+    const blocked = CLARIFICATION_ONLY_FIELDS.filter(f =>
+      f in draft && draft[f] !== null && draft[f] !== ""
+    );
     if (blocked.length) {
       alert("Cannot edit " + blocked.join(", ") + " unless Posting Status is Clarification");
       return;
