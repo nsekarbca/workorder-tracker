@@ -60,8 +60,16 @@
       <button class="action-btn" id="import-btn" style="display:none;" onclick="document.getElementById('import-file').click()">Import Inventory CSV</button>
       <button class="action-btn" id="run-assign-btn" style="display:none;" onclick="runAssignment()">Run Assignment Now</button>
       <button class="action-btn" id="clear-data-btn" style="display:none; background:#b23b3b;" onclick="clearAllData()">Clear All Data</button>
+      <button class="action-btn" id="production-btn" style="display:none;" onclick="showProductionView()">Production</button>
       <button class="action-btn" onclick="loadOrders()">Refresh</button>
       <button class="action-btn" id="submit-day-btn" style="display:none; background:#2fa63f;" onclick="submitEndOfDay()">Submit End of Day</button>
+    </div>
+    <div id="production-bar" style="display:none; margin-bottom:12px; gap:10px; align-items:center;">
+      <label>From <input type="date" id="prod-start-date"></label>
+      <label>To <input type="date" id="prod-end-date"></label>
+      <button class="action-btn" onclick="loadProduction()">Load</button>
+      <button class="action-btn" onclick="exportProductionCSV()">Export CSV</button>
+      <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
     </div>
     <div id="grid-container"></div>
   </div>
@@ -133,6 +141,8 @@ function parseCurrency(val) {
 
 if (token) showApp();
 let currentOrders = [];
+let currentProduction = [];
+let viewMode = "active"; // "active" or "production"
 let drafts = {}; // order.id -> {field: value} pending unsaved edits
 
 async function login() {
@@ -168,6 +178,7 @@ function showApp() {
     document.getElementById("import-btn").style.display = "inline-block";
     document.getElementById("run-assign-btn").style.display = "inline-block";
     document.getElementById("clear-data-btn").style.display = "inline-block";
+    document.getElementById("production-btn").style.display = "inline-block";
     document.getElementById("import-file").addEventListener("change", importCSV);
   } else {
     document.getElementById("submit-day-btn").style.display = "inline-block";
@@ -232,6 +243,85 @@ async function submitEndOfDay() {
   const data = await res.json();
   alert(`Submitted ${data.submitted} order(s) to Production.`);
   loadOrders();
+}
+
+function showProductionView() {
+  viewMode = "production";
+  document.getElementById("toolbar").style.display = "none";
+  document.getElementById("production-bar").style.display = "flex";
+  loadProduction();
+}
+
+function showActiveView() {
+  viewMode = "active";
+  document.getElementById("toolbar").style.display = "flex";
+  document.getElementById("production-bar").style.display = "none";
+  loadOrders();
+}
+
+async function loadProduction() {
+  const start = document.getElementById("prod-start-date").value;
+  const end = document.getElementById("prod-end-date").value;
+  const params = new URLSearchParams();
+  if (start) params.set("start_date", start);
+  if (end) params.set("end_date", end);
+  const res = await authFetch("/orders/production?" + params.toString());
+  if (!res.ok) {
+    alert("Failed to load Production data: " + (await res.text()));
+    return;
+  }
+  currentProduction = await res.json();
+  renderProductionGrid(currentProduction);
+}
+
+function renderProductionGrid(orders) {
+  let html = "<table><thead><tr>";
+  COLUMNS.forEach(c => html += `<th class="${c.group}">${c.label}</th>`);
+  html += `<th class="col">Submitted At</th>`;
+  html += "</tr></thead><tbody>";
+  orders.forEach(o => {
+    html += "<tr>";
+    COLUMNS.forEach(c => {
+      const val = o[c.k] ?? "";
+      html += `<td>${c.currency ? formatCurrency(val) : val}</td>`;
+    });
+    html += `<td>${o.submitted_at ?? ""}</td>`;
+    html += "</tr>";
+  });
+  html += "</tbody></table>";
+  document.getElementById("grid-container").innerHTML = html ||
+    "<p>No production records in this range.</p>";
+  if (orders.length === 0) {
+    document.getElementById("grid-container").innerHTML = "<p>No production records in this range.</p>";
+  }
+}
+
+function exportProductionCSV() {
+  if (!currentProduction.length) {
+    alert("Nothing to export \u2014 load a date range first.");
+    return;
+  }
+  const headers = COLUMNS.map(c => c.label).concat(["Submitted At"]);
+  const keys = COLUMNS.map(c => c.k).concat(["submitted_at"]);
+  const rows = currentProduction.map(o =>
+    keys.map(k => {
+      let v = o[k] ?? "";
+      v = String(v).replace(/"/g, '""');
+      return `"${v}"`;
+    }).join(",")
+  );
+  const csv = [headers.join(","), ...rows].join("\r\n");
+  const blob = new Blob([csv], {type: "text/csv;charset=utf-8;"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const start = document.getElementById("prod-start-date").value || "all";
+  const end = document.getElementById("prod-end-date").value || "all";
+  a.href = url;
+  a.download = `production_${start}_to_${end}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 async function loadOrders() {
