@@ -226,6 +226,10 @@ def _auto_assign_open_slots(db: Session):
             next_order.employee_name = colleague.full_name
             next_order.posting_status = "In-Process"
             db.add(next_order)
+            # Autoflush is off for this session, so without this the next
+            # colleague's "find an unassigned order" query would still see
+            # this one as unassigned and both would grab the same row.
+            db.flush()
     db.commit()
 
 
@@ -246,20 +250,49 @@ def list_orders(current_user: models.User = Depends(auth.get_current_user), db: 
 def list_production_orders(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    received_start: Optional[date] = None,
+    received_end: Optional[date] = None,
+    assigned_start: Optional[date] = None,
+    assigned_end: Optional[date] = None,
+    created_start: Optional[date] = None,
+    created_end: Optional[date] = None,
+    employee_name: Optional[str] = None,
+    def_doc_type: Optional[str] = None,
     current_user: models.User = Depends(auth.require_role("team_lead")),
     db: Session = Depends(get_db),
 ):
     """
     Team-Lead-only view of everything already submitted to Production.
-    Optional start_date/end_date filter by Posted Date (inclusive) — the
-    date the work was actually completed, which is what a day's or week's
-    production report means in practice.
+    All filters are optional and combine with AND. start_date/end_date filter
+    by Posted Date (inclusive) — the day the work was actually completed.
     """
     query = db.query(models.WorkOrder).filter(models.WorkOrder.submitted == True)  # noqa: E712
+
     if start_date:
         query = query.filter(models.WorkOrder.posted_date >= start_date)
     if end_date:
         query = query.filter(models.WorkOrder.posted_date <= end_date)
+
+    if received_start:
+        query = query.filter(models.WorkOrder.received_date >= received_start)
+    if received_end:
+        query = query.filter(models.WorkOrder.received_date <= received_end)
+
+    if assigned_start:
+        query = query.filter(models.WorkOrder.assigned_date >= assigned_start)
+    if assigned_end:
+        query = query.filter(models.WorkOrder.assigned_date <= assigned_end)
+
+    if created_start:
+        query = query.filter(models.WorkOrder.created >= datetime.combine(created_start, datetime.min.time()))
+    if created_end:
+        query = query.filter(models.WorkOrder.created <= datetime.combine(created_end, datetime.max.time()))
+
+    if employee_name:
+        query = query.filter(models.WorkOrder.employee_name.ilike(f"%{employee_name}%"))
+    if def_doc_type:
+        query = query.filter(models.WorkOrder.def_doc_type.ilike(f"%{def_doc_type}%"))
+
     return query.order_by(models.WorkOrder.posted_date.asc(), models.WorkOrder.id.asc()).all()
 
 
