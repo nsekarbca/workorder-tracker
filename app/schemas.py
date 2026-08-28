@@ -56,6 +56,23 @@ class ColleagueUpdate(BaseModel):
     posted_date: Optional[date] = None
 
 
+# Fields a Team Lead may correct on a row that's Completed but not yet
+# submitted to Production — deliberately permissive, since this is only
+# reachable by a trusted Team Lead for fixing a colleague's mistake before
+# end-of-day submission locks it for good.
+class TeamLeadCorrection(BaseModel):
+    posted_amount: Optional[float] = None
+    bar_batch: Optional[str] = None
+    trans_count: Optional[int] = None
+    posting_status: Optional[str] = None
+    poster_comment: Optional[str] = None
+    ventra_comment: Optional[str] = None
+    escalation_category: Optional[str] = None
+    issue_raised_date: Optional[date] = None
+    issue_closed_date: Optional[date] = None
+    posted_date: Optional[date] = None
+
+
 class WorkOrderOut(BaseModel):
     id: int
     received_date: Optional[date]
@@ -86,6 +103,7 @@ class WorkOrderOut(BaseModel):
     posted_date: Optional[date]
     tat_days: Optional[int]
     assigned_to_id: Optional[int]
+    submitted: bool
 
     class Config:
         from_attributes = True

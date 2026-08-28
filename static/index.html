@@ -61,6 +61,7 @@
       <button class="action-btn" id="run-assign-btn" style="display:none;" onclick="runAssignment()">Run Assignment Now</button>
       <button class="action-btn" id="clear-data-btn" style="display:none; background:#b23b3b;" onclick="clearAllData()">Clear All Data</button>
       <button class="action-btn" onclick="loadOrders()">Refresh</button>
+      <button class="action-btn" id="submit-day-btn" style="display:none; background:#2fa63f;" onclick="submitEndOfDay()">Submit End of Day</button>
     </div>
     <div id="grid-container"></div>
   </div>
@@ -103,6 +104,11 @@ const COLUMNS = [
 
 // A-D fields are now auto-populated on import/assignment, never manually typed.
 const TL_FIELDS = [];
+// Fields a Team Lead can correct on a row that's Completed but not yet
+// submitted to Production — same set a colleague fills in, minus the
+// always-derived Pending $.
+const TL_CORRECTION_FIELDS = ["posted_amount","bar_batch","trans_count","posting_status",
+  "poster_comment","ventra_comment","escalation_category","issue_raised_date","issue_closed_date","posted_date"];
 const COL_FIELDS = ["posted_amount","bar_batch","trans_count","posting_status",
   "poster_comment","ventra_comment","escalation_category","issue_raised_date","issue_closed_date"];
 const CLARIFICATION_ONLY_FIELDS = ["poster_comment","ventra_comment","escalation_category",
@@ -156,13 +162,15 @@ function showApp() {
   document.getElementById("app").style.display = "block";
   document.getElementById("whoami").textContent = `${fullName} (${role})`;
   document.getElementById("role-note").textContent = role === "team_lead"
-    ? "Received Date, Assigned Date, Employee, and Employee Name are set automatically"
-    : "Edit fields, then click Save. Pending $ is auto-calculated. Locked once Completed.";
+    ? "Received Date, Assigned Date, Employee, and Employee Name are set automatically. Completed rows can still be corrected until submitted."
+    : "Edit fields, then click Save. Pending $ is auto-calculated. Locked once Completed \u2014 click Submit End of Day to send finished work to Production.";
   if (role === "team_lead") {
     document.getElementById("import-btn").style.display = "inline-block";
     document.getElementById("run-assign-btn").style.display = "inline-block";
     document.getElementById("clear-data-btn").style.display = "inline-block";
     document.getElementById("import-file").addEventListener("change", importCSV);
+  } else {
+    document.getElementById("submit-day-btn").style.display = "inline-block";
   }
   loadOrders();
 }
@@ -213,6 +221,19 @@ async function clearAllData() {
   loadOrders();
 }
 
+async function submitEndOfDay() {
+  const sure = confirm("Submit all your Completed orders to Production? Once submitted, they can no longer be corrected by you or your Team Lead.");
+  if (!sure) return;
+  const res = await authFetch("/orders/submit-day", {method:"POST"});
+  if (!res.ok) {
+    alert("Submit failed: " + (await res.text()));
+    return;
+  }
+  const data = await res.json();
+  alert(`Submitted ${data.submitted} order(s) to Production.`);
+  loadOrders();
+}
+
 async function loadOrders() {
   const res = await authFetch("/orders");
   currentOrders = await res.json();
@@ -237,21 +258,26 @@ function renderGrid(orders) {
   const cols = visibleColumns();
   let html = "<table><thead><tr>";
   cols.forEach(c => html += `<th class="${c.group}">${c.label}</th>`);
-  if (role === "colleague") html += `<th class="col">Save</th>`;
+  if (role === "colleague" || role === "team_lead") html += `<th class="col">Save</th>`;
   html += "</tr></thead><tbody>";
 
   orders.forEach(o => {
     const savedCompleted = o.posting_status === "Completed";
     const locked = role === "colleague" && savedCompleted;
+    // Team Lead can only correct a row once it's Completed but not yet
+    // submitted (submitted rows are already excluded from this list).
+    const tlCanCorrect = role === "team_lead" && savedCompleted;
     const effStatus = effectiveValue(o, "posting_status");
     const hasDraft = drafts[o.id] && Object.keys(drafts[o.id]).length > 0;
 
     html += `<tr>`;
     cols.forEach(c => {
-      const editableBase = (role === "team_lead" && TL_FIELDS.includes(c.k)) ||
+      const editableBase = (role === "team_lead" && (TL_FIELDS.includes(c.k) || (tlCanCorrect && TL_CORRECTION_FIELDS.includes(c.k)))) ||
                             (role === "colleague" && COL_FIELDS.includes(c.k));
       let editable = editableBase && !locked;
-      if (editable && CLARIFICATION_ONLY_FIELDS.includes(c.k) && effStatus !== "Clarification") {
+      // The Clarification-only gating is a colleague data-entry rule, not a
+      // restriction on trusted Team Lead corrections.
+      if (role === "colleague" && editable && CLARIFICATION_ONLY_FIELDS.includes(c.k) && effStatus !== "Clarification") {
         editable = false;
       }
       const rawVal = effectiveValue(o, c.k) ?? "";
@@ -265,7 +291,7 @@ function renderGrid(orders) {
         return;
       }
 
-      if (c.k === "escalation_category" && role === "colleague") {
+      if (c.k === "escalation_category" && (role === "colleague" || role === "team_lead")) {
         html += `<td><select class="cell-edit" data-id="${o.id}" data-field="escalation_category" onchange="updateDraft(this)" ${editable ? "" : "disabled"}>`;
         html += `<option value=""></option>`;
         ESCALATION_OPTIONS.forEach(opt => {
@@ -275,15 +301,20 @@ function renderGrid(orders) {
         return;
       }
 
-      if ((c.k === "poster_comment" || c.k === "ventra_comment") && role === "colleague") {
+      if ((c.k === "poster_comment" || c.k === "ventra_comment") && (role === "colleague" || role === "team_lead")) {
         html += `<td><input class="cell-edit" data-id="${o.id}" data-field="${c.k}" value="${rawVal}" onchange="updateDraft(this)" ${editable ? "" : "disabled"}></td>`;
         return;
       }
 
       if (c.k === "posted_date") {
-        // System-set the moment an order is marked Completed — never a
-        // manual input.
-        html += `<td>${rawVal}</td>`;
+        // Auto-set the moment an order is marked Completed — never a manual
+        // input for a colleague. A Team Lead correcting an unsubmitted row
+        // can override it directly.
+        if (role === "team_lead" && editable) {
+          html += `<td><input class="cell-edit" data-id="${o.id}" data-field="posted_date" value="${rawVal}" placeholder="YYYY-MM-DD" onchange="updateDraft(this)"></td>`;
+        } else {
+          html += `<td>${rawVal}</td>`;
+        }
         return;
       }
 
@@ -308,6 +339,12 @@ function renderGrid(orders) {
         html += `<td>Locked</td>`;
       } else {
         html += `<td><button class="action-btn" onclick="saveRow(${o.id})" ${hasDraft ? "" : "disabled"}>Save</button></td>`;
+      }
+    } else if (role === "team_lead") {
+      if (tlCanCorrect) {
+        html += `<td><button class="action-btn" onclick="saveRow(${o.id})" ${hasDraft ? "" : "disabled"}>Save</button></td>`;
+      } else {
+        html += `<td>\u2014</td>`;
       }
     }
     html += `</tr>`;
@@ -349,6 +386,28 @@ async function saveRow(orderId) {
   if (!draft || Object.keys(draft).length === 0) return;
   const order = currentOrders.find(o => o.id === orderId);
 
+  const payload = {};
+  for (const [field, value] of Object.entries(draft)) {
+    if (field === "pending_amount") continue; // preview-only, server recalculates
+    payload[field] = (field === "posted_amount") ? parseCurrency(value) : value;
+  }
+
+  if (role === "team_lead") {
+    // Trusted correction — no required-field or Clarification-only gating.
+    const res = await authFetch(`/orders/${orderId}/team-lead-correction`, {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      alert("Save failed: " + (await res.text()));
+      return;
+    }
+    delete drafts[orderId];
+    loadOrders();
+    return;
+  }
+
   const finalStatus = draft.posting_status !== undefined ? draft.posting_status : order.posting_status;
   const finalPosted = draft.posted_amount !== undefined ? draft.posted_amount : order.posted_amount;
   const finalBar = draft.bar_batch !== undefined ? draft.bar_batch : order.bar_batch;
@@ -371,12 +430,6 @@ async function saveRow(orderId) {
       alert("Cannot edit " + blocked.join(", ") + " unless Posting Status is Clarification");
       return;
     }
-  }
-
-  const payload = {};
-  for (const [field, value] of Object.entries(draft)) {
-    if (field === "pending_amount") continue; // preview-only, server recalculates
-    payload[field] = (field === "posted_amount") ? parseCurrency(value) : value;
   }
 
   const res = await authFetch(`/orders/${orderId}/colleague`, {
