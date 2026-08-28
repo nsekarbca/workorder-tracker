@@ -235,10 +235,25 @@ def _auto_assign_open_slots(db: Session):
 
 @app.get("/orders", response_model=List[schemas.WorkOrderOut])
 def list_orders(current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
-    query = db.query(models.WorkOrder)
+    """Active queue only — orders already submitted to Production are hidden here for everyone."""
+    query = db.query(models.WorkOrder).filter(models.WorkOrder.submitted == False)  # noqa: E712
     if current_user.role == "colleague":
         query = query.filter(models.WorkOrder.assigned_to_id == current_user.id)
     return query.order_by(models.WorkOrder.id.asc()).all()
+
+
+@app.get("/orders/production", response_model=List[schemas.WorkOrderOut])
+def list_production_orders(
+    current_user: models.User = Depends(auth.require_role("team_lead")),
+    db: Session = Depends(get_db),
+):
+    """Team-Lead-only view of everything already submitted to Production."""
+    return (
+        db.query(models.WorkOrder)
+        .filter(models.WorkOrder.submitted == True)  # noqa: E712
+        .order_by(models.WorkOrder.id.asc())
+        .all()
+    )
 
 
 @app.get("/orders/{order_id}", response_model=schemas.WorkOrderOut)
@@ -334,7 +349,10 @@ def update_colleague_fields(
         "issue_raised_date", "issue_closed_date",
     ]
     if final_status != "Clarification":
-        attempted = [f for f in CLARIFICATION_ONLY_FIELDS if f in payload_data]
+        attempted = [
+            f for f in CLARIFICATION_ONLY_FIELDS
+            if f in payload_data and payload_data[f] not in (None, "")
+        ]
         if attempted:
             raise HTTPException(
                 status_code=400,
@@ -400,6 +418,80 @@ def update_colleague_fields(
     if order.posting_status == "Completed":
         _auto_assign_open_slots(db)
 
+    return order
+
+
+@app.post("/orders/submit-day")
+def submit_end_of_day(
+    current_user: models.User = Depends(auth.require_role("colleague")),
+    db: Session = Depends(get_db),
+):
+    """
+    Moves all of this colleague's Completed orders to Production — hides
+    them from both the colleague's and Team Lead's active queue for good.
+    Only Completed orders are eligible; anything still In-Process or in
+    Clarification is left untouched.
+    """
+    orders = (
+        db.query(models.WorkOrder)
+        .filter(
+            models.WorkOrder.assigned_to_id == current_user.id,
+            models.WorkOrder.posting_status == "Completed",
+            models.WorkOrder.submitted == False,  # noqa: E712
+        )
+        .all()
+    )
+    for order in orders:
+        order.submitted = True
+    db.commit()
+    return {"submitted": len(orders)}
+
+
+@app.patch("/orders/{order_id}/team-lead-correction", response_model=schemas.WorkOrderOut)
+def correct_completed_order(
+    order_id: int,
+    payload: schemas.TeamLeadCorrection,
+    current_user: models.User = Depends(auth.require_role("team_lead")),
+    db: Session = Depends(get_db),
+):
+    """
+    Lets a Team Lead fix a colleague's mistake on a row that's Completed but
+    not yet submitted to Production. Deliberately skips the Clarification-only
+    and In-Process-locking rules that apply to colleagues — a Team Lead
+    correction is trusted oversight, not routine data entry. Once the row is
+    submitted, this endpoint refuses to touch it.
+    """
+    order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.submitted:
+        raise HTTPException(status_code=403, detail="This order has been submitted to Production and is locked")
+
+    payload_data = payload.dict(exclude_unset=True)
+    if "posting_status" in payload_data and payload_data["posting_status"] not in (
+        "Completed", "In-Process", "Clarification"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="posting_status must be 'Completed', 'In-Process', or 'Clarification'",
+        )
+
+    for field, value in payload_data.items():
+        setattr(order, field, value)
+    order.last_edited_by = current_user.username
+
+    # Keep derived figures consistent with whatever the Team Lead just fixed.
+    if order.amount is not None:
+        order.pending_amount = order.amount - (order.posted_amount or 0)
+    if order.posted_date and order.received_date:
+        total_bdays = _count_business_days(order.received_date, order.posted_date)
+        pause_bdays = 0
+        if order.issue_raised_date and order.issue_closed_date:
+            pause_bdays = _count_business_days(order.issue_raised_date, order.issue_closed_date)
+        order.tat_days = total_bdays - pause_bdays
+
+    db.commit()
+    db.refresh(order)
     return order
 
 

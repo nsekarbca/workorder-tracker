@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Date, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, Date, DateTime, ForeignKey, Boolean
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from .database import Base
@@ -59,6 +59,11 @@ class WorkOrder(Base):
 
     # --- AA: auto-calculated ---
     tat_days = Column(Integer)            # TAT = posted_date - received_date, excluding issue pause window
+
+    # Set true by the colleague's end-of-day Submit action. Submitted orders
+    # are treated as moved to Production — hidden from both the colleague and
+    # Team Lead active views, and locked from further edits by anyone.
+    submitted = Column(Boolean, default=False, nullable=False)
 
     assigned_to_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     assignee = relationship("User", back_populates="orders")
