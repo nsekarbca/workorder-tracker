@@ -244,16 +244,23 @@ def list_orders(current_user: models.User = Depends(auth.get_current_user), db: 
 
 @app.get("/orders/production", response_model=List[schemas.WorkOrderOut])
 def list_production_orders(
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
     current_user: models.User = Depends(auth.require_role("team_lead")),
     db: Session = Depends(get_db),
 ):
-    """Team-Lead-only view of everything already submitted to Production."""
-    return (
-        db.query(models.WorkOrder)
-        .filter(models.WorkOrder.submitted == True)  # noqa: E712
-        .order_by(models.WorkOrder.id.asc())
-        .all()
-    )
+    """
+    Team-Lead-only view of everything already submitted to Production.
+    Optional start_date/end_date filter by Posted Date (inclusive) — the
+    date the work was actually completed, which is what a day's or week's
+    production report means in practice.
+    """
+    query = db.query(models.WorkOrder).filter(models.WorkOrder.submitted == True)  # noqa: E712
+    if start_date:
+        query = query.filter(models.WorkOrder.posted_date >= start_date)
+    if end_date:
+        query = query.filter(models.WorkOrder.posted_date <= end_date)
+    return query.order_by(models.WorkOrder.posted_date.asc(), models.WorkOrder.id.asc()).all()
 
 
 @app.get("/orders/{order_id}", response_model=schemas.WorkOrderOut)
@@ -441,8 +448,10 @@ def submit_end_of_day(
         )
         .all()
     )
+    now = datetime.utcnow()
     for order in orders:
         order.submitted = True
+        order.submitted_at = now
     db.commit()
     return {"submitted": len(orders)}
 

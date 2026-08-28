@@ -64,6 +64,8 @@ class WorkOrder(Base):
     # are treated as moved to Production — hidden from both the colleague and
     # Team Lead active views, and locked from further edits by anyone.
     submitted = Column(Boolean, default=False, nullable=False)
+    # When the end-of-day Submit action moved this row to Production.
+    submitted_at = Column(DateTime, nullable=True)
 
     assigned_to_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     assignee = relationship("User", back_populates="orders")
