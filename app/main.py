@@ -258,6 +258,9 @@ def list_production_orders(
     created_end: Optional[date] = None,
     employee_name: Optional[str] = None,
     def_doc_type: Optional[str] = None,
+    division: Optional[str] = None,
+    escalation_category: Optional[str] = None,
+    posting_status: Optional[str] = None,
     current_user: models.User = Depends(auth.require_role("team_lead")),
     db: Session = Depends(get_db),
 ):
@@ -288,10 +291,25 @@ def list_production_orders(
     if created_end:
         query = query.filter(models.WorkOrder.created <= datetime.combine(created_end, datetime.max.time()))
 
-    if employee_name:
-        query = query.filter(models.WorkOrder.employee_name.ilike(f"%{employee_name}%"))
-    if def_doc_type:
-        query = query.filter(models.WorkOrder.def_doc_type.ilike(f"%{def_doc_type}%"))
+    # Each of these accepts a comma-separated list of exact values, matching
+    # a multi-select dropdown built from the distinct values actually present
+    # in the data (rather than free-text partial matching).
+    def _in_filter(column, raw: Optional[str]):
+        if not raw:
+            return None
+        values = [v.strip() for v in raw.split(",") if v.strip()]
+        return column.in_(values) if values else None
+
+    for column, raw in [
+        (models.WorkOrder.employee_name, employee_name),
+        (models.WorkOrder.def_doc_type, def_doc_type),
+        (models.WorkOrder.division, division),
+        (models.WorkOrder.escalation_category, escalation_category),
+        (models.WorkOrder.posting_status, posting_status),
+    ]:
+        cond = _in_filter(column, raw)
+        if cond is not None:
+            query = query.filter(cond)
 
     return query.order_by(models.WorkOrder.posted_date.asc(), models.WorkOrder.id.asc()).all()
 
