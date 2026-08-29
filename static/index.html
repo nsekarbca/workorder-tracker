@@ -64,21 +64,38 @@
       <button class="action-btn" onclick="loadOrders()">Refresh</button>
       <button class="action-btn" id="submit-day-btn" style="display:none; background:#2fa63f;" onclick="submitEndOfDay()">Submit End of Day</button>
     </div>
-    <div id="production-bar" style="display:none; margin-bottom:12px; gap:14px; align-items:flex-end; flex-wrap:wrap;">
-      <label>Posted Date From <input type="date" id="prod-posted-start"></label>
-      <label>To <input type="date" id="prod-posted-end"></label>
-      <label>Received Date From <input type="date" id="prod-received-start"></label>
-      <label>To <input type="date" id="prod-received-end"></label>
-      <label>Assigned Date From <input type="date" id="prod-assigned-start"></label>
-      <label>To <input type="date" id="prod-assigned-end"></label>
-      <label>Created From <input type="date" id="prod-created-start"></label>
-      <label>To <input type="date" id="prod-created-end"></label>
-      <label>Employee Name <input type="text" id="prod-employee-name" placeholder="contains..." style="width:120px;"></label>
-      <label>Def Doc Type <input type="text" id="prod-doc-type" placeholder="contains..." style="width:120px;"></label>
-      <button class="action-btn" onclick="loadProduction()">Load</button>
-      <button class="action-btn" onclick="exportProductionCSV()">Export CSV</button>
-      <button class="action-btn" onclick="clearProductionFilters()">Clear Filters</button>
-      <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
+    <div id="production-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px;">
+      <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
+        <label>Date Field
+          <select id="prod-date-field" onchange="onDateFieldChange()">
+            <option value="posted">Posted Date</option>
+            <option value="received">Received Date</option>
+            <option value="assigned">Assigned Date</option>
+            <option value="created">Created</option>
+          </select>
+        </label>
+        <label>From <input type="date" id="prod-date-from"></label>
+        <label>To <input type="date" id="prod-date-to"></label>
+      </div>
+      <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
+        <label>Filter By
+          <select id="prod-filter-field" onchange="onFilterFieldChange()">
+            <option value="employee_name">Employee Name</option>
+            <option value="def_doc_type">Def Doc Type</option>
+            <option value="division">Division</option>
+            <option value="escalation_category">Escalation Category</option>
+            <option value="posting_status">Posting Status</option>
+          </select>
+        </label>
+        <select id="prod-filter-values" multiple size="5" style="min-width:200px;"></select>
+        <span style="font-size:12px; color:#666;">Ctrl/Cmd-click to select multiple</span>
+      </div>
+      <div style="display:flex; gap:10px;">
+        <button class="action-btn" onclick="loadProduction()">Load</button>
+        <button class="action-btn" onclick="exportProductionCSV()">Export CSV</button>
+        <button class="action-btn" onclick="clearProductionFilters()">Clear Filters</button>
+        <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
+      </div>
     </div>
     <div id="grid-container"></div>
   </div>
@@ -254,10 +271,33 @@ async function submitEndOfDay() {
   loadOrders();
 }
 
-function showProductionView() {
+const DATE_FIELD_PARAMS = {
+  posted: ["start_date", "end_date"],
+  received: ["received_start", "received_end"],
+  assigned: ["assigned_start", "assigned_end"],
+  created: ["created_start", "created_end"],
+};
+const VALUE_FILTER_FIELDS = ["employee_name", "def_doc_type", "division", "escalation_category", "posting_status"];
+
+let dateFilters = {posted:{from:"",to:""}, received:{from:"",to:""}, assigned:{from:"",to:""}, created:{from:"",to:""}};
+let valueFilters = {employee_name:[], def_doc_type:[], division:[], escalation_category:[], posting_status:[]};
+let productionAllForOptions = [];
+
+async function showProductionView() {
   viewMode = "production";
   document.getElementById("toolbar").style.display = "none";
   document.getElementById("production-bar").style.display = "flex";
+
+  dateFilters = {posted:{from:"",to:""}, received:{from:"",to:""}, assigned:{from:"",to:""}, created:{from:"",to:""}};
+  valueFilters = {employee_name:[], def_doc_type:[], division:[], escalation_category:[], posting_status:[]};
+  document.getElementById("prod-date-field").value = "posted";
+  document.getElementById("prod-filter-field").value = "employee_name";
+  document.getElementById("prod-date-from").value = "";
+  document.getElementById("prod-date-to").value = "";
+
+  const res = await authFetch("/orders/production");
+  if (res.ok) productionAllForOptions = await res.json();
+  populateFilterValueOptions();
   loadProduction();
 }
 
@@ -268,24 +308,66 @@ function showActiveView() {
   loadOrders();
 }
 
-async function loadProduction() {
-  const params = new URLSearchParams();
-  const fieldMap = {
-    "prod-posted-start": "start_date",
-    "prod-posted-end": "end_date",
-    "prod-received-start": "received_start",
-    "prod-received-end": "received_end",
-    "prod-assigned-start": "assigned_start",
-    "prod-assigned-end": "assigned_end",
-    "prod-created-start": "created_start",
-    "prod-created-end": "created_end",
-    "prod-employee-name": "employee_name",
-    "prod-doc-type": "def_doc_type",
+function onDateFieldChange() {
+  const prevField = document.getElementById("prod-date-field").dataset.prev || "posted";
+  dateFilters[prevField] = {
+    from: document.getElementById("prod-date-from").value,
+    to: document.getElementById("prod-date-to").value,
   };
-  for (const [elId, param] of Object.entries(fieldMap)) {
-    const val = document.getElementById(elId).value;
-    if (val) params.set(param, val);
+  const field = document.getElementById("prod-date-field").value;
+  document.getElementById("prod-date-field").dataset.prev = field;
+  document.getElementById("prod-date-from").value = dateFilters[field].from || "";
+  document.getElementById("prod-date-to").value = dateFilters[field].to || "";
+}
+
+function onFilterFieldChange() {
+  syncCurrentFilterSelection();
+  populateFilterValueOptions();
+}
+
+function syncCurrentFilterSelection() {
+  const field = document.getElementById("prod-filter-field").dataset.prev || document.getElementById("prod-filter-field").value;
+  const sel = document.getElementById("prod-filter-values");
+  valueFilters[field] = Array.from(sel.selectedOptions).map(o => o.value);
+  document.getElementById("prod-filter-field").dataset.prev = document.getElementById("prod-filter-field").value;
+}
+
+function populateFilterValueOptions() {
+  const field = document.getElementById("prod-filter-field").value;
+  const distinct = Array.from(new Set(
+    productionAllForOptions.map(o => o[field]).filter(v => v !== null && v !== undefined && v !== "")
+  )).sort();
+  const sel = document.getElementById("prod-filter-values");
+  sel.innerHTML = "";
+  distinct.forEach(v => {
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = v;
+    if ((valueFilters[field] || []).includes(v)) opt.selected = true;
+    sel.appendChild(opt);
+  });
+}
+
+async function loadProduction() {
+  // Capture whatever's currently showing in the two dropdowns before building params.
+  const activeDateField = document.getElementById("prod-date-field").value;
+  dateFilters[activeDateField] = {
+    from: document.getElementById("prod-date-from").value,
+    to: document.getElementById("prod-date-to").value,
+  };
+  syncCurrentFilterSelection();
+
+  const params = new URLSearchParams();
+  for (const [field, {from, to}] of Object.entries(dateFilters)) {
+    const [fromParam, toParam] = DATE_FIELD_PARAMS[field];
+    if (from) params.set(fromParam, from);
+    if (to) params.set(toParam, to);
   }
+  for (const field of VALUE_FILTER_FIELDS) {
+    const values = valueFilters[field] || [];
+    if (values.length) params.set(field, values.join(","));
+  }
+
   const res = await authFetch("/orders/production?" + params.toString());
   if (!res.ok) {
     alert("Failed to load Production data: " + (await res.text()));
@@ -296,9 +378,11 @@ async function loadProduction() {
 }
 
 function clearProductionFilters() {
-  ["prod-posted-start","prod-posted-end","prod-received-start","prod-received-end",
-   "prod-assigned-start","prod-assigned-end","prod-created-start","prod-created-end",
-   "prod-employee-name","prod-doc-type"].forEach(id => document.getElementById(id).value = "");
+  dateFilters = {posted:{from:"",to:""}, received:{from:"",to:""}, assigned:{from:"",to:""}, created:{from:"",to:""}};
+  valueFilters = {employee_name:[], def_doc_type:[], division:[], escalation_category:[], posting_status:[]};
+  document.getElementById("prod-date-from").value = "";
+  document.getElementById("prod-date-to").value = "";
+  populateFilterValueOptions();
   loadProduction();
 }
 
@@ -342,8 +426,9 @@ function exportProductionCSV() {
   const blob = new Blob([csv], {type: "text/csv;charset=utf-8;"});
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  const start = document.getElementById("prod-posted-start").value || "all";
-  const end = document.getElementById("prod-posted-end").value || "all";
+  const activeDateField = document.getElementById("prod-date-field").value;
+  const start = dateFilters[activeDateField].from || "all";
+  const end = dateFilters[activeDateField].to || "all";
   a.href = url;
   a.download = `production_${start}_to_${end}.csv`;
   document.body.appendChild(a);
