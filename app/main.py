@@ -261,15 +261,19 @@ def list_production_orders(
     division: Optional[str] = None,
     escalation_category: Optional[str] = None,
     posting_status: Optional[str] = None,
-    current_user: models.User = Depends(auth.require_role("team_lead")),
+    current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
 ):
     """
-    Team-Lead-only view of everything already submitted to Production.
+    Everything already submitted to Production. Team Lead sees everyone's;
+    a colleague only ever sees their own — enforced server-side regardless
+    of what filters are passed, not just hidden in the UI.
     All filters are optional and combine with AND. start_date/end_date filter
     by Posted Date (inclusive) — the day the work was actually completed.
     """
     query = db.query(models.WorkOrder).filter(models.WorkOrder.submitted == True)  # noqa: E712
+    if current_user.role == "colleague":
+        query = query.filter(models.WorkOrder.assigned_to_id == current_user.id)
 
     if start_date:
         query = query.filter(models.WorkOrder.posted_date >= start_date)
