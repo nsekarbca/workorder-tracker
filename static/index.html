@@ -79,13 +79,7 @@
       </div>
       <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
         <label>Filter By
-          <select id="prod-filter-field" onchange="onFilterFieldChange()">
-            <option value="employee_name">Employee Name</option>
-            <option value="def_doc_type">Def Doc Type</option>
-            <option value="division">Division</option>
-            <option value="escalation_category">Escalation Category</option>
-            <option value="posting_status">Posting Status</option>
-          </select>
+          <select id="prod-filter-field" onchange="onFilterFieldChange()"></select>
         </label>
         <select id="prod-filter-values" multiple size="5" style="min-width:200px;"></select>
         <span style="font-size:12px; color:#666;">Ctrl/Cmd-click to select multiple</span>
@@ -199,7 +193,7 @@ function showApp() {
   document.getElementById("whoami").textContent = `${fullName} (${role})`;
   document.getElementById("role-note").textContent = role === "team_lead"
     ? "Received Date, Assigned Date, Employee, and Employee Name are set automatically. Completed rows can still be corrected until submitted."
-    : "Edit fields, then click Save. Pending $ is auto-calculated. Locked once Completed \u2014 click Submit End of Day to send finished work to Production.";
+    : "Edit fields, then click Save. Pending $ is auto-calculated. Locked once Completed \u2014 click Submit End of Day to send finished work to Production. Use Production to view/export your own submitted history.";
   if (role === "team_lead") {
     document.getElementById("import-btn").style.display = "inline-block";
     document.getElementById("run-assign-btn").style.display = "inline-block";
@@ -208,6 +202,7 @@ function showApp() {
     document.getElementById("import-file").addEventListener("change", importCSV);
   } else {
     document.getElementById("submit-day-btn").style.display = "inline-block";
+    document.getElementById("production-btn").style.display = "inline-block";
   }
   loadOrders();
 }
@@ -278,6 +273,25 @@ const DATE_FIELD_PARAMS = {
   created: ["created_start", "created_end"],
 };
 const VALUE_FILTER_FIELDS = ["employee_name", "def_doc_type", "division", "escalation_category", "posting_status"];
+const FILTER_FIELD_OPTIONS = [
+  {value: "employee_name", label: "Employee Name", teamLeadOnly: true},
+  {value: "def_doc_type", label: "Def Doc Type"},
+  {value: "division", label: "Division"},
+  {value: "escalation_category", label: "Escalation Category"},
+  {value: "posting_status", label: "Posting Status"},
+];
+
+function populateFilterFieldDropdown() {
+  const sel = document.getElementById("prod-filter-field");
+  sel.innerHTML = "";
+  FILTER_FIELD_OPTIONS.forEach(opt => {
+    if (opt.teamLeadOnly && role !== "team_lead") return;
+    const o = document.createElement("option");
+    o.value = opt.value;
+    o.textContent = opt.label;
+    sel.appendChild(o);
+  });
+}
 
 let dateFilters = {posted:{from:"",to:""}, received:{from:"",to:""}, assigned:{from:"",to:""}, created:{from:"",to:""}};
 let valueFilters = {employee_name:[], def_doc_type:[], division:[], escalation_category:[], posting_status:[]};
@@ -291,7 +305,8 @@ async function showProductionView() {
   dateFilters = {posted:{from:"",to:""}, received:{from:"",to:""}, assigned:{from:"",to:""}, created:{from:"",to:""}};
   valueFilters = {employee_name:[], def_doc_type:[], division:[], escalation_category:[], posting_status:[]};
   document.getElementById("prod-date-field").value = "posted";
-  document.getElementById("prod-filter-field").value = "employee_name";
+  populateFilterFieldDropdown();
+  document.getElementById("prod-filter-field").value = role === "team_lead" ? "employee_name" : "def_doc_type";
   document.getElementById("prod-date-from").value = "";
   document.getElementById("prod-date-to").value = "";
 
