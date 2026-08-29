@@ -64,11 +64,20 @@
       <button class="action-btn" onclick="loadOrders()">Refresh</button>
       <button class="action-btn" id="submit-day-btn" style="display:none; background:#2fa63f;" onclick="submitEndOfDay()">Submit End of Day</button>
     </div>
-    <div id="production-bar" style="display:none; margin-bottom:12px; gap:10px; align-items:center;">
-      <label>From <input type="date" id="prod-start-date"></label>
-      <label>To <input type="date" id="prod-end-date"></label>
+    <div id="production-bar" style="display:none; margin-bottom:12px; gap:14px; align-items:flex-end; flex-wrap:wrap;">
+      <label>Posted Date From <input type="date" id="prod-posted-start"></label>
+      <label>To <input type="date" id="prod-posted-end"></label>
+      <label>Received Date From <input type="date" id="prod-received-start"></label>
+      <label>To <input type="date" id="prod-received-end"></label>
+      <label>Assigned Date From <input type="date" id="prod-assigned-start"></label>
+      <label>To <input type="date" id="prod-assigned-end"></label>
+      <label>Created From <input type="date" id="prod-created-start"></label>
+      <label>To <input type="date" id="prod-created-end"></label>
+      <label>Employee Name <input type="text" id="prod-employee-name" placeholder="contains..." style="width:120px;"></label>
+      <label>Def Doc Type <input type="text" id="prod-doc-type" placeholder="contains..." style="width:120px;"></label>
       <button class="action-btn" onclick="loadProduction()">Load</button>
       <button class="action-btn" onclick="exportProductionCSV()">Export CSV</button>
+      <button class="action-btn" onclick="clearProductionFilters()">Clear Filters</button>
       <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
     </div>
     <div id="grid-container"></div>
@@ -260,11 +269,23 @@ function showActiveView() {
 }
 
 async function loadProduction() {
-  const start = document.getElementById("prod-start-date").value;
-  const end = document.getElementById("prod-end-date").value;
   const params = new URLSearchParams();
-  if (start) params.set("start_date", start);
-  if (end) params.set("end_date", end);
+  const fieldMap = {
+    "prod-posted-start": "start_date",
+    "prod-posted-end": "end_date",
+    "prod-received-start": "received_start",
+    "prod-received-end": "received_end",
+    "prod-assigned-start": "assigned_start",
+    "prod-assigned-end": "assigned_end",
+    "prod-created-start": "created_start",
+    "prod-created-end": "created_end",
+    "prod-employee-name": "employee_name",
+    "prod-doc-type": "def_doc_type",
+  };
+  for (const [elId, param] of Object.entries(fieldMap)) {
+    const val = document.getElementById(elId).value;
+    if (val) params.set(param, val);
+  }
   const res = await authFetch("/orders/production?" + params.toString());
   if (!res.ok) {
     alert("Failed to load Production data: " + (await res.text()));
@@ -272,6 +293,13 @@ async function loadProduction() {
   }
   currentProduction = await res.json();
   renderProductionGrid(currentProduction);
+}
+
+function clearProductionFilters() {
+  ["prod-posted-start","prod-posted-end","prod-received-start","prod-received-end",
+   "prod-assigned-start","prod-assigned-end","prod-created-start","prod-created-end",
+   "prod-employee-name","prod-doc-type"].forEach(id => document.getElementById(id).value = "");
+  loadProduction();
 }
 
 function renderProductionGrid(orders) {
@@ -314,8 +342,8 @@ function exportProductionCSV() {
   const blob = new Blob([csv], {type: "text/csv;charset=utf-8;"});
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  const start = document.getElementById("prod-start-date").value || "all";
-  const end = document.getElementById("prod-end-date").value || "all";
+  const start = document.getElementById("prod-posted-start").value || "all";
+  const end = document.getElementById("prod-posted-end").value || "all";
   a.href = url;
   a.download = `production_${start}_to_${end}.csv`;
   document.body.appendChild(a);
