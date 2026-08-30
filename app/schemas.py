@@ -18,6 +18,10 @@ class UserOut(BaseModel):
         from_attributes = True
 
 
+class ReassignRequest(BaseModel):
+    assigned_to_id: int
+
+
 # Fields a Team Lead may set (A-D)
 class TeamLeadUpdate(BaseModel):
     received_date: Optional[date] = None
@@ -104,6 +108,7 @@ class WorkOrderOut(BaseModel):
     tat_days: Optional[int]
     assigned_to_id: Optional[int]
     submitted: bool
+    submitted_at: Optional[datetime]
 
     class Config:
         from_attributes = True

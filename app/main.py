@@ -102,6 +102,15 @@ def read_me(current_user: models.User = Depends(auth.get_current_user)):
     return current_user
 
 
+@app.get("/users/colleagues", response_model=List[schemas.UserOut])
+def list_colleagues(
+    current_user: models.User = Depends(auth.require_role("team_lead")),
+    db: Session = Depends(get_db),
+):
+    """Team-Lead-only — populates the Reassign dropdown."""
+    return db.query(models.User).filter(models.User.role == "colleague").order_by(models.User.full_name.asc()).all()
+
+
 @app.post("/orders/run-assignment")
 def run_assignment(
     current_user: models.User = Depends(auth.require_role("team_lead")),
@@ -114,6 +123,45 @@ def run_assignment(
     """
     _auto_assign_open_slots(db)
     return {"status": "assignment pass complete"}
+
+
+@app.patch("/orders/{order_id}/reassign", response_model=schemas.WorkOrderOut)
+def reassign_order(
+    order_id: int,
+    payload: schemas.ReassignRequest,
+    current_user: models.User = Depends(auth.require_role("team_lead")),
+    db: Session = Depends(get_db),
+):
+    """
+    Manually reassign an In-Process (or Clarification) order to a different
+    colleague. Not available once an order is Completed — use the
+    team-lead-correction flow for a completed-but-unsubmitted row instead,
+    and reassignment is meaningless once it's been submitted to Production.
+    """
+    order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.submitted:
+        raise HTTPException(status_code=403, detail="This order has been submitted to Production")
+    if order.posting_status == "Completed":
+        raise HTTPException(status_code=403, detail="Completed orders can't be reassigned this way")
+
+    new_colleague = (
+        db.query(models.User)
+        .filter(models.User.id == payload.assigned_to_id, models.User.role == "colleague")
+        .first()
+    )
+    if not new_colleague:
+        raise HTTPException(status_code=400, detail="Not a valid colleague")
+
+    order.assigned_to_id = new_colleague.id
+    order.assigned_date = date.today()
+    order.employee_id = new_colleague.employee_id or new_colleague.username
+    order.employee_name = new_colleague.full_name
+    order.last_edited_by = current_user.username
+    db.commit()
+    db.refresh(order)
+    return order
 
 
 @app.delete("/orders/all")
