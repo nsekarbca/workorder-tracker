@@ -162,6 +162,7 @@ function parseCurrency(val) {
 if (token) showApp();
 let currentOrders = [];
 let currentProduction = [];
+let colleagueList = [];
 let viewMode = "active"; // "active" or "production"
 let drafts = {}; // order.id -> {field: value} pending unsaved edits
 
@@ -200,6 +201,7 @@ function showApp() {
     document.getElementById("clear-data-btn").style.display = "inline-block";
     document.getElementById("production-btn").style.display = "inline-block";
     document.getElementById("import-file").addEventListener("change", importCSV);
+    loadColleagueList();
   } else {
     document.getElementById("submit-day-btn").style.display = "inline-block";
     document.getElementById("production-btn").style.display = "inline-block";
@@ -452,6 +454,32 @@ function exportProductionCSV() {
   URL.revokeObjectURL(url);
 }
 
+async function loadColleagueList() {
+  const res = await authFetch("/users/colleagues");
+  if (res.ok) colleagueList = await res.json();
+}
+
+async function reassignOrder(orderId, newColleagueId, selectEl) {
+  if (!newColleagueId) return;
+  const colleague = colleagueList.find(c => c.id === parseInt(newColleagueId));
+  const sure = confirm(`Reassign this order to ${colleague ? colleague.full_name : "this colleague"}?`);
+  if (!sure) {
+    loadOrders(); // reset the dropdown back to its saved value
+    return;
+  }
+  const res = await authFetch(`/orders/${orderId}/reassign`, {
+    method: "PATCH",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({assigned_to_id: parseInt(newColleagueId)})
+  });
+  if (!res.ok) {
+    alert("Reassign failed: " + (await res.text()));
+    loadOrders();
+    return;
+  }
+  loadOrders();
+}
+
 async function loadOrders() {
   const res = await authFetch("/orders");
   currentOrders = await res.json();
@@ -476,7 +504,7 @@ function renderGrid(orders) {
   const cols = visibleColumns();
   let html = "<table><thead><tr>";
   cols.forEach(c => html += `<th class="${c.group}">${c.label}</th>`);
-  if (role === "colleague" || role === "team_lead") html += `<th class="col">Save</th>`;
+  if (role === "colleague" || role === "team_lead") html += `<th class="col">Action</th>`;
   html += "</tr></thead><tbody>";
 
   orders.forEach(o => {
@@ -562,7 +590,13 @@ function renderGrid(orders) {
       if (tlCanCorrect) {
         html += `<td><button class="action-btn" onclick="saveRow(${o.id})" ${hasDraft ? "" : "disabled"}>Save</button></td>`;
       } else {
-        html += `<td>\u2014</td>`;
+        html += `<td><select onchange="reassignOrder(${o.id}, this.value)">`;
+        html += `<option value="">Reassign\u2026</option>`;
+        colleagueList.forEach(c => {
+          const isCurrent = c.id === o.assigned_to_id;
+          html += `<option value="${c.id}" ${isCurrent ? "selected" : ""}>${c.full_name}${isCurrent ? " (current)" : ""}</option>`;
+        });
+        html += `</select></td>`;
       }
     }
     html += `</tr>`;
