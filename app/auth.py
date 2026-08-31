@@ -1,4 +1,6 @@
 import os
+import secrets
+import string
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -67,3 +69,16 @@ def require_role(*roles: str):
         return user
 
     return role_checker
+
+
+def generate_temp_password(length: int = 12) -> str:
+    """
+    Readable-ish random temp password: guarantees at least one of each
+    character class so it always passes typical password rules.
+    """
+    alphabet = string.ascii_letters + string.digits
+    while True:
+        pwd = "".join(secrets.choice(alphabet) for _ in range(length))
+        if (any(c.islower() for c in pwd) and any(c.isupper() for c in pwd)
+                and any(c.isdigit() for c in pwd)):
+            return pwd
