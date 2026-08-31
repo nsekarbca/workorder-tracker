@@ -163,7 +163,7 @@
       </div>
     </div>
     <div id="admin-panel" style="display:none;">
-      <h3>Create User</h3>
+      <h3 id="user-form-heading">Create User</h3>
       <div class="form-grid">
         <label>Username <input id="nu-username"></label>
         <label>Full Name <input id="nu-full-name"></label>
@@ -192,7 +192,8 @@
         <select id="nu-processes" multiple size="5"></select>
       </label>
       <div style="margin-top:12px;">
-        <button class="action-btn" onclick="createUser()">Create User</button>
+        <button class="action-btn" id="user-form-submit-btn" onclick="saveUser()">Create User</button>
+        <button class="action-btn" id="user-form-cancel-btn" style="display:none; background:#888;" onclick="cancelEditUser()">Cancel</button>
       </div>
       <hr style="margin:20px 0;">
       <h3>Existing Users</h3>
@@ -271,6 +272,7 @@ let currentProduction = [];
 let colleagueList = [];
 let allUsers = [];
 let allProcesses = [];
+let editingUserId = null;
 let viewMode = "active"; // "active", "production", or "admin"
 let drafts = {};
 
@@ -546,6 +548,7 @@ async function showAdminView() {
   });
 
   await loadUserList();
+  cancelEditUser();
 }
 
 async function loadUserList() {
@@ -555,13 +558,59 @@ async function loadUserList() {
   let html = "<table><thead><tr><th>Full Name</th><th>Username</th><th>Role</th><th>Email</th><th>Status</th><th>Processes</th><th>Action</th></tr></thead><tbody>";
   allUsers.forEach(u => {
     html += `<tr><td>${u.full_name}</td><td>${u.username}</td><td>${u.role}</td><td>${u.email || ""}</td><td>${u.employment_status}</td><td>${u.processes.map(p=>p.name).join(", ")}</td>`;
-    html += `<td><button class="action-btn" onclick="resetUserPassword(${u.id})">Reset Password</button></td></tr>`;
+    html += `<td>
+      <button class="action-btn" onclick="editUser(${u.id})">Edit</button>
+      <button class="action-btn" onclick="resetUserPassword(${u.id})">Reset Password</button>
+    </td></tr>`;
   });
   html += "</tbody></table>";
   document.getElementById("user-list").innerHTML = html;
 }
 
-async function createUser() {
+function clearUserForm() {
+  ["nu-username","nu-full-name","nu-employee-id","nu-email","nu-designation",
+   "nu-reporting-manager","nu-dob","nu-doj","nu-anniversary"].forEach(id => document.getElementById(id).value = "");
+  document.getElementById("nu-role").value = "colleague";
+  document.getElementById("nu-employment-status").value = "Active";
+  Array.from(document.getElementById("nu-processes").options).forEach(o => o.selected = false);
+}
+
+function editUser(userId) {
+  const u = allUsers.find(x => x.id === userId);
+  if (!u) return;
+  editingUserId = userId;
+  document.getElementById("nu-username").value = u.username;
+  document.getElementById("nu-username").disabled = true; // usernames can't be changed
+  document.getElementById("nu-full-name").value = u.full_name;
+  document.getElementById("nu-role").value = u.role;
+  document.getElementById("nu-employee-id").value = u.employee_id || "";
+  document.getElementById("nu-email").value = u.email || "";
+  document.getElementById("nu-designation").value = u.designation || "";
+  document.getElementById("nu-reporting-manager").value = u.reporting_manager || "";
+  document.getElementById("nu-employment-status").value = u.employment_status;
+  document.getElementById("nu-dob").value = u.dob || "";
+  document.getElementById("nu-doj").value = u.doj || "";
+  document.getElementById("nu-anniversary").value = u.anniversary_date || "";
+  const currentProcessIds = (u.processes || []).map(p => p.id);
+  Array.from(document.getElementById("nu-processes").options).forEach(o => {
+    o.selected = currentProcessIds.includes(parseInt(o.value));
+  });
+  document.getElementById("user-form-heading").textContent = `Edit User: ${u.full_name}`;
+  document.getElementById("user-form-submit-btn").textContent = "Update User";
+  document.getElementById("user-form-cancel-btn").style.display = "inline-block";
+  document.getElementById("user-form-heading").scrollIntoView({behavior: "smooth"});
+}
+
+function cancelEditUser() {
+  editingUserId = null;
+  document.getElementById("nu-username").disabled = false;
+  clearUserForm();
+  document.getElementById("user-form-heading").textContent = "Create User";
+  document.getElementById("user-form-submit-btn").textContent = "Create User";
+  document.getElementById("user-form-cancel-btn").style.display = "none";
+}
+
+async function saveUser() {
   const processIds = Array.from(document.getElementById("nu-processes").selectedOptions).map(o => parseInt(o.value));
   const payload = {
     username: document.getElementById("nu-username").value,
@@ -581,6 +630,23 @@ async function createUser() {
     alert("Username and Full Name are required.");
     return;
   }
+
+  if (editingUserId) {
+    const res = await authFetch(`/users/${editingUserId}`, {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      alert("Failed to update user: " + (await res.text()));
+      return;
+    }
+    alert("User updated.");
+    cancelEditUser();
+    loadUserList();
+    return;
+  }
+
   const res = await authFetch("/users", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
@@ -592,7 +658,7 @@ async function createUser() {
   }
   const data = await res.json();
   alert(`User created.\n\nUsername: ${data.user.username}\nTemporary Password: ${data.temporary_password}\n\nPlease share these with the user securely \u2014 no email was sent.`);
-  ["nu-username","nu-full-name","nu-employee-id","nu-email","nu-designation","nu-reporting-manager","nu-dob","nu-doj","nu-anniversary"].forEach(id => document.getElementById(id).value = "");
+  clearUserForm();
   loadUserList();
 }
 
@@ -994,11 +1060,11 @@ function renderGrid(orders) {
       if (locked) {
         html += `<td>Locked</td>`;
       } else {
-        html += `<td><button class="action-btn" onclick="saveRow(${o.id})" ${hasDraft ? "" : "disabled"}>Save</button></td>`;
+        html += `<td><button class="action-btn" onclick="saveRow(${o.id}, this)" ${hasDraft ? "" : "disabled"}>Save</button></td>`;
       }
     } else if (isLeadRole()) {
       if (tlCanCorrect) {
-        html += `<td><button class="action-btn" onclick="saveRow(${o.id})" ${hasDraft ? "" : "disabled"}>Save</button></td>`;
+        html += `<td><button class="action-btn" onclick="saveRow(${o.id}, this)" ${hasDraft ? "" : "disabled"}>Save</button></td>`;
       } else {
         html += `<td><select onchange="reassignOrder(${o.id}, this.value)">`;
         html += `<option value="">Reassign\u2026</option>`;
@@ -1036,9 +1102,11 @@ function updateDraft(input) {
   renderGrid(currentOrders);
 }
 
-async function saveRow(orderId) {
+async function saveRow(orderId, btn) {
   const draft = drafts[orderId];
   if (!draft || Object.keys(draft).length === 0) return;
+  if (btn) { btn.disabled = true; btn.textContent = "Saving\u2026"; }
+  const resetBtn = () => { if (btn) { btn.disabled = false; btn.textContent = "Save"; } };
   const order = currentOrders.find(o => o.id === orderId);
 
   const payload = {};
@@ -1055,6 +1123,7 @@ async function saveRow(orderId) {
     });
     if (!res.ok) {
       alert("Save failed: " + (await res.text()));
+      resetBtn();
       return;
     }
     delete drafts[orderId];
@@ -1073,6 +1142,7 @@ async function saveRow(orderId) {
   if (finalTrans === null || finalTrans === undefined || finalTrans === "") missing.push("Trans Count");
   if (missing.length) {
     alert("Cannot save \u2014 missing required: " + missing.join(", "));
+    resetBtn();
     return;
   }
 
@@ -1082,6 +1152,7 @@ async function saveRow(orderId) {
     );
     if (blocked.length) {
       alert("Cannot edit " + blocked.join(", ") + " unless Posting Status is Clarification");
+      resetBtn();
       return;
     }
   }
@@ -1093,6 +1164,7 @@ async function saveRow(orderId) {
   });
   if (!res.ok) {
     alert("Save failed: " + (await res.text()));
+    resetBtn();
     return;
   }
   delete drafts[orderId];
