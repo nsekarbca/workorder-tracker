@@ -1,5 +1,5 @@
 from datetime import date, datetime
-from typing import Optional
+from typing import Optional, List
 from pydantic import BaseModel
 
 
@@ -8,14 +8,84 @@ class UserLogin(BaseModel):
     password: str
 
 
+class ProcessOut(BaseModel):
+    id: int
+    name: str
+
+    class Config:
+        from_attributes = True
+
+
 class UserOut(BaseModel):
     id: int
     username: str
     full_name: str
     role: str
+    email: Optional[str] = None
+    dob: Optional[date] = None
+    doj: Optional[date] = None
+    anniversary_date: Optional[date] = None
+    designation: Optional[str] = None
+    reporting_manager: Optional[str] = None
+    employment_status: str = "Active"
+    must_change_password: bool = True
+    processes: List[ProcessOut] = []
 
     class Config:
         from_attributes = True
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str
+    role: str
+    full_name: str
+    must_change_password: bool
+    processes: List[ProcessOut] = []
+
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str
+    new_password: str
+
+
+class ForgotUsernameRequest(BaseModel):
+    email: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    username_or_email: str
+
+
+class ResetPasswordWithTokenRequest(BaseModel):
+    token: str
+    new_password: str
+
+
+# Super-Admin-only: create a full user profile in one step.
+class CreateUserRequest(BaseModel):
+    username: str
+    full_name: str
+    role: str  # "colleague", "team_lead", or "super_admin"
+    email: Optional[str] = None
+    dob: Optional[date] = None
+    doj: Optional[date] = None
+    anniversary_date: Optional[date] = None
+    designation: Optional[str] = None
+    reporting_manager: Optional[str] = None
+    employment_status: str = "Active"
+    employee_id: Optional[str] = None
+    process_ids: List[int] = []
+
+
+class CreateUserResponse(BaseModel):
+    user: UserOut
+    temporary_password: str
+
+
+class ResetPasswordResponse(BaseModel):
+    username: str
+    temporary_password: str
 
 
 class ReassignRequest(BaseModel):
@@ -79,6 +149,7 @@ class TeamLeadCorrection(BaseModel):
 
 class WorkOrderOut(BaseModel):
     id: int
+    process_id: Optional[int]
     received_date: Optional[date]
     assigned_date: Optional[date]
     employee_id: Optional[str]

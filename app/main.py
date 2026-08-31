@@ -1,5 +1,6 @@
 from datetime import date, datetime, timedelta
 from typing import List, Optional
+import secrets
 
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,7 +12,7 @@ import io
 
 import os
 
-from . import models, schemas, auth
+from . import models, schemas, auth, email_utils
 from .database import Base, engine, get_db, SessionLocal
 
 Base.metadata.create_all(bind=engine)
@@ -27,74 +28,86 @@ app.add_middleware(
 
 
 @app.on_event("startup")
-def bootstrap_first_team_lead():
+def bootstrap_and_seed():
     """
-    Creates the very first Team Lead login automatically, from environment
-    variables, if no users exist yet. This means no local script and no
-    Python install is needed on your machine — just set BOOTSTRAP_USERNAME
-    and BOOTSTRAP_PASSWORD as env vars on Render and the account is ready
-    the moment the app deploys.
+    Creates the very first login automatically, from environment variables,
+    if no users exist yet — as super_admin, since only a super_admin can
+    create further accounts. Also seeds the fixed process list (idempotent —
+    safe to run on every startup).
     """
     db = SessionLocal()
     try:
-        if db.query(models.User).first() is not None:
-            return
-        username = os.getenv("BOOTSTRAP_USERNAME")
-        password = os.getenv("BOOTSTRAP_PASSWORD")
-        if not username or not password:
-            return
-        db.add(models.User(
-            username=username,
-            full_name="Team Lead",
-            role="team_lead",
-            password_hash=auth.hash_password(password),
-        ))
+        for name in models.PROCESS_NAMES:
+            if not db.query(models.Process).filter(models.Process.name == name).first():
+                db.add(models.Process(name=name))
         db.commit()
+
+        if db.query(models.User).first() is None:
+            username = os.getenv("BOOTSTRAP_USERNAME")
+            password = os.getenv("BOOTSTRAP_PASSWORD")
+            if username and password:
+                admin = models.User(
+                    username=username,
+                    full_name="Super Admin",
+                    role="super_admin",
+                    password_hash=auth.hash_password(password),
+                    must_change_password=True,
+                )
+                admin.processes = db.query(models.Process).all()
+                db.add(admin)
+                db.commit()
     finally:
         db.close()
+
+
+def _user_has_process(user: models.User, process_id: int) -> bool:
+    if user.role == "super_admin":
+        return True
+    return any(p.id == process_id for p in user.processes)
+
+
+def _require_process_access(user: models.User, process_id: int):
+    if not _user_has_process(user, process_id):
+        raise HTTPException(status_code=403, detail="You don't have access to this process")
 
 
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
 
-@app.post("/auth/login")
+@app.post("/auth/login", response_model=schemas.LoginResponse)
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.username == form_data.username).first()
     if not user or not auth.verify_password(form_data.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Incorrect username or password")
+    if user.employment_status == "Inactive":
+        raise HTTPException(status_code=403, detail="This account is inactive")
     token = auth.create_access_token({"sub": user.username})
-    return {"access_token": token, "token_type": "bearer", "role": user.role, "full_name": user.full_name}
+    processes = db.query(models.Process).all() if user.role == "super_admin" else user.processes
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "role": user.role,
+        "full_name": user.full_name,
+        "must_change_password": user.must_change_password,
+        "processes": processes,
+    }
 
 
-@app.post("/auth/register", response_model=schemas.UserOut)
-def register_user(
-    username: str,
-    full_name: str,
-    password: str,
-    role: str,
-    employee_id: Optional[str] = None,
-    current_user: models.User = Depends(auth.require_role("team_lead")),
+@app.post("/auth/change-password")
+def change_password(
+    payload: schemas.ChangePasswordRequest,
+    current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Only a team lead can create new logins (colleagues or other leads)."""
-    if role not in ("team_lead", "colleague"):
-        raise HTTPException(status_code=400, detail="role must be 'team_lead' or 'colleague'")
-    if db.query(models.User).filter(models.User.username == username).first():
-        raise HTTPException(status_code=400, detail="username already exists")
-    user = models.User(
-        username=username,
-        full_name=full_name,
-        password_hash=auth.hash_password(password),
-        role=role,
-        employee_id=employee_id,
-    )
-    db.add(user)
+    if not auth.verify_password(payload.old_password, current_user.password_hash):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    if len(payload.new_password) < 8:
+        raise HTTPException(status_code=400, detail="New password must be at least 8 characters")
+    current_user.password_hash = auth.hash_password(payload.new_password)
+    current_user.must_change_password = False
     db.commit()
-    db.refresh(user)
-    if role == "colleague":
-        _auto_assign_open_slots(db)
-    return user
+    return {"status": "password changed"}
 
 
 @app.get("/auth/me", response_model=schemas.UserOut)
@@ -102,26 +115,191 @@ def read_me(current_user: models.User = Depends(auth.get_current_user)):
     return current_user
 
 
-@app.get("/users/colleagues", response_model=List[schemas.UserOut])
-def list_colleagues(
-    current_user: models.User = Depends(auth.require_role("team_lead")),
+@app.post("/auth/forgot-username")
+def forgot_username(payload: schemas.ForgotUsernameRequest, db: Session = Depends(get_db)):
+    """
+    Always returns the same generic message regardless of whether the email
+    matches an account — avoids leaking which addresses are registered.
+    """
+    user = db.query(models.User).filter(models.User.email == payload.email).first()
+    if user:
+        email_utils.send_username_reminder_email(user.email, user.username)
+    return {"message": "If that email is on file, we've sent the username to it."}
+
+
+@app.post("/auth/forgot-password")
+def forgot_password(payload: schemas.ForgotPasswordRequest, db: Session = Depends(get_db)):
+    """Same generic-response principle as forgot-username, for the same reason."""
+    identifier = payload.username_or_email
+    user = (
+        db.query(models.User)
+        .filter((models.User.username == identifier) | (models.User.email == identifier))
+        .first()
+    )
+    if user and user.email:
+        user.reset_token = secrets.token_urlsafe(32)
+        user.reset_token_expires = datetime.utcnow() + timedelta(hours=1)
+        db.commit()
+        email_utils.send_password_reset_email(user.email, user.username, user.reset_token)
+    return {"message": "If that account exists and has an email on file, we've sent reset instructions."}
+
+
+@app.post("/auth/reset-password-with-token")
+def reset_password_with_token(payload: schemas.ResetPasswordWithTokenRequest, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.reset_token == payload.token).first()
+    if not user or not user.reset_token_expires or user.reset_token_expires < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="This reset link is invalid or has expired")
+    if len(payload.new_password) < 8:
+        raise HTTPException(status_code=400, detail="New password must be at least 8 characters")
+    user.password_hash = auth.hash_password(payload.new_password)
+    user.must_change_password = False
+    user.reset_token = None
+    user.reset_token_expires = None
+    db.commit()
+    return {"status": "password reset — you can now log in with your new password"}
+
+
+# ---------------------------------------------------------------------------
+# User management — Super Admin only
+# ---------------------------------------------------------------------------
+
+@app.get("/users", response_model=List[schemas.UserOut])
+def list_users(
+    current_user: models.User = Depends(auth.require_role("super_admin")),
     db: Session = Depends(get_db),
 ):
-    """Team-Lead-only — populates the Reassign dropdown."""
-    return db.query(models.User).filter(models.User.role == "colleague").order_by(models.User.full_name.asc()).all()
+    return db.query(models.User).order_by(models.User.full_name.asc()).all()
+
+
+@app.post("/users", response_model=schemas.CreateUserResponse)
+def create_user(
+    payload: schemas.CreateUserRequest,
+    current_user: models.User = Depends(auth.require_role("super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    Only a Super Admin can create profiles. No email is sent (not configured
+    for this deployment) — the temporary password is returned in this
+    response so the Super Admin can relay it to the new user directly.
+    """
+    if payload.role not in ("colleague", "team_lead", "super_admin"):
+        raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', or 'super_admin'")
+    if db.query(models.User).filter(models.User.username == payload.username).first():
+        raise HTTPException(status_code=400, detail="username already exists")
+
+    temp_password = auth.generate_temp_password()
+    user = models.User(
+        username=payload.username,
+        full_name=payload.full_name,
+        role=payload.role,
+        password_hash=auth.hash_password(temp_password),
+        must_change_password=True,
+        email=payload.email,
+        dob=payload.dob,
+        doj=payload.doj,
+        anniversary_date=payload.anniversary_date,
+        designation=payload.designation,
+        reporting_manager=payload.reporting_manager,
+        employment_status=payload.employment_status,
+        employee_id=payload.employee_id,
+    )
+    if payload.process_ids:
+        user.processes = db.query(models.Process).filter(models.Process.id.in_(payload.process_ids)).all()
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    if user.email:
+        email_utils.send_new_account_email(user.email, user.full_name, user.username, temp_password)
+    return {"user": user, "temporary_password": temp_password}
+
+
+@app.patch("/users/{user_id}", response_model=schemas.UserOut)
+def update_user(
+    user_id: int,
+    payload: schemas.CreateUserRequest,
+    current_user: models.User = Depends(auth.require_role("super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Edit an existing profile — role, employment status, processes, etc."""
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if payload.role not in ("colleague", "team_lead", "super_admin"):
+        raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', or 'super_admin'")
+
+    user.full_name = payload.full_name
+    user.role = payload.role
+    user.email = payload.email
+    user.dob = payload.dob
+    user.doj = payload.doj
+    user.anniversary_date = payload.anniversary_date
+    user.designation = payload.designation
+    user.reporting_manager = payload.reporting_manager
+    user.employment_status = payload.employment_status
+    user.employee_id = payload.employee_id
+    user.processes = db.query(models.Process).filter(models.Process.id.in_(payload.process_ids)).all()
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@app.post("/users/{user_id}/reset-password", response_model=schemas.ResetPasswordResponse)
+def reset_password(
+    user_id: int,
+    current_user: models.User = Depends(auth.require_role("super_admin")),
+    db: Session = Depends(get_db),
+):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    temp_password = auth.generate_temp_password()
+    user.password_hash = auth.hash_password(temp_password)
+    user.must_change_password = True
+    db.commit()
+    if user.email:
+        email_utils.send_new_account_email(user.email, user.full_name, user.username, temp_password)
+    return {"username": user.username, "temporary_password": temp_password}
+
+
+@app.get("/processes", response_model=List[schemas.ProcessOut])
+def list_all_processes(
+    current_user: models.User = Depends(auth.require_role("super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Full process list — for the Super Admin's user-creation form."""
+    return db.query(models.Process).order_by(models.Process.name.asc()).all()
+
+
+@app.get("/users/colleagues", response_model=List[schemas.UserOut])
+def list_colleagues(
+    process_id: int,
+    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Colleagues who have access to this process — populates the Reassign dropdown."""
+    _require_process_access(current_user, process_id)
+    return (
+        db.query(models.User)
+        .filter(models.User.role == "colleague", models.User.processes.any(models.Process.id == process_id))
+        .order_by(models.User.full_name.asc())
+        .all()
+    )
 
 
 @app.post("/orders/run-assignment")
 def run_assignment(
-    current_user: models.User = Depends(auth.require_role("team_lead")),
+    process_id: int,
+    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
-    Manually re-runs the auto-assignment pass. Use this any time a colleague
-    ends up with no open order and needs to be caught up — e.g. right after
-    creating a new colleague account, in case it wasn't picked up automatically.
+    Manually re-runs the auto-assignment pass for one process. Use this any
+    time a colleague ends up with no open order and needs to be caught up —
+    e.g. right after adding a colleague to this process, in case it wasn't
+    picked up automatically.
     """
-    _auto_assign_open_slots(db)
+    _require_process_access(current_user, process_id)
+    _auto_assign_open_slots(db, process_id)
     return {"status": "assignment pass complete"}
 
 
@@ -129,7 +307,7 @@ def run_assignment(
 def reassign_order(
     order_id: int,
     payload: schemas.ReassignRequest,
-    current_user: models.User = Depends(auth.require_role("team_lead")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -141,6 +319,7 @@ def reassign_order(
     order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+    _require_process_access(current_user, order.process_id)
     if order.submitted:
         raise HTTPException(status_code=403, detail="This order has been submitted to Production")
     if order.posting_status == "Completed":
@@ -148,11 +327,15 @@ def reassign_order(
 
     new_colleague = (
         db.query(models.User)
-        .filter(models.User.id == payload.assigned_to_id, models.User.role == "colleague")
+        .filter(
+            models.User.id == payload.assigned_to_id,
+            models.User.role == "colleague",
+            models.User.processes.any(models.Process.id == order.process_id),
+        )
         .first()
     )
     if not new_colleague:
-        raise HTTPException(status_code=400, detail="Not a valid colleague")
+        raise HTTPException(status_code=400, detail="Not a valid colleague for this process")
 
     order.assigned_to_id = new_colleague.id
     order.assigned_date = date.today()
@@ -166,14 +349,17 @@ def reassign_order(
 
 @app.delete("/orders/all")
 def delete_all_orders(
-    current_user: models.User = Depends(auth.require_role("team_lead")),
+    process_id: int,
+    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
-    Deletes every work order — used to clear test/imported data for a fresh
-    run. Does NOT touch user accounts (Team Lead / colleague logins stay).
+    Deletes every work order in this process — used to clear test/imported
+    data for a fresh run. Does NOT touch user accounts, and does not affect
+    other processes' data.
     """
-    deleted_count = db.query(models.WorkOrder).delete()
+    _require_process_access(current_user, process_id)
+    deleted_count = db.query(models.WorkOrder).filter(models.WorkOrder.process_id == process_id).delete()
     db.commit()
     return {"deleted": deleted_count}
 
@@ -184,21 +370,24 @@ def delete_all_orders(
 
 @app.post("/orders/import")
 def import_inventory(
+    process_id: int,
     file: UploadFile = File(...),
-    current_user: models.User = Depends(auth.require_role("team_lead")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
     Accepts a CSV with columns matching E-O:
     edm,status,created,image_count,doc_count,def_doc_type,amount,description,division,deposit_date
-    Creates one unassigned WorkOrder row per line.
+    Creates one unassigned WorkOrder row per line, tagged to this process.
     """
+    _require_process_access(current_user, process_id)
     content = file.file.read().decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(content))
     created_count = 0
     today = date.today()
     for row in reader:
         order = models.WorkOrder(
+            process_id=process_id,
             received_date=today,
             edm=row.get("edm") or None,
             status=row.get("status") or None,
@@ -215,7 +404,7 @@ def import_inventory(
         db.add(order)
         created_count += 1
     db.commit()
-    _auto_assign_open_slots(db)
+    _auto_assign_open_slots(db, process_id)
     return {"imported": created_count}
 
 
@@ -243,17 +432,25 @@ def _parse_float(v: Optional[str]) -> Optional[float]:
 # Assignment logic — one open file per colleague at a time (round-robin)
 # ---------------------------------------------------------------------------
 
-def _auto_assign_open_slots(db: Session):
+def _auto_assign_open_slots(db: Session, process_id: int):
     """
-    For every colleague who currently has no open (non-completed) order,
-    hand them the oldest unassigned order. Mirrors the 'application-based'
-    model: one open file per user; finishing it pulls the next one in.
+    For every colleague who has access to this process and currently has no
+    open (non-completed) order *in this process*, hand them the oldest
+    unassigned order in this same process. Mirrors the 'application-based'
+    model: one open file per user per process; finishing it pulls the next
+    one in. A colleague working multiple processes can have one open order
+    in each simultaneously — this only ever looks within one process at a time.
     """
-    colleagues = db.query(models.User).filter(models.User.role == "colleague").all()
+    colleagues = (
+        db.query(models.User)
+        .filter(models.User.role == "colleague", models.User.processes.any(models.Process.id == process_id))
+        .all()
+    )
     for colleague in colleagues:
         has_open = (
             db.query(models.WorkOrder)
             .filter(
+                models.WorkOrder.process_id == process_id,
                 models.WorkOrder.assigned_to_id == colleague.id,
                 models.WorkOrder.posting_status != "Completed",
             )
@@ -263,7 +460,7 @@ def _auto_assign_open_slots(db: Session):
             continue
         next_order = (
             db.query(models.WorkOrder)
-            .filter(models.WorkOrder.assigned_to_id.is_(None))
+            .filter(models.WorkOrder.process_id == process_id, models.WorkOrder.assigned_to_id.is_(None))
             .order_by(models.WorkOrder.id.asc())
             .first()
         )
@@ -286,9 +483,17 @@ def _auto_assign_open_slots(db: Session):
 # ---------------------------------------------------------------------------
 
 @app.get("/orders", response_model=List[schemas.WorkOrderOut])
-def list_orders(current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
-    """Active queue only — orders already submitted to Production are hidden here for everyone."""
-    query = db.query(models.WorkOrder).filter(models.WorkOrder.submitted == False)  # noqa: E712
+def list_orders(
+    process_id: int,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Active queue for one process — orders already submitted to Production are hidden here for everyone."""
+    _require_process_access(current_user, process_id)
+    query = db.query(models.WorkOrder).filter(
+        models.WorkOrder.submitted == False,  # noqa: E712
+        models.WorkOrder.process_id == process_id,
+    )
     if current_user.role == "colleague":
         query = query.filter(models.WorkOrder.assigned_to_id == current_user.id)
     return query.order_by(models.WorkOrder.id.asc()).all()
@@ -296,6 +501,7 @@ def list_orders(current_user: models.User = Depends(auth.get_current_user), db: 
 
 @app.get("/orders/production", response_model=List[schemas.WorkOrderOut])
 def list_production_orders(
+    process_id: int,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     received_start: Optional[date] = None,
@@ -313,13 +519,17 @@ def list_production_orders(
     db: Session = Depends(get_db),
 ):
     """
-    Everything already submitted to Production. Team Lead sees everyone's;
-    a colleague only ever sees their own — enforced server-side regardless
-    of what filters are passed, not just hidden in the UI.
-    All filters are optional and combine with AND. start_date/end_date filter
-    by Posted Date (inclusive) — the day the work was actually completed.
+    Everything already submitted to Production, within one process. Team
+    Lead sees everyone's; a colleague only ever sees their own — enforced
+    server-side regardless of what filters are passed, not just hidden in
+    the UI. All filters are optional and combine with AND. start_date/end_date
+    filter by Posted Date (inclusive) — the day the work was actually completed.
     """
-    query = db.query(models.WorkOrder).filter(models.WorkOrder.submitted == True)  # noqa: E712
+    _require_process_access(current_user, process_id)
+    query = db.query(models.WorkOrder).filter(
+        models.WorkOrder.submitted == True,  # noqa: E712
+        models.WorkOrder.process_id == process_id,
+    )
     if current_user.role == "colleague":
         query = query.filter(models.WorkOrder.assigned_to_id == current_user.id)
 
@@ -371,6 +581,7 @@ def get_order(order_id: int, current_user: models.User = Depends(auth.get_curren
     order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+    _require_process_access(current_user, order.process_id)
     if current_user.role == "colleague" and order.assigned_to_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not your assigned order")
     return order
@@ -384,12 +595,13 @@ def get_order(order_id: int, current_user: models.User = Depends(auth.get_curren
 def update_team_lead_fields(
     order_id: int,
     payload: schemas.TeamLeadUpdate,
-    current_user: models.User = Depends(auth.require_role("team_lead")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
     db: Session = Depends(get_db),
 ):
     order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+    _require_process_access(current_user, order.process_id)
     for field, value in payload.dict(exclude_unset=True).items():
         setattr(order, field, value)
     order.last_edited_by = current_user.username
@@ -533,18 +745,22 @@ def update_colleague_fields(
 
 @app.post("/orders/submit-day")
 def submit_end_of_day(
+    process_id: int,
     current_user: models.User = Depends(auth.require_role("colleague")),
     db: Session = Depends(get_db),
 ):
     """
-    Moves all of this colleague's Completed orders to Production — hides
-    them from both the colleague's and Team Lead's active queue for good.
-    Only Completed orders are eligible; anything still In-Process or in
-    Clarification is left untouched.
+    Moves all of this colleague's Completed orders IN THIS PROCESS to
+    Production — hides them from both the colleague's and Team Lead's active
+    queue for good. Only Completed orders are eligible; anything still
+    In-Process or in Clarification is left untouched. Scoped to one process
+    so a colleague working multiple processes submits each one separately.
     """
+    _require_process_access(current_user, process_id)
     orders = (
         db.query(models.WorkOrder)
         .filter(
+            models.WorkOrder.process_id == process_id,
             models.WorkOrder.assigned_to_id == current_user.id,
             models.WorkOrder.posting_status == "Completed",
             models.WorkOrder.submitted == False,  # noqa: E712
@@ -563,7 +779,7 @@ def submit_end_of_day(
 def correct_completed_order(
     order_id: int,
     payload: schemas.TeamLeadCorrection,
-    current_user: models.User = Depends(auth.require_role("team_lead")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -576,6 +792,7 @@ def correct_completed_order(
     order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+    _require_process_access(current_user, order.process_id)
     if order.submitted:
         raise HTTPException(status_code=403, detail="This order has been submitted to Production and is locked")
 
