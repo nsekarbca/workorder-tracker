@@ -5,19 +5,30 @@
 <title>Work Order Allocation Tracker</title>
 <style>
   :root {
+    --navy: #0b2545;
+    --navy-dark: #081a33;
+    --accent: #1c7ed6;
     --brown: #7a3b1e;
     --teal: #1a6b8a;
-    --purple: #7a2a6b;
+    --purple: #5b2a63;
     --green: #2fa63f;
+    --red: #b23b3b;
   }
   * { box-sizing: border-box; }
   body { font-family: Segoe UI, Arial, sans-serif; margin: 0; background: #f4f4f6; color: #222; }
-  header { background: var(--purple); color: white; padding: 14px 20px; display: flex; justify-content: space-between; align-items: center; }
-  header h1 { font-size: 18px; margin: 0; }
-  #login-screen { max-width: 340px; margin: 80px auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.1); }
-  #login-screen input { width: 100%; padding: 8px; margin: 6px 0 14px; border: 1px solid #ccc; border-radius: 4px; }
-  #login-screen button, .action-btn { background: var(--teal); color: white; border: none; padding: 9px 16px; border-radius: 4px; cursor: pointer; }
-  #login-screen button:hover, .action-btn:hover { opacity: .9; }
+  header { background: var(--navy); color: white; padding: 10px 20px; display: flex; justify-content: space-between; align-items: center; }
+  header .brand { display: flex; align-items: center; gap: 12px; }
+  header .brand img { height: 34px; display: block; }
+  header .brand .wordmark { font-size: 20px; font-weight: 700; letter-spacing: .5px; }
+  header .brand .wordmark span { color: var(--accent); }
+  header .app-title { font-size: 13px; color: #cdd8e6; margin-left: 10px; border-left: 1px solid #3a5578; padding-left: 10px; }
+  #login-screen, #change-password-screen, #process-select-screen, #forgot-screen, #reset-token-screen { max-width: 360px; margin: 70px auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.12); }
+  #login-screen h2, #change-password-screen h2, #process-select-screen h2, #forgot-screen h2, #reset-token-screen h2 { margin-top: 0; color: var(--navy); }
+  #login-screen input, #change-password-screen input, #forgot-screen input, #reset-token-screen input { width: 100%; padding: 8px; margin: 6px 0 14px; border: 1px solid #ccc; border-radius: 4px; }
+  #login-screen button, #change-password-screen button, #forgot-screen button, #reset-token-screen button, .action-btn { background: var(--navy); color: white; border: none; padding: 9px 16px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+  #login-screen button:hover, #change-password-screen button:hover, #forgot-screen button:hover, #reset-token-screen button:hover, .action-btn:hover { opacity: .88; }
+  #forgot-link, #forgot-back-link { display: block; margin-top: 4px; font-size: 12px; color: var(--accent); cursor: pointer; text-decoration: underline; }
+  #forgot-screen label { display: block; font-size: 13px; margin-top: 6px; }
   #app { display: none; padding: 16px; }
   table { border-collapse: collapse; width: 100%; background: white; font-size: 12px; }
   th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; white-space: nowrap; }
@@ -27,14 +38,25 @@
   th.tat { background: var(--green); color: white; }
   tr:nth-child(even) { background: #fafafa; }
   input.cell-edit { width: 90px; font-size: 12px; padding: 2px 4px; }
-  #toolbar { margin-bottom: 12px; display: flex; gap: 10px; align-items: center; }
+  #toolbar { margin-bottom: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
   .badge { background: #eee; padding: 4px 10px; border-radius: 12px; font-size: 12px; }
+  .process-badge { background: var(--accent); color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; }
   #error-msg { color: #c0392b; font-size: 13px; min-height: 18px; }
+  .process-btn { display: block; width: 100%; text-align: left; padding: 12px; margin: 6px 0; border: 1px solid #ccc; border-radius: 6px; background: #f8f9fb; cursor: pointer; font-size: 14px; }
+  .process-btn:hover { background: #eef3fa; border-color: var(--accent); }
+  #admin-panel { background: white; padding: 16px; border-radius: 8px; margin-bottom: 16px; }
+  #admin-panel label { display: block; font-size: 12px; margin-top: 8px; color: #444; }
+  #admin-panel input, #admin-panel select { width: 100%; padding: 6px; margin-top: 2px; border: 1px solid #ccc; border-radius: 4px; }
+  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
 </style>
 </head>
 <body>
 
 <div id="login-screen">
+  <div style="text-align:center; margin-bottom: 10px;">
+    <img src="logo.png" alt="Ventra Health" style="max-height:40px;" onerror="this.style.display='none'; document.getElementById('login-wordmark').style.display='block';">
+    <div id="login-wordmark" style="display:none; font-size:22px; font-weight:700; color:#0b2545;">VENTRA<span style="color:#1c7ed6;">HEALTH</span></div>
+  </div>
   <h2>Work Order Tracker</h2>
   <label>Username</label>
   <input id="login-username" autocomplete="username">
@@ -42,13 +64,61 @@
   <input id="login-password" type="password" autocomplete="current-password">
   <div id="error-msg"></div>
   <button onclick="login()">Log In</button>
+  <span id="forgot-link" onclick="showForgotScreen()">Forgot Password / Username?</span>
+</div>
+
+<div id="forgot-screen" style="display:none;">
+  <h2>Forgot Username or Password?</h2>
+  <label><input type="radio" name="forgot-mode" value="username" checked onchange="onForgotModeChange()"> I forgot my username</label>
+  <label><input type="radio" name="forgot-mode" value="password" onchange="onForgotModeChange()"> I forgot my password</label>
+  <label id="forgot-input-label" style="margin-top:10px;">Email address</label>
+  <input id="forgot-input" placeholder="you@company.com">
+  <div id="forgot-msg" style="font-size:13px; color:#2f7a3f; min-height:18px;"></div>
+  <button onclick="submitForgot()">Send</button>
+  <span id="forgot-back-link" onclick="showLoginScreen()">Back to log in</span>
+</div>
+
+<div id="reset-token-screen" style="display:none;">
+  <h2>Set a New Password</h2>
+  <p style="font-size:13px; color:#555;">Choose a new password to finish resetting your account.</p>
+  <label>New Password (min 8 characters)</label>
+  <input id="rt-new" type="password">
+  <label>Confirm New Password</label>
+  <input id="rt-confirm" type="password">
+  <div id="rt-error" style="color:#c0392b; font-size:13px; min-height:18px;"></div>
+  <button onclick="submitResetWithToken()">Set Password</button>
+</div>
+
+<div id="change-password-screen" style="display:none;">
+  <h2>Set a New Password</h2>
+  <p style="font-size:13px; color:#555;">For security, you need to set your own password before continuing.</p>
+  <label>Current / Temporary Password</label>
+  <input id="cp-old" type="password">
+  <label>New Password (min 8 characters)</label>
+  <input id="cp-new" type="password">
+  <label>Confirm New Password</label>
+  <input id="cp-confirm" type="password">
+  <div id="cp-error" style="color:#c0392b; font-size:13px; min-height:18px;"></div>
+  <button onclick="submitChangePassword()">Set Password</button>
+</div>
+
+<div id="process-select-screen" style="display:none;">
+  <h2>Select a Process</h2>
+  <p style="font-size:13px; color:#555;">You have access to more than one process. Pick one to continue.</p>
+  <div id="process-list"></div>
 </div>
 
 <div id="app">
   <header>
-    <h1>Work Order Allocation Tracker</h1>
+    <div class="brand">
+      <img src="logo.png" alt="Ventra Health" onerror="this.style.display='none'; document.getElementById('app-wordmark').style.display='block';">
+      <div id="app-wordmark" style="display:none;" class="wordmark">VENTRA<span>HEALTH</span></div>
+      <span class="app-title">Work Order Allocation Tracker</span>
+    </div>
     <div>
+      <span id="process-badge" class="process-badge" style="display:none;"></span>
       <span id="whoami" class="badge"></span>
+      <button class="action-btn" id="admin-btn" style="display:none;" onclick="showAdminView()">Admin</button>
       <button class="action-btn" onclick="logout()">Log out</button>
     </div>
   </header>
@@ -59,10 +129,11 @@
       <input type="file" id="import-file" style="display:none;">
       <button class="action-btn" id="import-btn" style="display:none;" onclick="document.getElementById('import-file').click()">Import Inventory CSV</button>
       <button class="action-btn" id="run-assign-btn" style="display:none;" onclick="runAssignment()">Run Assignment Now</button>
-      <button class="action-btn" id="clear-data-btn" style="display:none; background:#b23b3b;" onclick="clearAllData()">Clear All Data</button>
+      <button class="action-btn" id="clear-data-btn" style="display:none; background:var(--red);" onclick="clearAllData()">Clear All Data</button>
       <button class="action-btn" id="production-btn" style="display:none;" onclick="showProductionView()">Production</button>
       <button class="action-btn" onclick="loadOrders()">Refresh</button>
-      <button class="action-btn" id="submit-day-btn" style="display:none; background:#2fa63f;" onclick="submitEndOfDay()">Submit End of Day</button>
+      <button class="action-btn" id="submit-day-btn" style="display:none; background:var(--green);" onclick="submitEndOfDay()">Submit End of Day</button>
+      <button class="action-btn" id="switch-process-btn" style="display:none;" onclick="showProcessSwitcher()">Switch Process</button>
     </div>
     <div id="production-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px;">
       <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
@@ -91,15 +162,54 @@
         <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
       </div>
     </div>
+    <div id="admin-panel" style="display:none;">
+      <h3>Create User</h3>
+      <div class="form-grid">
+        <label>Username <input id="nu-username"></label>
+        <label>Full Name <input id="nu-full-name"></label>
+        <label>Role
+          <select id="nu-role">
+            <option value="colleague">Colleague</option>
+            <option value="team_lead">Team Lead</option>
+            <option value="super_admin">Super Admin</option>
+          </select>
+        </label>
+        <label>Employee ID <input id="nu-employee-id"></label>
+        <label>Email <input id="nu-email" type="email"></label>
+        <label>Designation <input id="nu-designation"></label>
+        <label>Reporting Manager <input id="nu-reporting-manager"></label>
+        <label>Employment Status
+          <select id="nu-employment-status">
+            <option value="Active">Active</option>
+            <option value="Inactive">Inactive</option>
+          </select>
+        </label>
+        <label>Date of Birth <input id="nu-dob" type="date"></label>
+        <label>Date of Joining <input id="nu-doj" type="date"></label>
+        <label>Anniversary Date <input id="nu-anniversary" type="date"></label>
+      </div>
+      <label>Processes (Ctrl/Cmd-click for multiple)
+        <select id="nu-processes" multiple size="5"></select>
+      </label>
+      <div style="margin-top:12px;">
+        <button class="action-btn" onclick="createUser()">Create User</button>
+      </div>
+      <hr style="margin:20px 0;">
+      <h3>Existing Users</h3>
+      <div id="user-list"></div>
+    </div>
     <div id="grid-container"></div>
   </div>
 </div>
 
 <script>
-const API = ""; // same origin
+const API = "";
 let token = localStorage.getItem("wot_token") || "";
 let role = localStorage.getItem("wot_role") || "";
 let fullName = localStorage.getItem("wot_name") || "";
+let myProcesses = JSON.parse(localStorage.getItem("wot_processes") || "[]");
+let currentProcessId = localStorage.getItem("wot_process_id") ? parseInt(localStorage.getItem("wot_process_id")) : null;
+let pendingMustChangePassword = false;
 
 const COLUMNS = [
   {k:"received_date", label:"Received Date", group:"tl"},
@@ -130,21 +240,18 @@ const COLUMNS = [
   {k:"tat_days", label:"TAT", group:"tat"},
 ];
 
-// A-D fields are now auto-populated on import/assignment, never manually typed.
 const TL_FIELDS = [];
-// Fields a Team Lead can correct on a row that's Completed but not yet
-// submitted to Production — same set a colleague fills in, minus the
-// always-derived Pending $.
 const TL_CORRECTION_FIELDS = ["posted_amount","bar_batch","trans_count","posting_status",
   "poster_comment","ventra_comment","escalation_category","issue_raised_date","issue_closed_date","posted_date"];
 const COL_FIELDS = ["posted_amount","bar_batch","trans_count","posting_status",
   "poster_comment","ventra_comment","escalation_category","issue_raised_date","issue_closed_date"];
 const CLARIFICATION_ONLY_FIELDS = ["poster_comment","ventra_comment","escalation_category",
   "issue_raised_date","issue_closed_date"];
-// Colleagues don't need to see the Team-Lead-owned columns at all.
 const HIDDEN_FOR_COLLEAGUE = ["received_date","assigned_date","employee_id","employee_name"];
 const POSTING_STATUS_OPTIONS = ["In-Process", "Clarification", "Completed"];
 const ESCALATION_OPTIONS = ["Patient not found", "DUVA Verification", "EOB not found", "Invoice Creation", "Other"];
+
+function isLeadRole() { return role === "team_lead" || role === "super_admin"; }
 
 function formatCurrency(val) {
   if (val === null || val === undefined || val === "") return "";
@@ -159,12 +266,99 @@ function parseCurrency(val) {
   return cleaned === "" ? null : cleaned;
 }
 
-if (token) showApp();
 let currentOrders = [];
 let currentProduction = [];
 let colleagueList = [];
-let viewMode = "active"; // "active" or "production"
-let drafts = {}; // order.id -> {field: value} pending unsaved edits
+let allUsers = [];
+let allProcesses = [];
+let viewMode = "active"; // "active", "production", or "admin"
+let drafts = {};
+
+if (token) {
+  if (localStorage.getItem("wot_must_change") === "true") {
+    showChangePasswordScreen();
+  } else if (!currentProcessId && myProcesses.length > 1) {
+    showProcessSelectScreen();
+  } else {
+    if (!currentProcessId && myProcesses.length === 1) currentProcessId = myProcesses[0].id;
+    showApp();
+  }
+}
+
+function showLoginScreen() {
+  document.getElementById("login-screen").style.display = "block";
+  document.getElementById("forgot-screen").style.display = "none";
+  document.getElementById("reset-token-screen").style.display = "none";
+}
+
+function showForgotScreen() {
+  document.getElementById("login-screen").style.display = "none";
+  document.getElementById("forgot-screen").style.display = "block";
+  document.getElementById("forgot-msg").textContent = "";
+  document.getElementById("forgot-input").value = "";
+}
+
+function onForgotModeChange() {
+  const mode = document.querySelector('input[name="forgot-mode"]:checked').value;
+  document.getElementById("forgot-input-label").textContent =
+    mode === "username" ? "Email address" : "Username or email address";
+  document.getElementById("forgot-input").placeholder =
+    mode === "username" ? "you@company.com" : "username or you@company.com";
+}
+
+async function submitForgot() {
+  const mode = document.querySelector('input[name="forgot-mode"]:checked').value;
+  const value = document.getElementById("forgot-input").value.trim();
+  if (!value) return;
+  const endpoint = mode === "username" ? "/auth/forgot-username" : "/auth/forgot-password";
+  const body = mode === "username" ? {email: value} : {username_or_email: value};
+  const res = await fetch(API + endpoint, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body)
+  });
+  const data = await res.json();
+  document.getElementById("forgot-msg").textContent = data.message || "Request submitted.";
+}
+
+async function submitResetWithToken() {
+  const token = new URLSearchParams(window.location.search).get("reset_token");
+  const newPw = document.getElementById("rt-new").value;
+  const confirm = document.getElementById("rt-confirm").value;
+  if (newPw.length < 8) {
+    document.getElementById("rt-error").textContent = "Password must be at least 8 characters.";
+    return;
+  }
+  if (newPw !== confirm) {
+    document.getElementById("rt-error").textContent = "Passwords don't match.";
+    return;
+  }
+  const res = await fetch(API + "/auth/reset-password-with-token", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({token, new_password: newPw})
+  });
+  if (!res.ok) {
+    document.getElementById("rt-error").textContent = (await res.json()).detail || "Reset failed.";
+    return;
+  }
+  alert("Password reset. You can now log in.");
+  window.history.replaceState({}, "", window.location.pathname);
+  document.getElementById("reset-token-screen").style.display = "none";
+  document.getElementById("login-screen").style.display = "block";
+}
+
+// If the page was opened from a password-reset email link, jump straight to
+// the reset form instead of showing the normal login screen.
+(function checkForResetToken() {
+  const token = new URLSearchParams(window.location.search).get("reset_token");
+  if (token) {
+    document.addEventListener("DOMContentLoaded", () => {
+      document.getElementById("login-screen").style.display = "none";
+      document.getElementById("reset-token-screen").style.display = "block";
+    });
+  }
+})();
 
 async function login() {
   const username = document.getElementById("login-username").value;
@@ -177,10 +371,95 @@ async function login() {
   }
   const data = await res.json();
   token = data.access_token; role = data.role; fullName = data.full_name;
+  myProcesses = data.processes || [];
   localStorage.setItem("wot_token", token);
   localStorage.setItem("wot_role", role);
   localStorage.setItem("wot_name", fullName);
-  showApp();
+  localStorage.setItem("wot_processes", JSON.stringify(myProcesses));
+  localStorage.setItem("wot_must_change", data.must_change_password ? "true" : "false");
+  localStorage.removeItem("wot_process_id");
+  currentProcessId = null;
+
+  document.getElementById("login-screen").style.display = "none";
+  if (data.must_change_password) {
+    showChangePasswordScreen();
+  } else if (myProcesses.length > 1) {
+    showProcessSelectScreen();
+  } else if (myProcesses.length === 1) {
+    currentProcessId = myProcesses[0].id;
+    localStorage.setItem("wot_process_id", currentProcessId);
+    showApp();
+  } else {
+    // super_admin with no explicit process assignment still needs a context
+    // to browse queues in, but can always manage users regardless.
+    showApp();
+  }
+}
+
+function showChangePasswordScreen() {
+  document.getElementById("login-screen").style.display = "none";
+  document.getElementById("process-select-screen").style.display = "none";
+  document.getElementById("app").style.display = "none";
+  document.getElementById("change-password-screen").style.display = "block";
+}
+
+async function submitChangePassword() {
+  const oldPw = document.getElementById("cp-old").value;
+  const newPw = document.getElementById("cp-new").value;
+  const confirmPw = document.getElementById("cp-confirm").value;
+  const errEl = document.getElementById("cp-error");
+  errEl.textContent = "";
+  if (newPw.length < 8) { errEl.textContent = "New password must be at least 8 characters."; return; }
+  if (newPw !== confirmPw) { errEl.textContent = "Passwords do not match."; return; }
+
+  const res = await authFetch("/auth/change-password", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({old_password: oldPw, new_password: newPw})
+  });
+  if (!res.ok) {
+    errEl.textContent = (await res.json()).detail || "Failed to change password.";
+    return;
+  }
+  localStorage.setItem("wot_must_change", "false");
+  document.getElementById("change-password-screen").style.display = "none";
+  if (myProcesses.length > 1) {
+    showProcessSelectScreen();
+  } else {
+    if (myProcesses.length === 1) {
+      currentProcessId = myProcesses[0].id;
+      localStorage.setItem("wot_process_id", currentProcessId);
+    }
+    showApp();
+  }
+}
+
+function showProcessSelectScreen() {
+  document.getElementById("login-screen").style.display = "none";
+  document.getElementById("change-password-screen").style.display = "none";
+  document.getElementById("app").style.display = "none";
+  document.getElementById("process-select-screen").style.display = "block";
+  const list = document.getElementById("process-list");
+  list.innerHTML = "";
+  myProcesses.forEach(p => {
+    const btn = document.createElement("button");
+    btn.className = "process-btn";
+    btn.textContent = p.name;
+    btn.onclick = () => {
+      currentProcessId = p.id;
+      localStorage.setItem("wot_process_id", currentProcessId);
+      document.getElementById("process-select-screen").style.display = "none";
+      showApp();
+    };
+    list.appendChild(btn);
+  });
+}
+
+function showProcessSwitcher() {
+  currentProcessId = null;
+  localStorage.removeItem("wot_process_id");
+  document.getElementById("app").style.display = "none";
+  showProcessSelectScreen();
 }
 
 function logout() {
@@ -190,23 +469,47 @@ function logout() {
 
 function showApp() {
   document.getElementById("login-screen").style.display = "none";
+  document.getElementById("change-password-screen").style.display = "none";
+  document.getElementById("process-select-screen").style.display = "none";
   document.getElementById("app").style.display = "block";
   document.getElementById("whoami").textContent = `${fullName} (${role})`;
-  document.getElementById("role-note").textContent = role === "team_lead"
+
+  const procBadge = document.getElementById("process-badge");
+  if (currentProcessId) {
+    const proc = myProcesses.find(p => p.id === currentProcessId);
+    procBadge.textContent = proc ? proc.name : "";
+    procBadge.style.display = "inline-block";
+  } else {
+    procBadge.style.display = "none";
+  }
+  if (myProcesses.length > 1) {
+    document.getElementById("switch-process-btn").style.display = "inline-block";
+  }
+
+  document.getElementById("role-note").textContent = isLeadRole()
     ? "Received Date, Assigned Date, Employee, and Employee Name are set automatically. Completed rows can still be corrected until submitted."
     : "Edit fields, then click Save. Pending $ is auto-calculated. Locked once Completed \u2014 click Submit End of Day to send finished work to Production. Use Production to view/export your own submitted history.";
-  if (role === "team_lead") {
+
+  if (isLeadRole()) {
     document.getElementById("import-btn").style.display = "inline-block";
     document.getElementById("run-assign-btn").style.display = "inline-block";
     document.getElementById("clear-data-btn").style.display = "inline-block";
     document.getElementById("production-btn").style.display = "inline-block";
     document.getElementById("import-file").addEventListener("change", importCSV);
-    loadColleagueList();
+    if (currentProcessId) loadColleagueList();
   } else {
     document.getElementById("submit-day-btn").style.display = "inline-block";
     document.getElementById("production-btn").style.display = "inline-block";
   }
-  loadOrders();
+  if (role === "super_admin") {
+    document.getElementById("admin-btn").style.display = "inline-block";
+  }
+
+  if (currentProcessId) {
+    loadOrders();
+  } else if (role === "super_admin") {
+    showAdminView();
+  }
 }
 
 async function authFetch(path, opts={}) {
@@ -216,19 +519,112 @@ async function authFetch(path, opts={}) {
   return res;
 }
 
+function withProcess(path) {
+  const sep = path.includes("?") ? "&" : "?";
+  return `${path}${sep}process_id=${currentProcessId}`;
+}
+
+// ---------------------------------------------------------------------
+// Admin (Super Admin only) — user management
+// ---------------------------------------------------------------------
+
+async function showAdminView() {
+  viewMode = "admin";
+  document.getElementById("toolbar").style.display = "none";
+  document.getElementById("production-bar").style.display = "none";
+  document.getElementById("admin-panel").style.display = "block";
+  document.getElementById("grid-container").innerHTML = "";
+
+  const procRes = await authFetch("/processes");
+  if (procRes.ok) allProcesses = await procRes.json();
+  const procSel = document.getElementById("nu-processes");
+  procSel.innerHTML = "";
+  allProcesses.forEach(p => {
+    const opt = document.createElement("option");
+    opt.value = p.id; opt.textContent = p.name;
+    procSel.appendChild(opt);
+  });
+
+  await loadUserList();
+}
+
+async function loadUserList() {
+  const res = await authFetch("/users");
+  if (!res.ok) return;
+  allUsers = await res.json();
+  let html = "<table><thead><tr><th>Full Name</th><th>Username</th><th>Role</th><th>Email</th><th>Status</th><th>Processes</th><th>Action</th></tr></thead><tbody>";
+  allUsers.forEach(u => {
+    html += `<tr><td>${u.full_name}</td><td>${u.username}</td><td>${u.role}</td><td>${u.email || ""}</td><td>${u.employment_status}</td><td>${u.processes.map(p=>p.name).join(", ")}</td>`;
+    html += `<td><button class="action-btn" onclick="resetUserPassword(${u.id})">Reset Password</button></td></tr>`;
+  });
+  html += "</tbody></table>";
+  document.getElementById("user-list").innerHTML = html;
+}
+
+async function createUser() {
+  const processIds = Array.from(document.getElementById("nu-processes").selectedOptions).map(o => parseInt(o.value));
+  const payload = {
+    username: document.getElementById("nu-username").value,
+    full_name: document.getElementById("nu-full-name").value,
+    role: document.getElementById("nu-role").value,
+    employee_id: document.getElementById("nu-employee-id").value || null,
+    email: document.getElementById("nu-email").value || null,
+    designation: document.getElementById("nu-designation").value || null,
+    reporting_manager: document.getElementById("nu-reporting-manager").value || null,
+    employment_status: document.getElementById("nu-employment-status").value,
+    dob: document.getElementById("nu-dob").value || null,
+    doj: document.getElementById("nu-doj").value || null,
+    anniversary_date: document.getElementById("nu-anniversary").value || null,
+    process_ids: processIds,
+  };
+  if (!payload.username || !payload.full_name) {
+    alert("Username and Full Name are required.");
+    return;
+  }
+  const res = await authFetch("/users", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) {
+    alert("Failed to create user: " + (await res.text()));
+    return;
+  }
+  const data = await res.json();
+  alert(`User created.\n\nUsername: ${data.user.username}\nTemporary Password: ${data.temporary_password}\n\nPlease share these with the user securely \u2014 no email was sent.`);
+  ["nu-username","nu-full-name","nu-employee-id","nu-email","nu-designation","nu-reporting-manager","nu-dob","nu-doj","nu-anniversary"].forEach(id => document.getElementById(id).value = "");
+  loadUserList();
+}
+
+async function resetUserPassword(userId) {
+  const sure = confirm("Reset this user's password? They'll be forced to set a new one on next login.");
+  if (!sure) return;
+  const res = await authFetch(`/users/${userId}/reset-password`, {method: "POST"});
+  if (!res.ok) {
+    alert("Failed: " + (await res.text()));
+    return;
+  }
+  const data = await res.json();
+  alert(`Password reset.\n\nUsername: ${data.username}\nTemporary Password: ${data.temporary_password}\n\nPlease share these with the user securely.`);
+}
+
+// ---------------------------------------------------------------------
+// Active queue actions
+// ---------------------------------------------------------------------
+
 async function importCSV(e) {
   const file = e.target.files[0];
   if (!file) return;
   const form = new FormData();
   form.append("file", file);
-  const res = await authFetch("/orders/import", {method:"POST", body: form});
+  const res = await authFetch(withProcess("/orders/import"), {method:"POST", body: form});
   const data = await res.json();
   alert(`Imported ${data.imported} rows`);
   loadOrders();
 }
 
 async function runAssignment() {
-  const res = await authFetch("/orders/run-assignment", {method:"POST"});
+  const res = await authFetch(withProcess("/orders/run-assignment"), {method:"POST"});
   if (!res.ok) {
     alert("Assignment run failed: " + (await res.text()));
     return;
@@ -238,14 +634,14 @@ async function runAssignment() {
 }
 
 async function clearAllData() {
-  const sure = confirm("This will permanently delete ALL imported work orders (not user logins). This cannot be undone. Continue?");
+  const sure = confirm("This will permanently delete ALL imported work orders in this process (not user logins). This cannot be undone. Continue?");
   if (!sure) return;
   const typed = prompt('Type DELETE to confirm.');
   if (typed !== "DELETE") {
     alert("Cancelled — nothing was deleted.");
     return;
   }
-  const res = await authFetch("/orders/all", {method:"DELETE"});
+  const res = await authFetch(withProcess("/orders/all"), {method:"DELETE"});
   if (!res.ok) {
     alert("Delete failed: " + (await res.text()));
     return;
@@ -256,9 +652,9 @@ async function clearAllData() {
 }
 
 async function submitEndOfDay() {
-  const sure = confirm("Submit all your Completed orders to Production? Once submitted, they can no longer be corrected by you or your Team Lead.");
+  const sure = confirm("Submit all your Completed orders in this process to Production? Once submitted, they can no longer be corrected by you or your Team Lead.");
   if (!sure) return;
-  const res = await authFetch("/orders/submit-day", {method:"POST"});
+  const res = await authFetch(withProcess("/orders/submit-day"), {method:"POST"});
   if (!res.ok) {
     alert("Submit failed: " + (await res.text()));
     return;
@@ -287,7 +683,7 @@ function populateFilterFieldDropdown() {
   const sel = document.getElementById("prod-filter-field");
   sel.innerHTML = "";
   FILTER_FIELD_OPTIONS.forEach(opt => {
-    if (opt.teamLeadOnly && role !== "team_lead") return;
+    if (opt.teamLeadOnly && !isLeadRole()) return;
     const o = document.createElement("option");
     o.value = opt.value;
     o.textContent = opt.label;
@@ -302,17 +698,18 @@ let productionAllForOptions = [];
 async function showProductionView() {
   viewMode = "production";
   document.getElementById("toolbar").style.display = "none";
+  document.getElementById("admin-panel").style.display = "none";
   document.getElementById("production-bar").style.display = "flex";
 
   dateFilters = {posted:{from:"",to:""}, received:{from:"",to:""}, assigned:{from:"",to:""}, created:{from:"",to:""}};
   valueFilters = {employee_name:[], def_doc_type:[], division:[], escalation_category:[], posting_status:[]};
   document.getElementById("prod-date-field").value = "posted";
   populateFilterFieldDropdown();
-  document.getElementById("prod-filter-field").value = role === "team_lead" ? "employee_name" : "def_doc_type";
+  document.getElementById("prod-filter-field").value = isLeadRole() ? "employee_name" : "def_doc_type";
   document.getElementById("prod-date-from").value = "";
   document.getElementById("prod-date-to").value = "";
 
-  const res = await authFetch("/orders/production");
+  const res = await authFetch(withProcess("/orders/production"));
   if (res.ok) productionAllForOptions = await res.json();
   populateFilterValueOptions();
   loadProduction();
@@ -322,6 +719,7 @@ function showActiveView() {
   viewMode = "active";
   document.getElementById("toolbar").style.display = "flex";
   document.getElementById("production-bar").style.display = "none";
+  document.getElementById("admin-panel").style.display = "none";
   loadOrders();
 }
 
@@ -366,7 +764,6 @@ function populateFilterValueOptions() {
 }
 
 async function loadProduction() {
-  // Capture whatever's currently showing in the two dropdowns before building params.
   const activeDateField = document.getElementById("prod-date-field").value;
   dateFilters[activeDateField] = {
     from: document.getElementById("prod-date-from").value,
@@ -385,7 +782,7 @@ async function loadProduction() {
     if (values.length) params.set(field, values.join(","));
   }
 
-  const res = await authFetch("/orders/production?" + params.toString());
+  const res = await authFetch(withProcess("/orders/production?" + params.toString()));
   if (!res.ok) {
     alert("Failed to load Production data: " + (await res.text()));
     return;
@@ -455,16 +852,16 @@ function exportProductionCSV() {
 }
 
 async function loadColleagueList() {
-  const res = await authFetch("/users/colleagues");
+  const res = await authFetch(withProcess("/users/colleagues"));
   if (res.ok) colleagueList = await res.json();
 }
 
-async function reassignOrder(orderId, newColleagueId, selectEl) {
+async function reassignOrder(orderId, newColleagueId) {
   if (!newColleagueId) return;
   const colleague = colleagueList.find(c => c.id === parseInt(newColleagueId));
   const sure = confirm(`Reassign this order to ${colleague ? colleague.full_name : "this colleague"}?`);
   if (!sure) {
-    loadOrders(); // reset the dropdown back to its saved value
+    loadOrders();
     return;
   }
   const res = await authFetch(`/orders/${orderId}/reassign`, {
@@ -481,7 +878,12 @@ async function reassignOrder(orderId, newColleagueId, selectEl) {
 }
 
 async function loadOrders() {
-  const res = await authFetch("/orders");
+  if (!currentProcessId) return;
+  document.getElementById("admin-panel").style.display = "none";
+  document.getElementById("toolbar").style.display = "flex";
+  document.getElementById("production-bar").style.display = "none";
+  viewMode = "active";
+  const res = await authFetch(withProcess("/orders"));
   currentOrders = await res.json();
   drafts = {};
   renderGrid(currentOrders);
@@ -504,25 +906,21 @@ function renderGrid(orders) {
   const cols = visibleColumns();
   let html = "<table><thead><tr>";
   cols.forEach(c => html += `<th class="${c.group}">${c.label}</th>`);
-  if (role === "colleague" || role === "team_lead") html += `<th class="col">Action</th>`;
+  if (role === "colleague" || isLeadRole()) html += `<th class="col">Action</th>`;
   html += "</tr></thead><tbody>";
 
   orders.forEach(o => {
     const savedCompleted = o.posting_status === "Completed";
     const locked = role === "colleague" && savedCompleted;
-    // Team Lead can only correct a row once it's Completed but not yet
-    // submitted (submitted rows are already excluded from this list).
-    const tlCanCorrect = role === "team_lead" && savedCompleted;
+    const tlCanCorrect = isLeadRole() && savedCompleted;
     const effStatus = effectiveValue(o, "posting_status");
     const hasDraft = drafts[o.id] && Object.keys(drafts[o.id]).length > 0;
 
     html += `<tr>`;
     cols.forEach(c => {
-      const editableBase = (role === "team_lead" && (TL_FIELDS.includes(c.k) || (tlCanCorrect && TL_CORRECTION_FIELDS.includes(c.k)))) ||
+      const editableBase = (isLeadRole() && (TL_FIELDS.includes(c.k) || (tlCanCorrect && TL_CORRECTION_FIELDS.includes(c.k)))) ||
                             (role === "colleague" && COL_FIELDS.includes(c.k));
       let editable = editableBase && !locked;
-      // The Clarification-only gating is a colleague data-entry rule, not a
-      // restriction on trusted Team Lead corrections.
       if (role === "colleague" && editable && CLARIFICATION_ONLY_FIELDS.includes(c.k) && effStatus !== "Clarification") {
         editable = false;
       }
@@ -537,7 +935,7 @@ function renderGrid(orders) {
         return;
       }
 
-      if (c.k === "escalation_category" && (role === "colleague" || role === "team_lead")) {
+      if (c.k === "escalation_category" && (role === "colleague" || isLeadRole())) {
         html += `<td><select class="cell-edit" data-id="${o.id}" data-field="escalation_category" onchange="updateDraft(this)" ${editable ? "" : "disabled"}>`;
         html += `<option value=""></option>`;
         ESCALATION_OPTIONS.forEach(opt => {
@@ -547,16 +945,13 @@ function renderGrid(orders) {
         return;
       }
 
-      if ((c.k === "poster_comment" || c.k === "ventra_comment") && (role === "colleague" || role === "team_lead")) {
+      if ((c.k === "poster_comment" || c.k === "ventra_comment") && (role === "colleague" || isLeadRole())) {
         html += `<td><input class="cell-edit" data-id="${o.id}" data-field="${c.k}" value="${rawVal}" onchange="updateDraft(this)" ${editable ? "" : "disabled"}></td>`;
         return;
       }
 
       if (c.k === "posted_date") {
-        // Auto-set the moment an order is marked Completed — never a manual
-        // input for a colleague. A Team Lead correcting an unsubmitted row
-        // can override it directly.
-        if (role === "team_lead" && editable) {
+        if (isLeadRole() && editable) {
           html += `<td><input class="cell-edit" data-id="${o.id}" data-field="posted_date" value="${rawVal}" placeholder="YYYY-MM-DD" onchange="updateDraft(this)"></td>`;
         } else {
           html += `<td>${rawVal}</td>`;
@@ -586,7 +981,7 @@ function renderGrid(orders) {
       } else {
         html += `<td><button class="action-btn" onclick="saveRow(${o.id})" ${hasDraft ? "" : "disabled"}>Save</button></td>`;
       }
-    } else if (role === "team_lead") {
+    } else if (isLeadRole()) {
       if (tlCanCorrect) {
         html += `<td><button class="action-btn" onclick="saveRow(${o.id})" ${hasDraft ? "" : "disabled"}>Save</button></td>`;
       } else {
@@ -613,8 +1008,6 @@ function updateDraft(input) {
   if (!drafts[id]) drafts[id] = {};
   drafts[id][field] = value;
 
-  // Live Pending $ preview: Amount - Posted $, recalculated the moment
-  // Posted $ changes, before the row is even saved.
   if (field === "posted_amount") {
     const order = currentOrders.find(o => o.id === id);
     const parsedPosted = parseFloat(parseCurrency(value));
@@ -624,11 +1017,6 @@ function updateDraft(input) {
       delete drafts[id]["pending_amount"];
     }
   }
-
-  // Note: Escalation Category / Issue Raised Date are cleared automatically
-  // by the backend when Posting Status leaves Clarification — intentionally
-  // not mirrored here, since sending explicit nulls for them would itself
-  // trip the "only editable during Clarification" check.
 
   renderGrid(currentOrders);
 }
@@ -640,12 +1028,11 @@ async function saveRow(orderId) {
 
   const payload = {};
   for (const [field, value] of Object.entries(draft)) {
-    if (field === "pending_amount") continue; // preview-only, server recalculates
+    if (field === "pending_amount") continue;
     payload[field] = (field === "posted_amount") ? parseCurrency(value) : value;
   }
 
-  if (role === "team_lead") {
-    // Trusted correction — no required-field or Clarification-only gating.
+  if (isLeadRole()) {
     const res = await authFetch(`/orders/${orderId}/team-lead-correction`, {
       method: "PATCH",
       headers: {"Content-Type": "application/json"},
