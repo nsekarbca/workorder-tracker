@@ -612,18 +612,32 @@ async function resetUserPassword(userId) {
 // Active queue actions
 // ---------------------------------------------------------------------
 
+function requireSpecificProcess() {
+  if (currentProcessId === null || currentProcessId === undefined) {
+    alert("Select one specific process first \u2014 this action can't run while \"All Processes\" is selected.");
+    return false;
+  }
+  return true;
+}
+
 async function importCSV(e) {
   const file = e.target.files[0];
   if (!file) return;
+  if (!requireSpecificProcess()) { e.target.value = ""; return; }
   const form = new FormData();
   form.append("file", file);
   const res = await authFetch(withProcess("/orders/import"), {method:"POST", body: form});
+  if (!res.ok) {
+    alert("Import failed: " + (await res.text()));
+    return;
+  }
   const data = await res.json();
   alert(`Imported ${data.imported} rows`);
   loadOrders();
 }
 
 async function runAssignment() {
+  if (!requireSpecificProcess()) return;
   const res = await authFetch(withProcess("/orders/run-assignment"), {method:"POST"});
   if (!res.ok) {
     alert("Assignment run failed: " + (await res.text()));
@@ -634,6 +648,7 @@ async function runAssignment() {
 }
 
 async function clearAllData() {
+  if (!requireSpecificProcess()) return;
   const sure = confirm("This will permanently delete ALL imported work orders in this process (not user logins). This cannot be undone. Continue?");
   if (!sure) return;
   const typed = prompt('Type DELETE to confirm.');
