@@ -16,12 +16,12 @@
   }
   * { box-sizing: border-box; }
   body { font-family: Segoe UI, Arial, sans-serif; margin: 0; background: #f4f4f6; color: #222; }
-  header { background: var(--navy); color: white; padding: 10px 20px; display: flex; justify-content: space-between; align-items: center; }
+  header { background: white; color: var(--navy); padding: 10px 20px; display: flex; justify-content: space-between; align-items: center; border-bottom: 3px solid var(--navy); box-shadow: 0 1px 4px rgba(0,0,0,.08); }
   header .brand { display: flex; align-items: center; gap: 12px; }
   header .brand img { height: 44px; width: auto; max-width: 220px; object-fit: contain; display: block; }
-  header .brand .wordmark { font-size: 20px; font-weight: 700; letter-spacing: .5px; }
+  header .brand .wordmark { font-size: 20px; font-weight: 700; letter-spacing: .5px; color: var(--navy); }
   header .brand .wordmark span { color: var(--accent); }
-  header .app-title { font-size: 13px; color: #cdd8e6; margin-left: 10px; border-left: 1px solid #3a5578; padding-left: 10px; }
+  header .app-title { font-size: 13px; color: #555; margin-left: 10px; border-left: 1px solid #ccc; padding-left: 10px; }
   #login-screen, #change-password-screen, #process-select-screen, #forgot-screen, #reset-token-screen { max-width: 360px; margin: 70px auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.12); }
   #login-screen h2, #change-password-screen h2, #process-select-screen h2, #forgot-screen h2, #reset-token-screen h2 { margin-top: 0; color: var(--navy); }
   #login-screen input, #change-password-screen input, #forgot-screen input, #reset-token-screen input { width: 100%; padding: 8px; margin: 6px 0 14px; border: 1px solid #ccc; border-radius: 4px; }
@@ -39,7 +39,7 @@
   tr:nth-child(even) { background: #fafafa; }
   input.cell-edit { width: 90px; font-size: 12px; padding: 2px 4px; }
   #toolbar { margin-bottom: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-  .badge { background: #eee; padding: 4px 10px; border-radius: 12px; font-size: 12px; }
+  .badge { background: #eee; color: #222; padding: 4px 10px; border-radius: 12px; font-size: 12px; }
   .process-badge { background: var(--accent); color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; }
   #error-msg { color: #c0392b; font-size: 13px; min-height: 18px; }
   .process-btn { display: block; width: 100%; text-align: left; padding: 12px; margin: 6px 0; border: 1px solid #ccc; border-radius: 6px; background: #f8f9fb; cursor: pointer; font-size: 14px; }
@@ -195,6 +195,12 @@
         <button class="action-btn" id="user-form-cancel-btn" style="display:none; background:#888;" onclick="cancelEditUser()">Cancel</button>
       </div>
       <hr style="margin:20px 0;">
+      <h3>Session Timeout</h3>
+      <label style="max-width:300px;">Auto-logout after inactivity (minutes)
+        <input id="session-timeout-input" type="number" min="5" max="480">
+      </label>
+      <button class="action-btn" onclick="saveSessionTimeout()">Save Timeout</button>
+      <hr style="margin:20px 0;">
       <h3>Existing Users</h3>
       <div id="user-list"></div>
     </div>
@@ -204,11 +210,11 @@
 
 <script>
 const API = "";
-let token = localStorage.getItem("wot_token") || "";
-let role = localStorage.getItem("wot_role") || "";
-let fullName = localStorage.getItem("wot_name") || "";
-let myProcesses = JSON.parse(localStorage.getItem("wot_processes") || "[]");
-let currentProcessId = localStorage.getItem("wot_process_id") ? parseInt(localStorage.getItem("wot_process_id")) : null;
+let token = sessionStorage.getItem("wot_token") || "";
+let role = sessionStorage.getItem("wot_role") || "";
+let fullName = sessionStorage.getItem("wot_name") || "";
+let myProcesses = JSON.parse(sessionStorage.getItem("wot_processes") || "[]");
+let currentProcessId = sessionStorage.getItem("wot_process_id") ? parseInt(sessionStorage.getItem("wot_process_id")) : null;
 let pendingMustChangePassword = false;
 
 const COLUMNS = [
@@ -307,7 +313,7 @@ let viewMode = "active"; // "active", "production", or "admin"
 let drafts = {};
 
 if (token) {
-  if (localStorage.getItem("wot_must_change") === "true") {
+  if (sessionStorage.getItem("wot_must_change") === "true") {
     showChangePasswordScreen();
   } else if (!currentProcessId && myProcesses.length > 1) {
     showProcessSelectScreen();
@@ -404,12 +410,12 @@ async function login() {
   const data = await res.json();
   token = data.access_token; role = data.role; fullName = data.full_name;
   myProcesses = data.processes || [];
-  localStorage.setItem("wot_token", token);
-  localStorage.setItem("wot_role", role);
-  localStorage.setItem("wot_name", fullName);
-  localStorage.setItem("wot_processes", JSON.stringify(myProcesses));
-  localStorage.setItem("wot_must_change", data.must_change_password ? "true" : "false");
-  localStorage.removeItem("wot_process_id");
+  sessionStorage.setItem("wot_token", token);
+  sessionStorage.setItem("wot_role", role);
+  sessionStorage.setItem("wot_name", fullName);
+  sessionStorage.setItem("wot_processes", JSON.stringify(myProcesses));
+  sessionStorage.setItem("wot_must_change", data.must_change_password ? "true" : "false");
+  sessionStorage.removeItem("wot_process_id");
   currentProcessId = null;
 
   document.getElementById("login-screen").style.display = "none";
@@ -419,7 +425,7 @@ async function login() {
     showProcessSelectScreen();
   } else if (myProcesses.length === 1) {
     currentProcessId = myProcesses[0].id;
-    localStorage.setItem("wot_process_id", currentProcessId);
+    sessionStorage.setItem("wot_process_id", currentProcessId);
     showApp();
   } else {
     // super_admin with no explicit process assignment still needs a context
@@ -453,14 +459,14 @@ async function submitChangePassword() {
     errEl.textContent = (await res.json()).detail || "Failed to change password.";
     return;
   }
-  localStorage.setItem("wot_must_change", "false");
+  sessionStorage.setItem("wot_must_change", "false");
   document.getElementById("change-password-screen").style.display = "none";
   if (myProcesses.length > 1) {
     showProcessSelectScreen();
   } else {
     if (myProcesses.length === 1) {
       currentProcessId = myProcesses[0].id;
-      localStorage.setItem("wot_process_id", currentProcessId);
+      sessionStorage.setItem("wot_process_id", currentProcessId);
     }
     showApp();
   }
@@ -479,7 +485,7 @@ function showProcessSelectScreen() {
     btn.textContent = p.name;
     btn.onclick = () => {
       currentProcessId = p.id;
-      localStorage.setItem("wot_process_id", currentProcessId);
+      sessionStorage.setItem("wot_process_id", currentProcessId);
       document.getElementById("process-select-screen").style.display = "none";
       showApp();
     };
@@ -489,15 +495,64 @@ function showProcessSelectScreen() {
 
 function showProcessSwitcher() {
   currentProcessId = null;
-  localStorage.removeItem("wot_process_id");
+  sessionStorage.removeItem("wot_process_id");
   document.getElementById("app").style.display = "none";
   showProcessSelectScreen();
 }
 
 function logout() {
-  localStorage.clear();
+  sessionStorage.clear();
+  stopIdleTimer();
   location.reload();
 }
+
+// ---------------------------------------------------------------------
+// Idle-timeout: auto-logout after N minutes of no activity. N is set by
+// Super Admin via /settings/session-timeout (defaults to 60).
+// ---------------------------------------------------------------------
+let idleTimeoutMinutes = 60;
+let idleTimerHandle = null;
+
+function resetIdleTimer() {
+  if (idleTimerHandle) clearTimeout(idleTimerHandle);
+  idleTimerHandle = setTimeout(() => {
+    alert("You've been logged out due to inactivity.");
+    logout();
+  }, idleTimeoutMinutes * 60 * 1000);
+}
+
+function stopIdleTimer() {
+  if (idleTimerHandle) clearTimeout(idleTimerHandle);
+  idleTimerHandle = null;
+}
+
+let idleTimerListenersAttached = false;
+
+async function startIdleTimer() {
+  try {
+    const res = await authFetch("/settings/session-timeout");
+    if (res.ok) {
+      const data = await res.json();
+      idleTimeoutMinutes = data.minutes;
+    }
+  } catch (e) { /* fall back to default silently */ }
+  if (!idleTimerListenersAttached) {
+    ["mousemove", "keydown", "click", "scroll", "touchstart"].forEach(evt =>
+      document.addEventListener(evt, resetIdleTimer, {passive: true})
+    );
+    idleTimerListenersAttached = true;
+  }
+  resetIdleTimer();
+}
+
+// If the page is restored from the browser's back-forward cache (e.g. the
+// user hits Back after logging out), force a fresh reload rather than
+// showing a stale cached view of the app.
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted) {
+    location.reload();
+  }
+});
 
 function showApp() {
   document.getElementById("login-screen").style.display = "none";
@@ -505,6 +560,7 @@ function showApp() {
   document.getElementById("process-select-screen").style.display = "none";
   document.getElementById("app").style.display = "block";
   document.getElementById("whoami").textContent = `${fullName} (${role})`;
+  startIdleTimer();
 
   const procBadge = document.getElementById("process-badge");
   if (currentProcessId) {
@@ -575,8 +631,34 @@ async function showAdminView() {
     procSel.appendChild(opt);
   });
 
+  const timeoutRes = await authFetch("/settings/session-timeout");
+  if (timeoutRes.ok) {
+    const data = await timeoutRes.json();
+    document.getElementById("session-timeout-input").value = data.minutes;
+  }
+
   await loadUserList();
   cancelEditUser();
+}
+
+async function saveSessionTimeout() {
+  const minutes = parseInt(document.getElementById("session-timeout-input").value);
+  if (!minutes || minutes < 5 || minutes > 480) {
+    alert("Enter a number of minutes between 5 and 480.");
+    return;
+  }
+  const res = await authFetch("/settings/session-timeout", {
+    method: "PUT",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({minutes})
+  });
+  if (!res.ok) {
+    alert("Failed to save: " + (await res.text()));
+    return;
+  }
+  idleTimeoutMinutes = minutes;
+  resetIdleTimer();
+  alert(`Session timeout set to ${minutes} minutes.`);
 }
 
 async function loadUserList() {
