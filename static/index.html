@@ -18,7 +18,7 @@
   body { font-family: Segoe UI, Arial, sans-serif; margin: 0; background: #f4f4f6; color: #222; }
   header { background: var(--navy); color: white; padding: 10px 20px; display: flex; justify-content: space-between; align-items: center; }
   header .brand { display: flex; align-items: center; gap: 12px; }
-  header .brand img { height: 34px; display: block; }
+  header .brand img { height: 44px; width: auto; max-width: 220px; object-fit: contain; display: block; }
   header .brand .wordmark { font-size: 20px; font-weight: 700; letter-spacing: .5px; }
   header .brand .wordmark span { color: var(--accent); }
   header .app-title { font-size: 13px; color: #cdd8e6; margin-left: 10px; border-left: 1px solid #3a5578; padding-left: 10px; }
@@ -125,7 +125,6 @@
 
   <div style="padding: 16px;">
     <div id="toolbar">
-      <span id="role-note" class="badge"></span>
       <input type="file" id="import-file" style="display:none;">
       <button class="action-btn" id="import-btn" style="display:none;" onclick="document.getElementById('import-file').click()">Import Inventory CSV</button>
       <button class="action-btn" id="run-assign-btn" style="display:none;" onclick="runAssignment()">Run Assignment Now</button>
@@ -264,6 +263,38 @@ function parseCurrency(val) {
   if (val === "" || val === null || val === undefined) return null;
   const cleaned = String(val).replace(/[^0-9.-]/g, "");
   return cleaned === "" ? null : cleaned;
+}
+
+function countBusinessDaysJS(startStr, endStr) {
+  if (!startStr || !endStr) return 0;
+  const start = new Date(startStr + "T00:00:00");
+  const end = new Date(endStr + "T00:00:00");
+  if (isNaN(start) || isNaN(end) || end <= start) return 0;
+  let count = 0;
+  let cur = new Date(start);
+  cur.setDate(cur.getDate() + 1);
+  while (cur <= end) {
+    const day = cur.getDay(); // 0=Sun ... 6=Sat
+    if (day !== 0 && day !== 6) count++;
+    cur.setDate(cur.getDate() + 1);
+  }
+  return count;
+}
+
+function todayStr() {
+  const d = new Date();
+  return d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") + "-" + String(d.getDate()).padStart(2,"0");
+}
+
+function renderTATCell(o) {
+  if (o.tat_days !== null && o.tat_days !== undefined) {
+    return `<td>${o.tat_days}</td>`;
+  }
+  if (o.received_date && o.assigned_to_id) {
+    const elapsed = countBusinessDaysJS(o.received_date, todayStr());
+    return `<td style="color:#888; font-style:italic;" title="Running count since Received Date \u2014 not final until Completed">${elapsed}</td>`;
+  }
+  return `<td></td>`;
 }
 
 let currentOrders = [];
@@ -487,9 +518,7 @@ function showApp() {
     document.getElementById("switch-process-btn").style.display = "inline-block";
   }
 
-  document.getElementById("role-note").textContent = isLeadRole()
-    ? "Received Date, Assigned Date, Employee, and Employee Name are set automatically. Completed rows can still be corrected until submitted."
-    : "Edit fields, then click Save. Pending $ is auto-calculated. Locked once Completed \u2014 click Submit End of Day to send finished work to Production. Use Production to view/export your own submitted history.";
+  // Instructional banner removed — no longer needed.
 
   if (isLeadRole()) {
     document.getElementById("import-btn").style.display = "inline-block";
@@ -1036,6 +1065,11 @@ function renderGrid(orders) {
         } else {
           html += `<td>${rawVal}</td>`;
         }
+        return;
+      }
+
+      if (c.k === "tat_days") {
+        html += renderTATCell(o);
         return;
       }
 
