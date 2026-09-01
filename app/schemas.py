@@ -123,10 +123,8 @@ class ColleagueUpdate(BaseModel):
     trans_count: Optional[int] = None
     posting_status: Optional[str] = None
     poster_comment: Optional[str] = None
-    ventra_comment: Optional[str] = None
     escalation_category: Optional[str] = None
     issue_raised_date: Optional[date] = None
-    issue_closed_date: Optional[date] = None
     posted_date: Optional[date] = None
 
 

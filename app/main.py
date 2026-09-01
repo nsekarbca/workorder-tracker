@@ -636,10 +636,14 @@ def update_colleague_fields(
 
     previous_status = order.posting_status
 
-    # Pending $ and Posted Date are always system-derived, never accepted
-    # directly from the client.
+    # Pending $, Posted Date, VENTRA Comment, and Issue Closed Date are all
+    # system-derived now — never accepted directly from the colleague.
+    # VENTRA Comment is a Team-Lead-only note (set via team-lead-correction);
+    # Issue Closed Date auto-stamps the moment a Clarification is resolved.
     payload_data.pop("pending_amount", None)
     payload_data.pop("posted_date", None)
+    payload_data.pop("ventra_comment", None)
+    payload_data.pop("issue_closed_date", None)
 
     # Final posting_status after this update is applied (may be unchanged).
     final_status = payload_data.get("posting_status", order.posting_status)
@@ -663,12 +667,13 @@ def update_colleague_fields(
             detail=f"Cannot save — missing required: {', '.join(missing_core)}",
         )
 
-    # Poster Comment, VENTRA Comment, Escalation Category, Issue Raised/Closed
-    # Date only ever make sense while a Clarification is open — locked both
-    # during In-Process and once Completed.
+    # Poster Comment, Escalation Category, and Issue Raised Date only make
+    # sense while a Clarification is open — locked both during In-Process
+    # and once Completed. (VENTRA Comment and Issue Closed Date are excluded
+    # here entirely since they're never colleague-editable — see the pops
+    # above.)
     CLARIFICATION_ONLY_FIELDS = [
-        "poster_comment", "ventra_comment", "escalation_category",
-        "issue_raised_date", "issue_closed_date",
+        "poster_comment", "escalation_category", "issue_raised_date",
     ]
     if final_status != "Clarification":
         attempted = [
@@ -695,11 +700,13 @@ def update_colleague_fields(
     if order.posting_status == "Completed" and not order.posted_date:
         order.posted_date = date.today()
 
-    # Leaving Clarification for any other status clears the fields that only
-    # make sense while a clarification is open.
-    if previous_status == "Clarification" and order.posting_status != "Clarification":
-        order.escalation_category = None
-        order.issue_raised_date = None
+    # Resolving a Clarification (moving to any other status) auto-stamps
+    # Issue Closed Date, mirroring how Issue Raised Date auto-stamps on the
+    # way in. Escalation Category and Issue Raised Date are deliberately
+    # NOT cleared anymore — they're kept as history so the TAT pause-window
+    # calculation at Completion stays accurate.
+    if previous_status == "Clarification" and order.posting_status != "Clarification" and not order.issue_closed_date:
+        order.issue_closed_date = date.today()
 
     # Pending $ = Amount - Posted $, recalculated any time either changes.
     if order.amount is not None:
@@ -738,7 +745,7 @@ def update_colleague_fields(
     db.refresh(order)
 
     if order.posting_status == "Completed":
-        _auto_assign_open_slots(db)
+        _auto_assign_open_slots(db, order.process_id)
 
     return order
 
