@@ -27,6 +27,23 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def no_cache_for_app_shell(request, call_next):
+    """
+    The whole frontend is one HTML file with inline JS/CSS, so if the browser
+    caches it, deployed changes silently don't show up until a hard refresh.
+    Force revalidation on the root/app shell every time; let genuinely
+    static assets (the logo) cache normally.
+    """
+    response = await call_next(request)
+    path = request.url.path
+    if path == "/" or path == "/index.html":
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
+
 @app.on_event("startup")
 def bootstrap_and_seed():
     """
@@ -113,6 +130,39 @@ def change_password(
 @app.get("/auth/me", response_model=schemas.UserOut)
 def read_me(current_user: models.User = Depends(auth.get_current_user)):
     return current_user
+
+
+DEFAULT_SESSION_TIMEOUT_MINUTES = 60
+SESSION_TIMEOUT_SETTING_KEY = "session_timeout_minutes"
+
+
+@app.get("/settings/session-timeout", response_model=schemas.SessionTimeoutSetting)
+def get_session_timeout(
+    current_user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Any logged-in user can read this — the frontend uses it to run the
+    inactivity auto-logout timer."""
+    setting = db.query(models.AppSetting).filter(models.AppSetting.key == SESSION_TIMEOUT_SETTING_KEY).first()
+    return {"minutes": int(setting.value) if setting else DEFAULT_SESSION_TIMEOUT_MINUTES}
+
+
+@app.put("/settings/session-timeout", response_model=schemas.SessionTimeoutSetting)
+def set_session_timeout(
+    payload: schemas.SessionTimeoutSetting,
+    current_user: models.User = Depends(auth.require_role("super_admin")),
+    db: Session = Depends(get_db),
+):
+    if payload.minutes < 1:
+        raise HTTPException(status_code=400, detail="Timeout must be at least 1 minute")
+    setting = db.query(models.AppSetting).filter(models.AppSetting.key == SESSION_TIMEOUT_SETTING_KEY).first()
+    if setting:
+        setting.value = str(payload.minutes)
+    else:
+        setting = models.AppSetting(key=SESSION_TIMEOUT_SETTING_KEY, value=str(payload.minutes))
+        db.add(setting)
+    db.commit()
+    return {"minutes": payload.minutes}
 
 
 @app.post("/auth/forgot-username")
