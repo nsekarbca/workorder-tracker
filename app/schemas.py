@@ -48,7 +48,9 @@ class ChangePasswordRequest(BaseModel):
     old_password: str
     new_password: str
 
-
+class SessionTimeoutSetting(BaseModel):
+    minutes: int
+    
 class ForgotUsernameRequest(BaseModel):
     email: str
 
