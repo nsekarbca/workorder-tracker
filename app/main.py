@@ -479,6 +479,8 @@ def _parse_dt(v: Optional[str]) -> Optional[datetime]:
         "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M",
         "%m/%d/%y %H:%M:%S", "%m/%d/%y %H:%M",
         "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y",
+        "%d-%m-%Y", "%d/%m/%Y",
     ):
         try:
             return datetime.strptime(v, fmt)
