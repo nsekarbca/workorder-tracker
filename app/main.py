@@ -461,13 +461,30 @@ def import_inventory(
 def _parse_date(v: Optional[str]) -> Optional[date]:
     if not v:
         return None
-    return datetime.strptime(v.strip(), "%Y-%m-%d").date()
+    v = v.strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(v, fmt).date()
+        except ValueError:
+            continue
+    raise ValueError(f"Unrecognized date format: {v!r}")
 
 
 def _parse_dt(v: Optional[str]) -> Optional[datetime]:
     if not v:
         return None
-    return datetime.strptime(v.strip(), "%Y-%m-%d %H:%M:%S")
+    v = v.strip()
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+        "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M",
+        "%m/%d/%y %H:%M:%S", "%m/%d/%y %H:%M",
+        "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
+    ):
+        try:
+            return datetime.strptime(v, fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"Unrecognized datetime format: {v!r}")
 
 
 def _parse_int(v: Optional[str]) -> Optional[int]:
