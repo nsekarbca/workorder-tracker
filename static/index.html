@@ -623,6 +623,7 @@ async function showAdminView() {
   document.getElementById("production-bar").style.display = "none";
   document.getElementById("admin-panel").style.display = "block";
   document.getElementById("grid-container").innerHTML = "";
+  cancelEditUser();
 
   const procRes = await authFetch("/processes");
   if (procRes.ok) allProcesses = await procRes.json();
@@ -642,7 +643,6 @@ async function showAdminView() {
 
   await loadUserList();
   populateReportingManagerDropdown();
-  cancelEditUser();
 }
 
 async function saveSessionTimeout() {
@@ -734,7 +734,6 @@ function cancelEditUser() {
   clearUserForm();
   document.getElementById("user-form-heading").textContent = "Create User";
   document.getElementById("user-form-submit-btn").textContent = "Create User";
-  document.getElementById("user-form-cancel-btn").style.display = "none";
 }
 
 async function saveUser() {
