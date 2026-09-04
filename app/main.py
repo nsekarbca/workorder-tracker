@@ -462,33 +462,19 @@ def import_inventory(
 def _parse_date(v: Optional[str]) -> Optional[date]:
     if not v:
         return None
-    v = v.strip()
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%d-%m-%Y", "%d/%m/%Y"):
-        try:
-            return datetime.strptime(v, fmt).date()
-        except ValueError:
-            continue
-    raise ValueError(f"Unrecognized date format: {v!r}")
+    try:
+        return date_parser.parse(v.strip()).date()
+    except (ValueError, OverflowError) as e:
+        raise ValueError(f"Unrecognized date format: {v!r}") from e
 
 
 def _parse_dt(v: Optional[str]) -> Optional[datetime]:
     if not v:
         return None
-    v = v.strip()
-    for fmt in (
-        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
-        "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M",
-        "%m/%d/%y %H:%M:%S", "%m/%d/%y %H:%M",
-        "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
-        "%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y",
-        "%d-%m-%Y", "%d/%m/%Y",
-    ):
-        try:
-            return datetime.strptime(v, fmt)
-        except ValueError:
-            continue
-    raise ValueError(f"Unrecognized datetime format: {v!r}")
-
+    try:
+        return date_parser.parse(v.strip())
+    except (ValueError, OverflowError) as e:
+        raise ValueError(f"Unrecognized datetime format: {v!r}") from e
 
 def _parse_int(v: Optional[str]) -> Optional[int]:
     return int(v) if v not in (None, "") else None
