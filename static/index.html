@@ -176,7 +176,9 @@
         <label>Employee ID <input id="nu-employee-id"></label>
         <label>Email <input id="nu-email" type="email"></label>
         <label>Designation <input id="nu-designation"></label>
-        <label>Reporting Manager <input id="nu-reporting-manager"></label>
+        <label>Reporting Manager
+          <select id="nu-reporting-manager"></select>
+        </label>
         <label>Employment Status
           <select id="nu-employment-status">
             <option value="Active">Active</option>
@@ -192,7 +194,8 @@
       </label>
       <div style="margin-top:12px;">
         <button class="action-btn" id="user-form-submit-btn" onclick="saveUser()">Create User</button>
-        <button class="action-btn" id="user-form-cancel-btn" style="display:none; background:#888;" onclick="cancelEditUser()">Cancel</button>
+        <button class="action-btn" id="user-form-cancel-btn" style="background:#888;" onclick="cancelEditUser()">Clear</button>
+        <button class="action-btn" style="background:#888;" onclick="showActiveView()">Exit</button>
       </div>
       <hr style="margin:20px 0;">
       <h3>Session Timeout</h3>
@@ -638,6 +641,7 @@ async function showAdminView() {
   }
 
   await loadUserList();
+  populateReportingManagerDropdown();
   cancelEditUser();
 }
 
@@ -696,7 +700,7 @@ function editUser(userId) {
   document.getElementById("nu-employee-id").value = u.employee_id || "";
   document.getElementById("nu-email").value = u.email || "";
   document.getElementById("nu-designation").value = u.designation || "";
-  document.getElementById("nu-reporting-manager").value = u.reporting_manager || "";
+  populateReportingManagerDropdown(u.reporting_manager || "");
   document.getElementById("nu-employment-status").value = u.employment_status;
   document.getElementById("nu-dob").value = u.dob || "";
   document.getElementById("nu-doj").value = u.doj || "";
@@ -711,6 +715,19 @@ function editUser(userId) {
   document.getElementById("user-form-heading").scrollIntoView({behavior: "smooth"});
 }
 
+  function populateReportingManagerDropdown(selectedName) {
+  const sel = document.getElementById("nu-reporting-manager");
+  const names = new Set(allUsers.filter(u => u.role === "team_lead").map(u => u.full_name));
+  if (selectedName) names.add(selectedName); // keep an existing value visible even if that person is no longer a team lead
+  sel.innerHTML = '<option value="">\u2014 None \u2014</option>';
+  Array.from(names).sort().forEach(name => {
+    const opt = document.createElement("option");
+    opt.value = name; opt.textContent = name;
+    if (name === selectedName) opt.selected = true;
+    sel.appendChild(opt);
+  });
+}
+  
 function cancelEditUser() {
   editingUserId = null;
   document.getElementById("nu-username").disabled = false;
