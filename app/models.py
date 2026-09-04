@@ -30,6 +30,15 @@ class Process(Base):
     users = relationship("User", secondary=user_process_association, back_populates="processes")
 
 
+class AppSetting(Base):
+    """Simple key-value store for admin-configurable settings, e.g. the
+    inactivity session timeout. Not tied to any one user."""
+    __tablename__ = "app_settings"
+
+    key = Column(String, primary_key=True)
+    value = Column(String, nullable=False)
+
+
 class User(Base):
     __tablename__ = "users"
 
