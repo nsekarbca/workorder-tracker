@@ -3,7 +3,7 @@ from typing import List, Optional
 from dateutil import parser as date_parser
 import secrets
 
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
@@ -94,12 +94,18 @@ def _require_process_access(user: models.User, process_id: int):
 # ---------------------------------------------------------------------------
 
 @app.post("/auth/login", response_model=schemas.LoginResponse)
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    process_id: Optional[int] = Form(None),
+    db: Session = Depends(get_db),
+):
     user = db.query(models.User).filter(models.User.username == form_data.username).first()
     if not user or not auth.verify_password(form_data.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Incorrect username or password")
     if user.employment_status == "Inactive":
         raise HTTPException(status_code=403, detail="This account is inactive")
+    if process_id is not None and not _user_has_process(user, process_id):
+        raise HTTPException(status_code=403, detail="You don't have access to that process")
     token = auth.create_access_token({"sub": user.username})
     processes = db.query(models.Process).all() if user.role == "super_admin" else user.processes
     return {
@@ -110,7 +116,6 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
         "must_change_password": user.must_change_password,
         "processes": processes,
     }
-
 
 @app.post("/auth/change-password")
 def change_password(
@@ -311,6 +316,10 @@ def reset_password(
         email_utils.send_new_account_email(user.email, user.full_name, user.username, temp_password)
     return {"username": user.username, "temporary_password": temp_password}
 
+@app.get("/processes/public", response_model=List[schemas.ProcessOut])
+def list_processes_public(db: Session = Depends(get_db)):
+    """Unauthenticated — only exposes process names, used to populate the login page's process dropdown."""
+    return db.query(models.Process).order_by(models.Process.name.asc()).all()
 
 @app.get("/processes", response_model=List[schemas.ProcessOut])
 def list_all_processes(
@@ -439,6 +448,7 @@ def import_inventory(
     for row in reader:
         order = models.WorkOrder(
             process_id=process_id,
+            team_lead_id=current_user.id if current_user.role == "team_lead" else None,
             received_date=today,
             edm=row.get("edm") or None,
             status=row.get("status") or None,
@@ -492,10 +502,10 @@ def _auto_assign_open_slots(db: Session, process_id: int):
     """
     For every colleague who has access to this process and currently has no
     open (non-completed) order *in this process*, hand them the oldest
-    unassigned order in this same process. Mirrors the 'application-based'
-    model: one open file per user per process; finishing it pulls the next
-    one in. A colleague working multiple processes can have one open order
-    in each simultaneously — this only ever looks within one process at a time.
+    unassigned order they're actually eligible for. An order imported by a
+    Team Lead only goes to colleagues whose Reporting Manager matches that
+    same Team Lead's name; an order imported by a Super Admin (team_lead_id
+    is None) is open to any colleague in the process.
     """
     colleagues = (
         db.query(models.User)
@@ -514,12 +524,23 @@ def _auto_assign_open_slots(db: Session, process_id: int):
         )
         if has_open:
             continue
-        next_order = (
+
+        candidates = (
             db.query(models.WorkOrder)
             .filter(models.WorkOrder.process_id == process_id, models.WorkOrder.assigned_to_id.is_(None))
             .order_by(models.WorkOrder.id.asc())
-            .first()
+            .all()
         )
+        next_order = None
+        for cand in candidates:
+            if cand.team_lead_id is None:
+                next_order = cand
+                break
+            owner = db.query(models.User).filter(models.User.id == cand.team_lead_id).first()
+            if owner and colleague.reporting_manager == owner.full_name:
+                next_order = cand
+                break
+
         if next_order:
             next_order.assigned_to_id = colleague.id
             next_order.assigned_date = date.today()
@@ -527,9 +548,6 @@ def _auto_assign_open_slots(db: Session, process_id: int):
             next_order.employee_name = colleague.full_name
             next_order.posting_status = "In-Process"
             db.add(next_order)
-            # Autoflush is off for this session, so without this the next
-            # colleague's "find an unassigned order" query would still see
-            # this one as unassigned and both would grab the same row.
             db.flush()
     db.commit()
 

@@ -128,6 +128,13 @@ class WorkOrder(Base):
     submitted_at = Column(DateTime, nullable=True)
 
     assigned_to_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    
+    # Which Team Lead's import this order came from — auto-assignment only
+    # offers it to colleagues who report to that Team Lead. Null means it
+    # was imported by a Super Admin and is open to any colleague in the
+    # process.
+    team_lead_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+
     assignee = relationship("User", back_populates="orders")
 
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

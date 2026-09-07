@@ -180,6 +180,7 @@ class WorkOrderOut(BaseModel):
     assigned_to_id: Optional[int]
     submitted: bool
     submitted_at: Optional[datetime]
+    team_lead_id: Optional[int]
 
     class Config:
         from_attributes = True
