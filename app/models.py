@@ -70,7 +70,17 @@ class User(Base):
     reset_token = Column(String, nullable=True)
     reset_token_expires = Column(DateTime, nullable=True)
 
-    orders = relationship("WorkOrder", back_populates="assignee")
+    orders = relationship(
+    "WorkOrder",
+    foreign_keys="WorkOrder.assigned_to_id",
+    back_populates="assignee",
+)
+
+team_lead_orders = relationship(
+    "WorkOrder",
+    foreign_keys="WorkOrder.team_lead_id",
+    back_populates="team_lead",
+)
     processes = relationship("Process", secondary=user_process_association, back_populates="users")
 
 
@@ -135,6 +145,16 @@ class WorkOrder(Base):
     # process.
     team_lead_id = Column(Integer, ForeignKey("users.id"), nullable=True)
 
-    assignee = relationship("User", back_populates="orders")
+    assignee = relationship(
+    "User",
+    foreign_keys=[assigned_to_id],
+    back_populates="orders",
+)
+
+team_lead = relationship(
+    "User",
+    foreign_keys=[team_lead_id],
+    back_populates="team_lead_orders",
+)
 
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
