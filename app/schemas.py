@@ -1,6 +1,6 @@
 from datetime import date, datetime
 from typing import Optional, List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 class UserLogin(BaseModel):
@@ -29,7 +29,7 @@ class UserOut(BaseModel):
     reporting_manager: Optional[str] = None
     employment_status: str = "Active"
     must_change_password: bool = True
-    processes: List[ProcessOut] = Field(default_factory=list)
+    processes: List[ProcessOut] = []
 
     class Config:
         from_attributes = True
@@ -41,7 +41,7 @@ class LoginResponse(BaseModel):
     role: str
     full_name: str
     must_change_password: bool
-    processes: List[ProcessOut] = Field(default_factory=list)
+    processes: List[ProcessOut] = []
 
 
 class ChangePasswordRequest(BaseModel):
@@ -77,7 +77,7 @@ class CreateUserRequest(BaseModel):
     reporting_manager: Optional[str] = None
     employment_status: str = "Active"
     employee_id: Optional[str] = None
-    process_ids: List[int] = Field(default_factory=list)
+    process_ids: List[int] = []
 
 
 class CreateUserResponse(BaseModel):
@@ -180,7 +180,6 @@ class WorkOrderOut(BaseModel):
     assigned_to_id: Optional[int]
     submitted: bool
     submitted_at: Optional[datetime]
-    team_lead_id: Optional[int]
 
     class Config:
         from_attributes = True

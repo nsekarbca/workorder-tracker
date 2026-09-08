@@ -70,17 +70,7 @@ class User(Base):
     reset_token = Column(String, nullable=True)
     reset_token_expires = Column(DateTime, nullable=True)
 
-    orders = relationship(
-    "WorkOrder",
-    foreign_keys="WorkOrder.assigned_to_id",
-    back_populates="assignee",
-)
-
-team_lead_orders = relationship(
-    "WorkOrder",
-    foreign_keys="WorkOrder.team_lead_id",
-    back_populates="team_lead",
-)
+    orders = relationship("WorkOrder", back_populates="assignee", foreign_keys="WorkOrder.assigned_to_id")
     processes = relationship("Process", secondary=user_process_association, back_populates="users")
 
 
@@ -138,23 +128,6 @@ class WorkOrder(Base):
     submitted_at = Column(DateTime, nullable=True)
 
     assigned_to_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    
-    # Which Team Lead's import this order came from — auto-assignment only
-    # offers it to colleagues who report to that Team Lead. Null means it
-    # was imported by a Super Admin and is open to any colleague in the
-    # process.
-    team_lead_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-
-    assignee = relationship(
-    "User",
-    foreign_keys=[assigned_to_id],
-    back_populates="orders",
-)
-
-team_lead = relationship(
-    "User",
-    foreign_keys=[team_lead_id],
-    back_populates="team_lead_orders",
-)
+    assignee = relationship("User", back_populates="orders", foreign_keys=[assigned_to_id])
 
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
