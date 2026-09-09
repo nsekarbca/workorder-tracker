@@ -85,6 +85,12 @@ class WorkOrder(Base):
     process_id = Column(Integer, ForeignKey("processes.id"), nullable=True)
     process = relationship("Process")
 
+    # Which Team Lead's import this order came from — auto-assignment only
+    # offers it to colleagues who report to that Team Lead. Null means it
+    # was imported by a Super Admin and is open to any colleague in the
+    # process.
+    team_lead_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+
     # --- A-D: Team Lead fields ---
     received_date = Column(Date)
     assigned_date = Column(Date)
