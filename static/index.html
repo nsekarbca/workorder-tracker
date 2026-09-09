@@ -62,8 +62,13 @@
   <input id="login-username" autocomplete="username">
   <label>Password</label>
   <input id="login-password" type="password" autocomplete="current-password">
-  <div id="error-msg"></div>
-  <button onclick="login()">Log In</button>
+    <div id="error-msg"></div>
+  <button id="login-btn" onclick="login()">Log In</button>
+  <div id="login-process-step" style="display:none;">
+    <label>Process</label>
+    <select id="login-process-dropdown"></select>
+    <button onclick="confirmInlineProcessSelection()">Continue</button>
+  </div>
   <span id="forgot-link" onclick="showForgotScreen()">Forgot Password / Username?</span>
 </div>
 
@@ -437,18 +442,44 @@ async function login() {
   sessionStorage.removeItem("wot_process_id");
   currentProcessId = null;
 
-  document.getElementById("login-screen").style.display = "none";
-  if (data.must_change_password) {
+    if (data.must_change_password) {
+    document.getElementById("login-screen").style.display = "none";
     showChangePasswordScreen();
   } else if (myProcesses.length > 1) {
-    showProcessSelectScreen();
+    showInlineProcessStep();
   } else if (myProcesses.length === 1) {
     currentProcessId = myProcesses[0].id;
     sessionStorage.setItem("wot_process_id", currentProcessId);
+    document.getElementById("login-screen").style.display = "none";
     showApp();
   } else {
+    document.getElementById("login-screen").style.display = "none";
     showApp();
   }
+}
+
+function showInlineProcessStep() {
+  document.getElementById("login-username").disabled = true;
+  document.getElementById("login-password").disabled = true;
+  document.getElementById("login-btn").style.display = "none";
+  document.getElementById("error-msg").textContent = "";
+  const sel = document.getElementById("login-process-dropdown");
+  sel.innerHTML = "";
+  myProcesses.forEach(p => {
+    const opt = document.createElement("option");
+    opt.value = p.id; opt.textContent = p.name;
+    sel.appendChild(opt);
+  });
+  document.getElementById("login-process-step").style.display = "block";
+}
+
+function confirmInlineProcessSelection() {
+  const selectedId = document.getElementById("login-process-dropdown").value;
+  if (!selectedId) return;
+  currentProcessId = parseInt(selectedId);
+  sessionStorage.setItem("wot_process_id", currentProcessId);
+  document.getElementById("login-screen").style.display = "none";
+  showApp();
 }
 
 function showChangePasswordScreen() {
