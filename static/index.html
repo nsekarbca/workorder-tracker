@@ -63,8 +63,6 @@
   <label>Password</label>
   <input id="login-password" type="password" autocomplete="current-password">
   <div id="error-msg"></div>
-  <label>Process <span style="font-weight:normal; color:#888;">(pick one if you have more than one)</span></label>
-  <select id="login-process"><option value="">&mdash; Select &mdash;</option></select>
   <button onclick="login()">Log In</button>
   <span id="forgot-link" onclick="showForgotScreen()">Forgot Password / Username?</span>
 </div>
@@ -107,7 +105,8 @@
 <div id="process-select-screen" style="display:none;">
   <h2>Select a Process</h2>
   <p style="font-size:13px; color:#555;">You have access to more than one process. Pick one to continue.</p>
-  <div id="process-list"></div>
+  <select id="process-dropdown"></select>
+  <button onclick="confirmProcessSelection()">Continue</button>
 </div>
 
 <div id="app">
@@ -420,10 +419,7 @@ async function submitResetWithToken() {
 async function login() {
   const username = document.getElementById("login-username").value;
   const password = document.getElementById("login-password").value;
-  const selectedProcessId = document.getElementById("login-process").value;
-  const bodyParams = {username, password};
-  if (selectedProcessId) bodyParams.process_id = selectedProcessId;
-  const body = new URLSearchParams(bodyParams);
+  const body = new URLSearchParams({username, password});
   const res = await fetch(API + "/auth/login", {method:"POST", body});
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -438,20 +434,12 @@ async function login() {
   sessionStorage.setItem("wot_name", fullName);
   sessionStorage.setItem("wot_processes", JSON.stringify(myProcesses));
   sessionStorage.setItem("wot_must_change", data.must_change_password ? "true" : "false");
-
-  if (selectedProcessId) {
-    currentProcessId = parseInt(selectedProcessId);
-    sessionStorage.setItem("wot_process_id", currentProcessId);
-  } else {
-    sessionStorage.removeItem("wot_process_id");
-    currentProcessId = null;
-  }
+  sessionStorage.removeItem("wot_process_id");
+  currentProcessId = null;
 
   document.getElementById("login-screen").style.display = "none";
   if (data.must_change_password) {
     showChangePasswordScreen();
-  } else if (currentProcessId) {
-    showApp();
   } else if (myProcesses.length > 1) {
     showProcessSelectScreen();
   } else if (myProcesses.length === 1) {
@@ -508,20 +496,22 @@ function showProcessSelectScreen() {
   document.getElementById("change-password-screen").style.display = "none";
   document.getElementById("app").style.display = "none";
   document.getElementById("process-select-screen").style.display = "block";
-  const list = document.getElementById("process-list");
-  list.innerHTML = "";
+  const sel = document.getElementById("process-dropdown");
+  sel.innerHTML = "";
   myProcesses.forEach(p => {
-    const btn = document.createElement("button");
-    btn.className = "process-btn";
-    btn.textContent = p.name;
-    btn.onclick = () => {
-      currentProcessId = p.id;
-      sessionStorage.setItem("wot_process_id", currentProcessId);
-      document.getElementById("process-select-screen").style.display = "none";
-      showApp();
-    };
-    list.appendChild(btn);
+    const opt = document.createElement("option");
+    opt.value = p.id; opt.textContent = p.name;
+    sel.appendChild(opt);
   });
+}
+
+function confirmProcessSelection() {
+  const selectedId = document.getElementById("process-dropdown").value;
+  if (!selectedId) return;
+  currentProcessId = parseInt(selectedId);
+  sessionStorage.setItem("wot_process_id", currentProcessId);
+  document.getElementById("process-select-screen").style.display = "none";
+  showApp();
 }
 
 function showProcessSwitcher() {
