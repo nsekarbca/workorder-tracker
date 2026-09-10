@@ -260,7 +260,7 @@ def create_user(
     for this deployment) — the temporary password is returned in this
     response so the Super Admin can relay it to the new user directly.
     """
-        if payload.role not in ("colleague", "team_lead", "admin", "super_admin"):
+    if payload.role not in ("colleague", "team_lead", "admin", "super_admin"):
         raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', 'admin', or 'super_admin'")
     if db.query(models.User).filter(models.User.username == payload.username).first():
         raise HTTPException(status_code=400, detail="username already exists")
