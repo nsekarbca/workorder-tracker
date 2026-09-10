@@ -132,6 +132,7 @@
   <div style="padding: 16px;">
     <div id="toolbar">
       <input type="file" id="import-file" style="display:none;">
+      <select id="import-on-behalf" style="display:none;"></select>
       <button class="action-btn" id="import-btn" style="display:none;" onclick="document.getElementById('import-file').click()">Import Inventory CSV</button>
       <button class="action-btn" id="run-assign-btn" style="display:none;" onclick="runAssignment()">Run Assignment Now</button>
       <button class="action-btn" id="clear-data-btn" style="display:none; background:var(--red);" onclick="clearAllData()">Clear All Data</button>
@@ -176,6 +177,7 @@
           <select id="nu-role">
             <option value="colleague">Colleague</option>
             <option value="team_lead">Team Lead</option>
+            <option value="admin">Admin</option>
             <option value="super_admin">Super Admin</option>
           </select>
         </label>
@@ -628,13 +630,19 @@ function showApp() {
 
   // Instructional banner removed — no longer needed.
 
-  if (isLeadRole()) {
+    if (isLeadRole()) {
     document.getElementById("import-btn").style.display = "inline-block";
     document.getElementById("run-assign-btn").style.display = "inline-block";
     document.getElementById("clear-data-btn").style.display = "inline-block";
     document.getElementById("production-btn").style.display = "inline-block";
     document.getElementById("import-file").addEventListener("change", importCSV);
     if (currentProcessId) loadColleagueList();
+  } else if (role === "admin") {
+    // Admin currently only gets Import (with on-behalf-of-Team-Lead
+    // delegation) — not the rest of the Team Lead toolset yet.
+    document.getElementById("import-btn").style.display = "inline-block";
+    document.getElementById("import-file").addEventListener("change", importCSV);
+    if (currentProcessId) loadImportOnBehalfDropdown();
   } else {
     document.getElementById("submit-day-btn").style.display = "inline-block";
     document.getElementById("production-btn").style.display = "inline-block";
@@ -867,6 +875,10 @@ async function importCSV(e) {
   if (!requireSpecificProcess()) { e.target.value = ""; return; }
   const form = new FormData();
   form.append("file", file);
+  if (role === "admin") {
+    const onBehalf = document.getElementById("import-on-behalf").value;
+    if (onBehalf) form.append("on_behalf_of_team_lead_id", onBehalf);
+  }
   const res = await authFetch(withProcess("/orders/import"), {method:"POST", body: form});
   if (!res.ok) {
     alert("Import failed: " + (await res.text()));
@@ -1112,6 +1124,20 @@ async function loadColleagueList() {
   if (res.ok) colleagueList = await res.json();
 }
 
+async function loadImportOnBehalfDropdown() {
+  const sel = document.getElementById("import-on-behalf");
+  const res = await authFetch(withProcess("/users/team-leads"));
+  if (!res.ok) return;
+  const teamLeads = await res.json();
+  sel.innerHTML = '<option value="">Import as: myself (open to all)</option>';
+  teamLeads.forEach(tl => {
+    const opt = document.createElement("option");
+    opt.value = tl.id; opt.textContent = "Import on behalf of: " + tl.full_name;
+    sel.appendChild(opt);
+  });
+  sel.style.display = "inline-block";
+}
+  
 async function reassignOrder(orderId, newColleagueId) {
   if (!newColleagueId) return;
   const colleague = colleagueList.find(c => c.id === parseInt(newColleagueId));
