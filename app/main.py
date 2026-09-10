@@ -219,6 +219,28 @@ def reset_password_with_token(payload: schemas.ResetPasswordWithTokenRequest, db
 # User management — Super Admin only
 # ---------------------------------------------------------------------------
 
+@app.get("/users/team-leads", response_model=List[schemas.UserOut])
+def list_team_leads(
+    process_id: int,
+    current_user: models.User = Depends(auth.require_role("admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    Team Leads who have access to this process — lets an Admin import
+    inventory on a specific Team Lead's behalf (e.g. while they're out),
+    so the imported orders still only route to that Team Lead's own
+    colleagues instead of the whole process. Deliberately Admin-only, not
+    Super Admin — this is an operational-coverage feature, not a system
+    administration one.
+    """
+    _require_process_access(current_user, process_id)
+    return (
+        db.query(models.User)
+        .filter(models.User.role == "team_lead", models.User.processes.any(models.Process.id == process_id))
+        .order_by(models.User.full_name.asc())
+        .all()
+    )
+    
 @app.get("/users", response_model=List[schemas.UserOut])
 def list_users(
     current_user: models.User = Depends(auth.require_role("super_admin")),
@@ -238,8 +260,8 @@ def create_user(
     for this deployment) — the temporary password is returned in this
     response so the Super Admin can relay it to the new user directly.
     """
-    if payload.role not in ("colleague", "team_lead", "super_admin"):
-        raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', or 'super_admin'")
+        if payload.role not in ("colleague", "team_lead", "admin", "super_admin"):
+        raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', 'admin', or 'super_admin'")
     if db.query(models.User).filter(models.User.username == payload.username).first():
         raise HTTPException(status_code=400, detail="username already exists")
 
@@ -280,8 +302,8 @@ def update_user(
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    if payload.role not in ("colleague", "team_lead", "super_admin"):
-        raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', or 'super_admin'")
+       if payload.role not in ("colleague", "team_lead", "admin", "super_admin"):
+        raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', 'admin', or 'super_admin'")
 
     user.full_name = payload.full_name
     user.role = payload.role
@@ -432,15 +454,41 @@ def delete_all_orders(
 def import_inventory(
     process_id: int,
     file: UploadFile = File(...),
-    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
+    on_behalf_of_team_lead_id: Optional[int] = Form(None),
+    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin", "admin")),
     db: Session = Depends(get_db),
 ):
     """
     Accepts a CSV with columns matching E-O:
     edm,status,created,image_count,doc_count,def_doc_type,amount,description,division,deposit_date
     Creates one unassigned WorkOrder row per line, tagged to this process.
+    Orders imported by a Team Lead are tagged to that Team Lead, so
+    auto-assignment only offers them to colleagues reporting to that same
+    Team Lead. An Admin can import on a specific Team Lead's behalf (e.g.
+    covering for one who's out) by passing on_behalf_of_team_lead_id, which
+    tags the import exactly as if that Team Lead had done it themselves.
+    A Super Admin, or an Admin importing without specifying a Team Lead,
+    leaves the order open to any colleague in the process.
     """
     _require_process_access(current_user, process_id)
+
+    resolved_team_lead_id = None
+    if current_user.role == "team_lead":
+        resolved_team_lead_id = current_user.id
+    elif current_user.role == "admin" and on_behalf_of_team_lead_id is not None:
+        delegate = (
+            db.query(models.User)
+            .filter(
+                models.User.id == on_behalf_of_team_lead_id,
+                models.User.role == "team_lead",
+                models.User.processes.any(models.Process.id == process_id),
+            )
+            .first()
+        )
+        if not delegate:
+            raise HTTPException(status_code=400, detail="Not a valid Team Lead for this process")
+        resolved_team_lead_id = delegate.id
+
     content = file.file.read().decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(content))
     created_count = 0
@@ -448,7 +496,7 @@ def import_inventory(
     for row in reader:
         order = models.WorkOrder(
             process_id=process_id,
-            team_lead_id=current_user.id if current_user.role == "team_lead" else None,
+            team_lead_id=resolved_team_lead_id,
             received_date=today,
             edm=row.get("edm") or None,
             status=row.get("status") or None,
