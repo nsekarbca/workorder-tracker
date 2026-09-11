@@ -300,9 +300,9 @@ def update_user(
 ):
     """Edit an existing profile — role, employment status, processes, etc."""
     user = db.query(models.User).filter(models.User.id == user_id).first()
-    if not user:
+        if not user:
         raise HTTPException(status_code=404, detail="User not found")
-       if payload.role not in ("colleague", "team_lead", "admin", "super_admin"):
+    if payload.role not in ("colleague", "team_lead", "admin", "super_admin"):
         raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', 'admin', or 'super_admin'")
 
     user.full_name = payload.full_name
