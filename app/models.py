@@ -26,6 +26,10 @@ class Process(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True, nullable=False)
+    # Optional daily production target for this process, set by a Super
+    # Admin. Purely informational at this stage — nullable so existing
+    # processes (and newly-created ones left blank) don't require a value.
+    daily_target = Column(Integer, nullable=True)
 
     users = relationship("User", secondary=user_process_association, back_populates="processes")
 

@@ -11,9 +11,22 @@ class UserLogin(BaseModel):
 class ProcessOut(BaseModel):
     id: int
     name: str
+    daily_target: Optional[int] = None
 
     class Config:
         from_attributes = True
+
+
+# Super-Admin-only: create a new process, with an optional daily target.
+class ProcessCreate(BaseModel):
+    name: str
+    daily_target: Optional[int] = None
+
+
+# Super-Admin-only: edit an existing process's name and/or daily target.
+class ProcessUpdate(BaseModel):
+    name: str
+    daily_target: Optional[int] = None
 
 
 class UserOut(BaseModel):

@@ -352,6 +352,57 @@ def list_all_processes(
     return db.query(models.Process).order_by(models.Process.name.asc()).all()
 
 
+@app.post("/processes", response_model=schemas.ProcessOut)
+def create_process(
+    payload: schemas.ProcessCreate,
+    current_user: models.User = Depends(auth.require_role("super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    Adds a new process beyond the original fixed nine — lets a Super Admin
+    grow the list as the org's work expands, with an optional daily
+    production target attached.
+    """
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Process name is required")
+    if db.query(models.Process).filter(models.Process.name == name).first():
+        raise HTTPException(status_code=400, detail="A process with that name already exists")
+    process = models.Process(name=name, daily_target=payload.daily_target)
+    db.add(process)
+    db.commit()
+    db.refresh(process)
+    return process
+
+
+@app.patch("/processes/{process_id}", response_model=schemas.ProcessOut)
+def update_process(
+    process_id: int,
+    payload: schemas.ProcessUpdate,
+    current_user: models.User = Depends(auth.require_role("super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Rename a process and/or change its daily target."""
+    process = db.query(models.Process).filter(models.Process.id == process_id).first()
+    if not process:
+        raise HTTPException(status_code=404, detail="Process not found")
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Process name is required")
+    duplicate = (
+        db.query(models.Process)
+        .filter(models.Process.name == name, models.Process.id != process_id)
+        .first()
+    )
+    if duplicate:
+        raise HTTPException(status_code=400, detail="A process with that name already exists")
+    process.name = name
+    process.daily_target = payload.daily_target
+    db.commit()
+    db.refresh(process)
+    return process
+
+
 @app.get("/users/colleagues", response_model=List[schemas.UserOut])
 def list_colleagues(
     process_id: int,
