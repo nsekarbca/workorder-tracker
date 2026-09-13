@@ -137,6 +137,7 @@
       <button class="action-btn" id="run-assign-btn" style="display:none;" onclick="runAssignment()">Run Assignment Now</button>
       <button class="action-btn" id="clear-data-btn" style="display:none; background:var(--red);" onclick="clearAllData()">Clear All Data</button>
       <button class="action-btn" id="production-btn" style="display:none;" onclick="showProductionView()">Production</button>
+      <button class="action-btn" id="share-btn" style="display:none;" onclick="toggleShareMode()">Share Orders</button>
       <button class="action-btn" onclick="loadOrders()">Refresh</button>
       <button class="action-btn" id="submit-day-btn" style="display:none; background:var(--green);" onclick="submitEndOfDay()">Submit End of Day</button>
       <button class="action-btn" id="switch-process-btn" style="display:none;" onclick="showProcessSwitcher()">Switch Process</button>
@@ -167,6 +168,17 @@
         <button class="action-btn" onclick="clearProductionFilters()">Clear Filters</button>
         <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
       </div>
+    </div>
+    <div id="share-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px; background:white; padding:12px; border-radius:8px;">
+      <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
+        <label>Transfer To
+          <select id="share-to-team-lead"></select>
+        </label>
+        <button class="action-btn" onclick="transferWholeQueue()">Transfer Whole Queue</button>
+        <button class="action-btn" onclick="transferSelected()">Transfer Checked Rows</button>
+        <button class="action-btn" style="background:#888;" onclick="cancelShareMode()">Cancel</button>
+      </div>
+      <div style="font-size:12px; color:#666;">Check rows in the grid below to transfer specific orders, or use "Transfer Whole Queue" to move every eligible order (not yet Completed or submitted) to the selected Team Lead. Their colleagues will be auto-assigned right away.</div>
     </div>
     <div id="admin-panel" style="display:none;">
       <h3 id="user-form-heading">Create User</h3>
@@ -236,6 +248,7 @@ const API = "";
 let token = sessionStorage.getItem("wot_token") || "";
 let role = sessionStorage.getItem("wot_role") || "";
 let fullName = sessionStorage.getItem("wot_name") || "";
+let myUserId = sessionStorage.getItem("wot_user_id") ? parseInt(sessionStorage.getItem("wot_user_id")) : null;
 let myProcesses = JSON.parse(sessionStorage.getItem("wot_processes") || "[]");
 let currentProcessId = sessionStorage.getItem("wot_process_id") ? parseInt(sessionStorage.getItem("wot_process_id")) : null;
 let pendingMustChangePassword = false;
@@ -335,6 +348,8 @@ let editingUserId = null;
 let editingProcessId = null;
 let viewMode = "active"; // "active", "production", or "admin"
 let drafts = {};
+let shareMode = false;
+let selectedForShare = new Set();
 
 if (token) {
   if (sessionStorage.getItem("wot_must_change") === "true") {
@@ -447,11 +462,12 @@ async function login() {
     return;
   }
   const data = await res.json();
-  token = data.access_token; role = data.role; fullName = data.full_name;
+  token = data.access_token; role = data.role; fullName = data.full_name; myUserId = data.id;
   myProcesses = data.processes || [];
   sessionStorage.setItem("wot_token", token);
   sessionStorage.setItem("wot_role", role);
   sessionStorage.setItem("wot_name", fullName);
+  sessionStorage.setItem("wot_user_id", data.id);
   sessionStorage.setItem("wot_processes", JSON.stringify(myProcesses));
   sessionStorage.setItem("wot_must_change", data.must_change_password ? "true" : "false");
   sessionStorage.removeItem("wot_process_id");
@@ -650,6 +666,9 @@ function showApp() {
     document.getElementById("production-btn").style.display = "inline-block";
     document.getElementById("import-file").addEventListener("change", importCSV);
     if (currentProcessId) loadColleagueList();
+    if (role === "team_lead") {
+      document.getElementById("share-btn").style.display = "inline-block";
+    }
   } else if (role === "admin") {
     // Admin currently only gets Import (with on-behalf-of-Team-Lead
     // delegation) — not the rest of the Team Lead toolset yet.
@@ -691,6 +710,9 @@ async function showAdminView() {
   viewMode = "admin";
   document.getElementById("toolbar").style.display = "none";
   document.getElementById("production-bar").style.display = "none";
+  shareMode = false;
+  selectedForShare.clear();
+  document.getElementById("share-bar").style.display = "none";
   document.getElementById("admin-panel").style.display = "block";
   document.getElementById("grid-container").innerHTML = "";
   cancelEditUser();
@@ -1068,6 +1090,9 @@ async function showProductionView() {
   viewMode = "production";
   document.getElementById("toolbar").style.display = "none";
   document.getElementById("admin-panel").style.display = "none";
+  shareMode = false;
+  selectedForShare.clear();
+  document.getElementById("share-bar").style.display = "none";
   document.getElementById("production-bar").style.display = "flex";
 
   dateFilters = {posted:{from:"",to:""}, received:{from:"",to:""}, assigned:{from:"",to:""}, created:{from:"",to:""}};
@@ -1272,6 +1297,84 @@ async function loadOrders() {
   renderGrid(currentOrders);
 }
 
+// ---------------------------------------------------------------------
+// Team Lead-to-Team Lead order sharing
+// ---------------------------------------------------------------------
+
+async function toggleShareMode() {
+  if (!requireSpecificProcess()) return;
+  shareMode = true;
+  selectedForShare.clear();
+  document.getElementById("share-bar").style.display = "flex";
+
+  const res = await authFetch(withProcess("/users/team-leads"));
+  const sel = document.getElementById("share-to-team-lead");
+  sel.innerHTML = "";
+  if (res.ok) {
+    const leads = await res.json();
+    leads.forEach(l => {
+      if (l.full_name === fullName) return; // exclude self
+      const opt = document.createElement("option");
+      opt.value = l.id; opt.textContent = l.full_name;
+      sel.appendChild(opt);
+    });
+  }
+  if (!sel.options.length) {
+    sel.innerHTML = '<option value="">No other Team Lead on this process</option>';
+  }
+  renderGrid(currentOrders);
+}
+
+function cancelShareMode() {
+  shareMode = false;
+  selectedForShare.clear();
+  document.getElementById("share-bar").style.display = "none";
+  renderGrid(currentOrders);
+}
+
+function toggleShareRow(orderId, checked) {
+  if (checked) selectedForShare.add(orderId);
+  else selectedForShare.delete(orderId);
+}
+
+async function doTransfer(orderIds) {
+  const toId = document.getElementById("share-to-team-lead").value;
+  if (!toId) {
+    alert("Choose a Team Lead to transfer to.");
+    return;
+  }
+  const payload = { to_team_lead_id: parseInt(toId) };
+  if (orderIds) payload.order_ids = orderIds;
+
+  const res = await authFetch(withProcess("/orders/transfer"), {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) {
+    alert("Transfer failed: " + (await res.text()));
+    return;
+  }
+  const data = await res.json();
+  alert(`Transferred ${data.transferred} order(s).`);
+  cancelShareMode();
+  loadOrders();
+}
+
+function transferWholeQueue() {
+  const sure = confirm("Transfer your ENTIRE eligible queue (not yet Completed or submitted) to the selected Team Lead?");
+  if (!sure) return;
+  doTransfer(null);
+}
+
+function transferSelected() {
+  if (selectedForShare.size === 0) {
+    alert("Check at least one row first, or use \"Transfer Whole Queue\".");
+    return;
+  }
+  doTransfer(Array.from(selectedForShare));
+}
+
 function effectiveValue(o, field) {
   const d = drafts[o.id];
   if (d && Object.prototype.hasOwnProperty.call(d, field)) return d[field];
@@ -1288,6 +1391,7 @@ function visibleColumns() {
 function renderGrid(orders) {
   const cols = visibleColumns();
   let html = "<table><thead><tr>";
+  if (shareMode) html += `<th class="col">Share</th>`;
   cols.forEach(c => html += `<th class="${c.group}">${c.label}</th>`);
   if (role === "colleague" || isLeadRole()) html += `<th class="col">Action</th>`;
   html += "</tr></thead><tbody>";
@@ -1300,6 +1404,10 @@ function renderGrid(orders) {
     const hasDraft = drafts[o.id] && Object.keys(drafts[o.id]).length > 0;
 
     html += `<tr>`;
+    if (shareMode) {
+      const shareable = o.team_lead_id === myUserId && !savedCompleted;
+      html += `<td>${shareable ? `<input type="checkbox" onchange="toggleShareRow(${o.id}, this.checked)" ${selectedForShare.has(o.id) ? "checked" : ""}>` : ""}</td>`;
+    }
     cols.forEach(c => {
       const editableBase = (isLeadRole() && (TL_FIELDS.includes(c.k) || (tlCanCorrect && TL_CORRECTION_FIELDS.includes(c.k)))) ||
                             (role === "colleague" && COL_FIELDS.includes(c.k));
