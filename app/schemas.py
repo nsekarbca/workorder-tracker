@@ -51,6 +51,7 @@ class UserOut(BaseModel):
 class LoginResponse(BaseModel):
     access_token: str
     token_type: str
+    id: int
     role: str
     full_name: str
     must_change_password: bool
@@ -105,6 +106,15 @@ class ResetPasswordResponse(BaseModel):
 
 class ReassignRequest(BaseModel):
     assigned_to_id: int
+
+
+# Team Lead-initiated (or Super Admin, on a Team Lead's behalf) transfer of
+# a batch of not-yet-completed, not-yet-submitted orders to another Team
+# Lead's queue. Omitting order_ids transfers the whole eligible queue.
+class TransferOrdersRequest(BaseModel):
+    to_team_lead_id: int
+    from_team_lead_id: Optional[int] = None
+    order_ids: Optional[List[int]] = None
 
 
 # Fields a Team Lead may set (A-D)
@@ -163,6 +173,7 @@ class TeamLeadCorrection(BaseModel):
 class WorkOrderOut(BaseModel):
     id: int
     process_id: Optional[int]
+    team_lead_id: Optional[int]
     received_date: Optional[date]
     assigned_date: Optional[date]
     employee_id: Optional[str]

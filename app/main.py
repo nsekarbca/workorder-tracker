@@ -111,6 +111,7 @@ def login(
     return {
         "access_token": token,
         "token_type": "bearer",
+        "id": user.id,
         "role": user.role,
         "full_name": user.full_name,
         "must_change_password": user.must_change_password,
@@ -222,16 +223,15 @@ def reset_password_with_token(payload: schemas.ResetPasswordWithTokenRequest, db
 @app.get("/users/team-leads", response_model=List[schemas.UserOut])
 def list_team_leads(
     process_id: int,
-    current_user: models.User = Depends(auth.require_role("admin")),
+    current_user: models.User = Depends(auth.require_role("admin", "team_lead", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
-    Team Leads who have access to this process — lets an Admin import
-    inventory on a specific Team Lead's behalf (e.g. while they're out),
-    so the imported orders still only route to that Team Lead's own
-    colleagues instead of the whole process. Deliberately Admin-only, not
-    Super Admin — this is an operational-coverage feature, not a system
-    administration one.
+    Team Leads who have access to this process. Originally Admin-only (so an
+    Admin can import inventory on a specific absent Team Lead's behalf) —
+    now also used by a Team Lead to pick a destination when transferring
+    orders to another Team Lead, and by a Super Admin doing the same on a
+    Team Lead's behalf.
     """
     _require_process_access(current_user, process_id)
     return (
@@ -478,6 +478,70 @@ def reassign_order(
     db.commit()
     db.refresh(order)
     return order
+
+
+@app.post("/orders/transfer")
+def transfer_orders(
+    process_id: int,
+    payload: schemas.TransferOrdersRequest,
+    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    Moves a batch of not-yet-completed, not-yet-submitted orders from one
+    Team Lead's queue to another's. A Team Lead transfers their own queue;
+    a Super Admin must specify from_team_lead_id. Transferred orders are
+    fully unassigned (posting data already entered is kept, but the
+    colleague assignment is cleared) and immediately re-offered to the
+    destination Team Lead's colleagues via the normal auto-assign pass.
+    Omitting order_ids transfers the whole eligible queue; passing it
+    transfers just those rows.
+    """
+    _require_process_access(current_user, process_id)
+
+    if current_user.role == "team_lead":
+        from_team_lead_id = current_user.id
+    else:
+        if not payload.from_team_lead_id:
+            raise HTTPException(status_code=400, detail="from_team_lead_id is required for a Super Admin transfer")
+        from_team_lead_id = payload.from_team_lead_id
+
+    to_lead = (
+        db.query(models.User)
+        .filter(
+            models.User.id == payload.to_team_lead_id,
+            models.User.role == "team_lead",
+            models.User.processes.any(models.Process.id == process_id),
+        )
+        .first()
+    )
+    if not to_lead:
+        raise HTTPException(status_code=400, detail="Not a valid Team Lead for this process")
+    if to_lead.id == from_team_lead_id:
+        raise HTTPException(status_code=400, detail="Source and destination Team Lead are the same")
+
+    query = db.query(models.WorkOrder).filter(
+        models.WorkOrder.process_id == process_id,
+        models.WorkOrder.team_lead_id == from_team_lead_id,
+        models.WorkOrder.submitted == False,  # noqa: E712
+        models.WorkOrder.posting_status != "Completed",
+    )
+    if payload.order_ids:
+        query = query.filter(models.WorkOrder.id.in_(payload.order_ids))
+    orders = query.all()
+
+    for order in orders:
+        order.team_lead_id = to_lead.id
+        order.assigned_to_id = None
+        order.assigned_date = None
+        order.employee_id = None
+        order.employee_name = None
+        order.posting_status = None
+        order.last_edited_by = current_user.username
+
+    db.commit()
+    _auto_assign_open_slots(db, process_id)
+    return {"transferred": len(orders)}
 
 
 @app.delete("/orders/all")
