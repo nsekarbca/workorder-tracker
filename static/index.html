@@ -212,6 +212,18 @@
       </label>
       <button class="action-btn" onclick="saveSessionTimeout()">Save Timeout</button>
       <hr style="margin:20px 0;">
+      <h3 id="process-form-heading">Create Process</h3>
+      <div class="form-grid">
+        <label>Process Name <input id="np-name"></label>
+        <label>Daily Target <input id="np-daily-target" type="number" min="0"></label>
+      </div>
+      <div style="margin-top:12px;">
+        <button class="action-btn" id="process-form-submit-btn" onclick="saveProcess()">Create Process</button>
+        <button class="action-btn" id="process-form-cancel-btn" style="background:#888; display:none;" onclick="cancelEditProcess()">Cancel</button>
+      </div>
+      <h4 style="margin-top:16px;">Existing Processes</h4>
+      <div id="process-list"></div>
+      <hr style="margin:20px 0;">
       <h3>Existing Users</h3>
       <div id="user-list"></div>
     </div>
@@ -320,6 +332,7 @@ let colleagueList = [];
 let allUsers = [];
 let allProcesses = [];
 let editingUserId = null;
+let editingProcessId = null;
 let viewMode = "active"; // "active", "production", or "admin"
 let drafts = {};
 
@@ -691,6 +704,8 @@ async function showAdminView() {
     opt.value = p.id; opt.textContent = p.name;
     procSel.appendChild(opt);
   });
+  cancelEditProcess();
+  renderProcessList();
 
   const timeoutRes = await authFetch("/settings/session-timeout");
   if (timeoutRes.ok) {
@@ -855,6 +870,92 @@ async function resetUserPassword(userId) {
   }
   const data = await res.json();
   alert(`Password reset.\n\nUsername: ${data.username}\nTemporary Password: ${data.temporary_password}\n\nPlease share these with the user securely.`);
+}
+
+// ---------------------------------------------------------------------
+// Admin (Super Admin only) — process management
+// ---------------------------------------------------------------------
+
+function renderProcessList() {
+  let html = "<table><thead><tr><th>Name</th><th>Daily Target</th><th>Action</th></tr></thead><tbody>";
+  allProcesses.forEach(p => {
+    html += `<tr><td>${p.name}</td><td>${p.daily_target ?? ""}</td>`;
+    html += `<td><button class="action-btn" onclick="editProcess(${p.id})">Edit</button></td></tr>`;
+  });
+  html += "</tbody></table>";
+  document.getElementById("process-list").innerHTML = html;
+}
+
+function editProcess(processId) {
+  const p = allProcesses.find(x => x.id === processId);
+  if (!p) return;
+  editingProcessId = processId;
+  document.getElementById("np-name").value = p.name;
+  document.getElementById("np-daily-target").value = p.daily_target ?? "";
+  document.getElementById("process-form-heading").textContent = `Edit Process: ${p.name}`;
+  document.getElementById("process-form-submit-btn").textContent = "Update Process";
+  document.getElementById("process-form-cancel-btn").style.display = "inline-block";
+  document.getElementById("process-form-heading").scrollIntoView({behavior: "smooth"});
+}
+
+function cancelEditProcess() {
+  editingProcessId = null;
+  document.getElementById("np-name").value = "";
+  document.getElementById("np-daily-target").value = "";
+  document.getElementById("process-form-heading").textContent = "Create Process";
+  document.getElementById("process-form-submit-btn").textContent = "Create Process";
+  document.getElementById("process-form-cancel-btn").style.display = "none";
+}
+
+async function saveProcess() {
+  const name = document.getElementById("np-name").value.trim();
+  const targetRaw = document.getElementById("np-daily-target").value;
+  const payload = {
+    name: name,
+    daily_target: targetRaw === "" ? null : parseInt(targetRaw),
+  };
+  if (!payload.name) {
+    alert("Process name is required.");
+    return;
+  }
+
+  if (editingProcessId) {
+    const res = await authFetch(`/processes/${editingProcessId}`, {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      alert("Failed to update process: " + (await res.text()));
+      return;
+    }
+    alert("Process updated.");
+  } else {
+    const res = await authFetch("/processes", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      alert("Failed to create process: " + (await res.text()));
+      return;
+    }
+    alert("Process created.");
+  }
+
+  cancelEditProcess();
+  const procRes = await authFetch("/processes");
+  if (procRes.ok) allProcesses = await procRes.json();
+  const procSel = document.getElementById("nu-processes");
+  const previouslySelected = Array.from(procSel.selectedOptions).map(o => o.value);
+  procSel.innerHTML = "";
+  allProcesses.forEach(p => {
+    const opt = document.createElement("option");
+    opt.value = p.id; opt.textContent = p.name;
+    opt.selected = previouslySelected.includes(String(p.id));
+    procSel.appendChild(opt);
+  });
+  renderProcessList();
 }
 
 // ---------------------------------------------------------------------
