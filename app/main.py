@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 import csv
 import io
 
@@ -733,6 +734,17 @@ def list_orders(
     )
     if current_user.role == "colleague":
         query = query.filter(models.WorkOrder.assigned_to_id == current_user.id)
+    elif current_user.role == "team_lead":
+        # A Team Lead's queue is their own orders plus anything not yet
+        # tagged to any Team Lead (e.g. a Super Admin import). Orders
+        # transferred to another Team Lead (transfer_orders sets
+        # team_lead_id to the destination) drop out of view here.
+        query = query.filter(
+            or_(
+                models.WorkOrder.team_lead_id == current_user.id,
+                models.WorkOrder.team_lead_id.is_(None),
+            )
+        )
     return query.order_by(models.WorkOrder.id.asc()).all()
 
 
