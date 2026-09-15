@@ -32,6 +32,7 @@
   #app { display: none; padding: 16px; }
   table { border-collapse: collapse; width: 100%; background: white; font-size: 12px; }
   th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; white-space: nowrap; }
+  thead th { position: sticky; top: 0; z-index: 2; background: var(--navy); color: white; }
   th.tl { background: var(--brown); color: white; }
   th.inv { background: var(--teal); color: white; }
   th.col { background: var(--purple); color: white; }
@@ -1338,11 +1339,13 @@ function toggleShareRow(orderId, checked) {
 }
 
 async function doTransfer(orderIds) {
-  const toId = document.getElementById("share-to-team-lead").value;
+  const sel = document.getElementById("share-to-team-lead");
+  const toId = sel.value;
   if (!toId) {
     alert("Choose a Team Lead to transfer to.");
     return;
   }
+  const toName = sel.options[sel.selectedIndex].textContent;
   const payload = { to_team_lead_id: parseInt(toId) };
   if (orderIds) payload.order_ids = orderIds;
 
@@ -1356,13 +1359,19 @@ async function doTransfer(orderIds) {
     return;
   }
   const data = await res.json();
-  alert(`Transferred ${data.transferred} order(s).`);
+  alert(`${data.transferred} order(s) shared with ${toName}.`);
   cancelShareMode();
   loadOrders();
 }
 
 function transferWholeQueue() {
-  const sure = confirm("Transfer your ENTIRE eligible queue (not yet Completed or submitted) to the selected Team Lead?");
+  const sel = document.getElementById("share-to-team-lead");
+  if (!sel.value) {
+    alert("Choose a Team Lead to transfer to.");
+    return;
+  }
+  const toName = sel.options[sel.selectedIndex].textContent;
+  const sure = confirm(`Transfer your ENTIRE eligible queue (not yet Completed or submitted) to ${toName}?`);
   if (!sure) return;
   doTransfer(null);
 }
