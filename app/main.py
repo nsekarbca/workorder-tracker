@@ -525,7 +525,10 @@ def transfer_orders(
         models.WorkOrder.process_id == process_id,
         models.WorkOrder.team_lead_id == from_team_lead_id,
         models.WorkOrder.submitted == False,  # noqa: E712
-        models.WorkOrder.posting_status != "Completed",
+        or_(
+            models.WorkOrder.posting_status != "Completed",
+            models.WorkOrder.posting_status.is_(None),
+        ),
     )
     if payload.order_ids:
         query = query.filter(models.WorkOrder.id.in_(payload.order_ids))
