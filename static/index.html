@@ -40,16 +40,22 @@
   .celeb-card { border: 1px solid #eee; border-radius: 6px; padding: 10px 12px; margin-bottom: 8px; background: #fffdf6; }
   .celeb-card .celeb-name-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
   .celeb-card .celeb-name { font-weight: 600; color: var(--navy); }
-  .celeb-card .celeb-designation { display: block; font-size: 12px; color: #888; margin-top: 2px; }
   .celeb-card .celeb-tag { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 10px; color: white; white-space: nowrap; }
   .celeb-tag.birthday { background: #d6336c; }
   .celeb-tag.anniversary { background: #2b8a3e; }
   .celeb-comment { font-size: 12px; color: #444; margin: 6px 0 0 0; padding: 5px 8px; background: #f4f4f6; border-radius: 4px; }
   .celeb-comment b { color: var(--navy); }
+  .celeb-reactions { display: flex; gap: 6px; margin-top: 6px; }
+  .celeb-react-btn { border: 1px solid #ddd; background: white; border-radius: 14px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
+  .celeb-react-btn.active { background: #eaf3fc; border-color: var(--accent); }
+  .celeb-react-btn:hover { background: #f4f4f6; }
   .celeb-comment-input { display: flex; gap: 6px; margin-top: 8px; }
   .celeb-comment-input input { flex: 1; padding: 5px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px; }
   .update-item { border-left: 4px solid #ccc; padding: 8px 12px; margin-bottom: 8px; background: #fafafa; border-radius: 0 6px 6px 0; }
   .update-item:first-child { border-left-color: var(--accent); background: #eaf3fc; box-shadow: 0 1px 4px rgba(28,126,214,.15); }
+  .update-item .update-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; }
+  .update-item .update-tag { font-size: 10px; padding: 2px 8px; border-radius: 10px; background: #6c757d; color: white; }
+  .update-item .update-message { font-size: 13px; color: #222; }
   .update-item .update-meta { font-size: 11px; color: #777; margin-top: 4px; }
   .update-item:first-child .update-meta { color: var(--accent); font-weight: 600; }
   th.tl { background: var(--brown); color: white; }
@@ -212,9 +218,40 @@
       </div>
       <div id="updates-card">
         <h3 style="margin:0 0 10px;">📢 Process Updates</h3>
-        <div id="post-update-form" style="display:none; margin-bottom:12px;">
-          <textarea id="new-update-text" rows="2" style="width:100%; padding:6px; border:1px solid #ccc; border-radius:4px; font-family:inherit;" placeholder="Post an update for this process..."></textarea>
-          <button class="action-btn" onclick="postProcessUpdate()" style="margin-top:6px;">Post Update</button>
+        <div id="post-update-form" style="display:none; margin-bottom:12px; background:#f8f9fb; padding:10px; border-radius:6px;">
+          <div class="form-grid">
+            <label>Received Date <input id="pu-received-date" type="date"></label>
+            <label>Process <input id="pu-process" disabled style="background:#eee;"></label>
+            <label>Mode
+              <select id="pu-mode">
+                <option value="">—</option>
+                <option>Team message</option>
+                <option>Email</option>
+                <option>Smartsheet</option>
+                <option>Call</option>
+              </select>
+            </label>
+            <label>Received From <input id="pu-received-from"></label>
+            <label>Category
+              <select id="pu-category">
+                <option value="">—</option>
+                <option>Payer</option>
+                <option>Adjustment</option>
+                <option>Generic</option>
+              </select>
+            </label>
+            <label>Status
+              <select id="pu-status">
+                <option>Active</option>
+                <option>Inactive</option>
+              </select>
+            </label>
+            <label>Verified/Approved By <input id="pu-verified-by"></label>
+          </div>
+          <label style="display:block; margin-top:10px;">Update Comment
+            <textarea id="new-update-text" rows="2" style="width:100%; padding:6px; border:1px solid #ccc; border-radius:4px; font-family:inherit;" placeholder="What's the update..."></textarea>
+          </label>
+          <button class="action-btn" onclick="postProcessUpdate()" style="margin-top:8px;">Post Update</button>
         </div>
         <div id="updates-list"><p style="color:#888; font-size:13px; margin:0;">Loading...</p></div>
       </div>
@@ -1369,22 +1406,34 @@ function loadDashboard() {
 
 async function loadCelebrations() {
   const res = await authFetch("/celebrations/today");
+  const card = document.getElementById("celebrations-card");
   const container = document.getElementById("celebrations-list");
   if (!res.ok) {
+    card.style.display = "block";
     container.innerHTML = '<p style="color:#888; font-size:13px; margin:0;">Couldn\'t load celebrations.</p>';
     return;
   }
   const people = await res.json();
   if (!people.length) {
-    container.innerHTML = '<p style="color:#888; font-size:13px; margin:0;">No birthdays or work anniversaries today.</p>';
+    // Nothing to celebrate today — hide the whole section rather than
+    // show an empty card.
+    card.style.display = "none";
     return;
   }
+  card.style.display = "block";
+  const REACTIONS = [["like", "👍"], ["heart", "❤️"], ["thumbsup", "👍🏻"]];
   let html = "";
   people.forEach(p => {
     const tagLabel = p.kind === "birthday" ? "🎂 Birthday" : `🎊 Anniversary${p.years ? " · " + p.years + " yr" + (p.years === 1 ? "" : "s") : ""}`;
     html += `<div class="celeb-card">`;
     html += `<div class="celeb-name-row"><span class="celeb-name">${p.full_name}</span><span class="celeb-tag ${p.kind}">${tagLabel}</span></div>`;
-    if (p.designation) html += `<span class="celeb-designation">${p.designation}</span>`;
+    html += `<div class="celeb-reactions">`;
+    REACTIONS.forEach(([key, emoji]) => {
+      const active = p.my_reactions.includes(key);
+      const count = p.reaction_counts[key] || 0;
+      html += `<button class="celeb-react-btn${active ? " active" : ""}" onclick="reactToCelebration(${p.user_id}, '${key}')">${emoji} ${count > 0 ? count : ""}</button>`;
+    });
+    html += `</div>`;
     p.comments.forEach(c => {
       html += `<div class="celeb-comment"><b>${c.posted_by_name}:</b> ${c.message}</div>`;
     });
@@ -1394,6 +1443,19 @@ async function loadCelebrations() {
     html += `</div></div>`;
   });
   container.innerHTML = html;
+}
+
+async function reactToCelebration(userId, reaction) {
+  const res = await authFetch(`/celebrations/${userId}/react`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({reaction})
+  });
+  if (!res.ok) {
+    alert("Couldn't react: " + (await res.text()));
+    return;
+  }
+  loadCelebrations();
 }
 
 async function postCelebrationComment(userId) {
@@ -1414,8 +1476,12 @@ async function postCelebrationComment(userId) {
 
 async function loadProcessUpdates() {
   if (!currentProcessId) return;
-  document.getElementById("post-update-form").style.display =
-    (role === "team_lead" || role === "admin" || role === "super_admin") ? "block" : "none";
+  const canPost = (role === "team_lead" || role === "admin" || role === "super_admin");
+  document.getElementById("post-update-form").style.display = canPost ? "block" : "none";
+  if (canPost) {
+    const proc = myProcesses.find(p => p.id === currentProcessId);
+    document.getElementById("pu-process").value = proc ? proc.name : "";
+  }
 
   const res = await authFetch(withProcess("/process-updates"));
   const container = document.getElementById("updates-list");
@@ -1431,7 +1497,17 @@ async function loadProcessUpdates() {
   let html = "";
   updates.forEach(u => {
     const when = new Date(u.created_at).toLocaleString();
-    html += `<div class="update-item"><div>${u.message}</div>`;
+    const statusColor = u.status === "Active" ? "#2b8a3e" : "#888";
+    html += `<div class="update-item">`;
+    html += `<div class="update-tags">`;
+    if (u.received_date) html += `<span class="update-tag">📅 ${u.received_date}</span>`;
+    if (u.mode) html += `<span class="update-tag">${u.mode}</span>`;
+    if (u.category) html += `<span class="update-tag">${u.category}</span>`;
+    html += `<span class="update-tag" style="background:${statusColor};">${u.status}</span>`;
+    html += `</div>`;
+    html += `<div class="update-message">${u.message}</div>`;
+    if (u.received_from) html += `<div class="update-meta">From: ${u.received_from}</div>`;
+    if (u.verified_by) html += `<div class="update-meta">Verified/Approved by: ${u.verified_by}</div>`;
     html += `<div class="update-meta">${u.posted_by_name} (${u.posted_by_role.replace("_", " ")}) · ${when}</div></div>`;
   });
   container.innerHTML = html;
@@ -1441,16 +1517,31 @@ async function postProcessUpdate() {
   const textarea = document.getElementById("new-update-text");
   const message = textarea.value.trim();
   if (!message) return;
+  const payload = {
+    message: message,
+    received_date: document.getElementById("pu-received-date").value || null,
+    mode: document.getElementById("pu-mode").value || null,
+    received_from: document.getElementById("pu-received-from").value.trim() || null,
+    category: document.getElementById("pu-category").value || null,
+    status: document.getElementById("pu-status").value,
+    verified_by: document.getElementById("pu-verified-by").value.trim() || null,
+  };
   const res = await authFetch(withProcess("/process-updates"), {
     method: "POST",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({message})
+    body: JSON.stringify(payload)
   });
   if (!res.ok) {
     alert("Couldn't post update: " + (await res.text()));
     return;
   }
   textarea.value = "";
+  document.getElementById("pu-received-date").value = "";
+  document.getElementById("pu-mode").value = "";
+  document.getElementById("pu-received-from").value = "";
+  document.getElementById("pu-category").value = "";
+  document.getElementById("pu-status").value = "Active";
+  document.getElementById("pu-verified-by").value = "";
   loadProcessUpdates();
 }
 
