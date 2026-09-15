@@ -34,6 +34,19 @@
   th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; white-space: nowrap; }
   thead th { position: sticky; top: var(--sticky-offset, 0px); z-index: 2; background: var(--navy); color: white; }
   #sticky-top { position: sticky; top: 0; z-index: 30; background: #f4f4f6; box-shadow: 0 2px 4px rgba(0,0,0,.06); }
+  .celeb-card { border: 1px solid #eee; border-radius: 6px; padding: 10px 12px; margin-bottom: 8px; background: #fffdf6; }
+  .celeb-card .celeb-name { font-weight: 600; color: var(--navy); }
+  .celeb-card .celeb-tag { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 10px; margin-left: 8px; color: white; }
+  .celeb-tag.birthday { background: #d6336c; }
+  .celeb-tag.anniversary { background: #2b8a3e; }
+  .celeb-comment { font-size: 12px; color: #444; margin: 4px 0 0 0; padding: 4px 8px; background: #f4f4f6; border-radius: 4px; }
+  .celeb-comment b { color: var(--navy); }
+  .celeb-comment-input { display: flex; gap: 6px; margin-top: 6px; }
+  .celeb-comment-input input { flex: 1; padding: 5px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px; }
+  .update-item { border-left: 4px solid #ccc; padding: 8px 12px; margin-bottom: 8px; background: #fafafa; border-radius: 0 6px 6px 0; }
+  .update-item:first-child { border-left-color: var(--accent); background: #eaf3fc; box-shadow: 0 1px 4px rgba(28,126,214,.15); }
+  .update-item .update-meta { font-size: 11px; color: #777; margin-top: 4px; }
+  .update-item:first-child .update-meta { color: var(--accent); font-weight: 600; }
   th.tl { background: var(--brown); color: white; }
   th.inv { background: var(--teal); color: white; }
   th.col { background: var(--purple); color: white; }
@@ -187,6 +200,20 @@
   </div>
 
   <div style="padding: 0 16px 16px 16px;">
+    <div id="dashboard-panel" style="display:none;">
+      <div id="celebrations-card" style="background:white; border-radius:8px; padding:14px; margin-bottom:14px; box-shadow:0 1px 4px rgba(0,0,0,.06);">
+        <h3 style="margin:0 0 10px;">🎉 Today's Celebrations</h3>
+        <div id="celebrations-list"><p style="color:#888; font-size:13px; margin:0;">Loading...</p></div>
+      </div>
+      <div id="updates-card" style="background:white; border-radius:8px; padding:14px; margin-bottom:14px; box-shadow:0 1px 4px rgba(0,0,0,.06);">
+        <h3 style="margin:0 0 10px;">📢 Process Updates</h3>
+        <div id="post-update-form" style="display:none; margin-bottom:12px;">
+          <textarea id="new-update-text" rows="2" style="width:100%; padding:6px; border:1px solid #ccc; border-radius:4px; font-family:inherit;" placeholder="Post an update for this process..."></textarea>
+          <button class="action-btn" onclick="postProcessUpdate()" style="margin-top:6px;">Post Update</button>
+        </div>
+        <div id="updates-list"><p style="color:#888; font-size:13px; margin:0;">Loading...</p></div>
+      </div>
+    </div>
     <div id="admin-panel" style="display:none;">
       <h3 id="user-form-heading">Create User</h3>
       <div class="form-grid">
@@ -735,6 +762,7 @@ async function showAdminView() {
   viewMode = "admin";
   document.getElementById("toolbar").style.display = "none";
   document.getElementById("production-bar").style.display = "none";
+  document.getElementById("dashboard-panel").style.display = "none";
   shareMode = false;
   selectedForShare.clear();
   document.getElementById("share-bar").style.display = "none";
@@ -1115,6 +1143,7 @@ async function showProductionView() {
   viewMode = "production";
   document.getElementById("toolbar").style.display = "none";
   document.getElementById("admin-panel").style.display = "none";
+  document.getElementById("dashboard-panel").style.display = "none";
   shareMode = false;
   selectedForShare.clear();
   document.getElementById("share-bar").style.display = "none";
@@ -1315,11 +1344,110 @@ async function loadOrders() {
   document.getElementById("admin-panel").style.display = "none";
   document.getElementById("toolbar").style.display = "flex";
   document.getElementById("production-bar").style.display = "none";
+  document.getElementById("dashboard-panel").style.display = "block";
   viewMode = "active";
+  loadDashboard();
   const res = await authFetch(withProcess("/orders"));
   currentOrders = await res.json();
   drafts = {};
   renderGrid(currentOrders);
+}
+
+// ---------------------------------------------------------------------
+// Post-login dashboard: Today's Celebrations + Process Updates
+// ---------------------------------------------------------------------
+
+function loadDashboard() {
+  loadCelebrations();
+  loadProcessUpdates();
+}
+
+async function loadCelebrations() {
+  const res = await authFetch("/celebrations/today");
+  const container = document.getElementById("celebrations-list");
+  if (!res.ok) {
+    container.innerHTML = '<p style="color:#888; font-size:13px; margin:0;">Couldn\'t load celebrations.</p>';
+    return;
+  }
+  const people = await res.json();
+  if (!people.length) {
+    container.innerHTML = '<p style="color:#888; font-size:13px; margin:0;">No birthdays or work anniversaries today.</p>';
+    return;
+  }
+  let html = "";
+  people.forEach(p => {
+    const tagLabel = p.kind === "birthday" ? "🎂 Birthday" : `🎊 Anniversary${p.years ? " · " + p.years + " yr" + (p.years === 1 ? "" : "s") : ""}`;
+    html += `<div class="celeb-card">`;
+    html += `<span class="celeb-name">${p.full_name}</span>`;
+    html += `<span class="celeb-tag ${p.kind}">${tagLabel}</span>`;
+    if (p.designation) html += ` <span style="font-size:12px; color:#888;">${p.designation}</span>`;
+    p.comments.forEach(c => {
+      html += `<div class="celeb-comment"><b>${c.posted_by_name}:</b> ${c.message}</div>`;
+    });
+    html += `<div class="celeb-comment-input">`;
+    html += `<input id="celeb-input-${p.user_id}" placeholder="Say something nice..." onkeydown="if(event.key==='Enter')postCelebrationComment(${p.user_id})">`;
+    html += `<button class="action-btn" onclick="postCelebrationComment(${p.user_id})">Post</button>`;
+    html += `</div></div>`;
+  });
+  container.innerHTML = html;
+}
+
+async function postCelebrationComment(userId) {
+  const input = document.getElementById(`celeb-input-${userId}`);
+  const message = input.value.trim();
+  if (!message) return;
+  const res = await authFetch(`/celebrations/${userId}/comments`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({message})
+  });
+  if (!res.ok) {
+    alert("Couldn't post comment: " + (await res.text()));
+    return;
+  }
+  loadCelebrations();
+}
+
+async function loadProcessUpdates() {
+  if (!currentProcessId) return;
+  document.getElementById("post-update-form").style.display =
+    (role === "team_lead" || role === "admin" || role === "super_admin") ? "block" : "none";
+
+  const res = await authFetch(withProcess("/process-updates"));
+  const container = document.getElementById("updates-list");
+  if (!res.ok) {
+    container.innerHTML = '<p style="color:#888; font-size:13px; margin:0;">Couldn\'t load updates.</p>';
+    return;
+  }
+  const updates = await res.json();
+  if (!updates.length) {
+    container.innerHTML = '<p style="color:#888; font-size:13px; margin:0;">No updates posted yet.</p>';
+    return;
+  }
+  let html = "";
+  updates.forEach(u => {
+    const when = new Date(u.created_at).toLocaleString();
+    html += `<div class="update-item"><div>${u.message}</div>`;
+    html += `<div class="update-meta">${u.posted_by_name} (${u.posted_by_role.replace("_", " ")}) · ${when}</div></div>`;
+  });
+  container.innerHTML = html;
+}
+
+async function postProcessUpdate() {
+  const textarea = document.getElementById("new-update-text");
+  const message = textarea.value.trim();
+  if (!message) return;
+  const res = await authFetch(withProcess("/process-updates"), {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({message})
+  });
+  if (!res.ok) {
+    alert("Couldn't post update: " + (await res.text()));
+    return;
+  }
+  textarea.value = "";
+  loadProcessUpdates();
 }
 
 // ---------------------------------------------------------------------
