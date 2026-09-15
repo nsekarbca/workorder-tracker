@@ -32,7 +32,8 @@
   #app { display: none; padding: 16px; }
   table { border-collapse: collapse; width: 100%; background: white; font-size: 12px; }
   th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; white-space: nowrap; }
-  thead th { position: sticky; top: 0; z-index: 2; background: var(--navy); color: white; }
+  thead th { position: sticky; top: var(--sticky-offset, 0px); z-index: 2; background: var(--navy); color: white; }
+  #sticky-top { position: sticky; top: 0; z-index: 30; background: #f4f4f6; box-shadow: 0 2px 4px rgba(0,0,0,.06); }
   th.tl { background: var(--brown); color: white; }
   th.inv { background: var(--teal); color: white; }
   th.col { background: var(--purple); color: white; }
@@ -116,71 +117,76 @@
 </div>
 
 <div id="app">
-  <header>
-    <div class="brand">
-      <img src="logo.png" alt="Ventra Health" onerror="this.style.display='none'; document.getElementById('app-wordmark').style.display='block';">
-      <div id="app-wordmark" style="display:none;" class="wordmark">VENTRA<span>HEALTH</span></div>
-      <span class="app-title">Work Order Allocation Tracker</span>
-    </div>
-    <div>
-      <span id="process-badge" class="process-badge" style="display:none;"></span>
-      <span id="whoami" class="badge"></span>
-      <button class="action-btn" id="admin-btn" style="display:none;" onclick="showAdminView()">Admin</button>
-      <button class="action-btn" onclick="logout()">Log out</button>
-    </div>
-  </header>
+  <div id="sticky-top">
+    <header>
+      <div class="brand">
+        <img src="logo.png" alt="Ventra Health" onerror="this.style.display='none'; document.getElementById('app-wordmark').style.display='block';">
+        <div id="app-wordmark" style="display:none;" class="wordmark">VENTRA<span>HEALTH</span></div>
+        <span class="app-title">Work Order Allocation Tracker</span>
+      </div>
+      <div>
+        <span id="process-badge" class="process-badge" style="display:none;"></span>
+        <span id="whoami" class="badge"></span>
+        <button class="action-btn" id="admin-btn" style="display:none;" onclick="showAdminView()">Admin</button>
+        <button class="action-btn" onclick="logout()">Log out</button>
+      </div>
+    </header>
 
-  <div style="padding: 16px;">
-    <div id="toolbar">
-      <input type="file" id="import-file" style="display:none;">
-      <select id="import-on-behalf" style="display:none;"></select>
-      <button class="action-btn" id="import-btn" style="display:none;" onclick="document.getElementById('import-file').click()">Import Inventory CSV</button>
-      <button class="action-btn" id="run-assign-btn" style="display:none;" onclick="runAssignment()">Run Assignment Now</button>
-      <button class="action-btn" id="clear-data-btn" style="display:none; background:var(--red);" onclick="clearAllData()">Clear All Data</button>
-      <button class="action-btn" id="production-btn" style="display:none;" onclick="showProductionView()">Production</button>
-      <button class="action-btn" id="share-btn" style="display:none;" onclick="toggleShareMode()">Share Orders</button>
-      <button class="action-btn" onclick="loadOrders()">Refresh</button>
-      <button class="action-btn" id="submit-day-btn" style="display:none; background:var(--green);" onclick="submitEndOfDay()">Submit End of Day</button>
-      <button class="action-btn" id="switch-process-btn" style="display:none;" onclick="showProcessSwitcher()">Switch Process</button>
+    <div style="padding: 16px 16px 0 16px;">
+      <div id="toolbar">
+        <input type="file" id="import-file" style="display:none;">
+        <select id="import-on-behalf" style="display:none;"></select>
+        <button class="action-btn" id="import-btn" style="display:none;" onclick="document.getElementById('import-file').click()">Import Inventory CSV</button>
+        <button class="action-btn" id="run-assign-btn" style="display:none;" onclick="runAssignment()">Run Assignment Now</button>
+        <button class="action-btn" id="clear-data-btn" style="display:none; background:var(--red);" onclick="clearAllData()">Clear All Data</button>
+        <button class="action-btn" id="production-btn" style="display:none;" onclick="showProductionView()">Production</button>
+        <button class="action-btn" id="share-btn" style="display:none;" onclick="toggleShareMode()">Share Orders</button>
+        <button class="action-btn" onclick="loadOrders()">Refresh</button>
+        <button class="action-btn" id="submit-day-btn" style="display:none; background:var(--green);" onclick="submitEndOfDay()">Submit End of Day</button>
+        <button class="action-btn" id="switch-process-btn" style="display:none;" onclick="showProcessSwitcher()">Switch Process</button>
+      </div>
+      <div id="production-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px;">
+        <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
+          <label>Date Field
+            <select id="prod-date-field" onchange="onDateFieldChange()">
+              <option value="posted">Posted Date</option>
+              <option value="received">Received Date</option>
+              <option value="assigned">Assigned Date</option>
+              <option value="created">Created</option>
+            </select>
+          </label>
+          <label>From <input type="date" id="prod-date-from"></label>
+          <label>To <input type="date" id="prod-date-to"></label>
+        </div>
+        <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
+          <label>Filter By
+            <select id="prod-filter-field" onchange="onFilterFieldChange()"></select>
+          </label>
+          <select id="prod-filter-values" multiple size="5" style="min-width:200px;"></select>
+          <span style="font-size:12px; color:#666;">Ctrl/Cmd-click to select multiple</span>
+        </div>
+        <div style="display:flex; gap:10px;">
+          <button class="action-btn" onclick="loadProduction()">Load</button>
+          <button class="action-btn" onclick="exportProductionCSV()">Export CSV</button>
+          <button class="action-btn" onclick="clearProductionFilters()">Clear Filters</button>
+          <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
+        </div>
+      </div>
+      <div id="share-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px; background:white; padding:12px; border-radius:8px;">
+        <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
+          <label>Transfer To
+            <select id="share-to-team-lead"></select>
+          </label>
+          <button class="action-btn" onclick="transferWholeQueue()">Transfer Whole Queue</button>
+          <button class="action-btn" onclick="transferSelected()">Transfer Checked Rows</button>
+          <button class="action-btn" style="background:#888;" onclick="cancelShareMode()">Cancel</button>
+        </div>
+        <div style="font-size:12px; color:#666;">Check rows in the grid below to transfer specific orders, or use "Transfer Whole Queue" to move every eligible order (not yet Completed or submitted) to the selected Team Lead. Their colleagues will be auto-assigned right away.</div>
+      </div>
     </div>
-    <div id="production-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px;">
-      <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
-        <label>Date Field
-          <select id="prod-date-field" onchange="onDateFieldChange()">
-            <option value="posted">Posted Date</option>
-            <option value="received">Received Date</option>
-            <option value="assigned">Assigned Date</option>
-            <option value="created">Created</option>
-          </select>
-        </label>
-        <label>From <input type="date" id="prod-date-from"></label>
-        <label>To <input type="date" id="prod-date-to"></label>
-      </div>
-      <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
-        <label>Filter By
-          <select id="prod-filter-field" onchange="onFilterFieldChange()"></select>
-        </label>
-        <select id="prod-filter-values" multiple size="5" style="min-width:200px;"></select>
-        <span style="font-size:12px; color:#666;">Ctrl/Cmd-click to select multiple</span>
-      </div>
-      <div style="display:flex; gap:10px;">
-        <button class="action-btn" onclick="loadProduction()">Load</button>
-        <button class="action-btn" onclick="exportProductionCSV()">Export CSV</button>
-        <button class="action-btn" onclick="clearProductionFilters()">Clear Filters</button>
-        <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
-      </div>
-    </div>
-    <div id="share-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px; background:white; padding:12px; border-radius:8px;">
-      <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
-        <label>Transfer To
-          <select id="share-to-team-lead"></select>
-        </label>
-        <button class="action-btn" onclick="transferWholeQueue()">Transfer Whole Queue</button>
-        <button class="action-btn" onclick="transferSelected()">Transfer Checked Rows</button>
-        <button class="action-btn" style="background:#888;" onclick="cancelShareMode()">Cancel</button>
-      </div>
-      <div style="font-size:12px; color:#666;">Check rows in the grid below to transfer specific orders, or use "Transfer Whole Queue" to move every eligible order (not yet Completed or submitted) to the selected Team Lead. Their colleagues will be auto-assigned right away.</div>
-    </div>
+  </div>
+
+  <div style="padding: 0 16px 16px 16px;">
     <div id="admin-panel" style="display:none;">
       <h3 id="user-form-heading">Create User</h3>
       <div class="form-grid">
@@ -243,6 +249,7 @@
     <div id="grid-container"></div>
   </div>
 </div>
+
 
 <script>
 const API = "";
@@ -351,6 +358,23 @@ let viewMode = "active"; // "active", "production", or "admin"
 let drafts = {};
 let shareMode = false;
 let selectedForShare = new Set();
+
+// Keeps the table's sticky header pinned right below the sticky
+// header/toolbar block, whatever height that block currently is
+// (it changes as the toolbar, Production bar, or Share bar show/hide).
+(function initStickyOffset() {
+  const el = document.getElementById("sticky-top");
+  if (!el) return;
+  const update = () => {
+    document.documentElement.style.setProperty("--sticky-offset", el.offsetHeight + "px");
+  };
+  update();
+  if (window.ResizeObserver) {
+    new ResizeObserver(update).observe(el);
+  } else {
+    window.addEventListener("resize", update);
+  }
+})();
 
 if (token) {
   if (sessionStorage.getItem("wot_must_change") === "true") {
