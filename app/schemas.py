@@ -8,6 +8,46 @@ class UserLogin(BaseModel):
     password: str
 
 
+class CelebrationCommentOut(BaseModel):
+    id: int
+    target_user_id: int
+    message: str
+    posted_by_name: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class CelebrationCommentCreate(BaseModel):
+    message: str
+
+
+class CelebrationPerson(BaseModel):
+    user_id: int
+    full_name: str
+    designation: Optional[str] = None
+    kind: str  # "birthday" or "anniversary"
+    years: Optional[int] = None  # anniversaries only, if resolvable
+    comments: List[CelebrationCommentOut] = []
+
+
+class ProcessUpdateOut(BaseModel):
+    id: int
+    process_id: int
+    message: str
+    posted_by_name: str
+    posted_by_role: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ProcessUpdateCreate(BaseModel):
+    message: str
+
+
 class ProcessOut(BaseModel):
     id: int
     name: str

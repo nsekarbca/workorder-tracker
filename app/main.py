@@ -404,6 +404,117 @@ def update_process(
     return process
 
 
+# ---------------------------------------------------------------------------
+# Today's Celebrations (org-wide birthdays/anniversaries) + Process Updates
+# ---------------------------------------------------------------------------
+
+@app.get("/celebrations/today", response_model=List[schemas.CelebrationPerson])
+def todays_celebrations(
+    current_user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Every active user, across the whole org (any role, any process), whose
+    birthday or work anniversary falls on today's calendar date. Open to
+    anyone logged in — this isn't process-scoped.
+    """
+    today = date.today()
+    users = db.query(models.User).filter(models.User.employment_status == "Active").all()
+    people = []
+    for u in users:
+        if u.dob and u.dob.month == today.month and u.dob.day == today.day:
+            people.append({"user_id": u.id, "full_name": u.full_name, "designation": u.designation, "kind": "birthday", "years": None})
+        if u.anniversary_date and u.anniversary_date.month == today.month and u.anniversary_date.day == today.day:
+            years = today.year - u.anniversary_date.year
+            people.append({
+                "user_id": u.id, "full_name": u.full_name, "designation": u.designation,
+                "kind": "anniversary", "years": years if years > 0 else None,
+            })
+
+    if not people:
+        return []
+
+    target_ids = [p["user_id"] for p in people]
+    comments = (
+        db.query(models.CelebrationComment)
+        .filter(models.CelebrationComment.target_user_id.in_(target_ids))
+        .order_by(models.CelebrationComment.created_at.asc())
+        .all()
+    )
+    by_target = {}
+    for c in comments:
+        by_target.setdefault(c.target_user_id, []).append(c)
+    for p in people:
+        p["comments"] = by_target.get(p["user_id"], [])
+    return people
+
+
+@app.post("/celebrations/{target_user_id}/comments", response_model=schemas.CelebrationCommentOut)
+def add_celebration_comment(
+    target_user_id: int,
+    payload: schemas.CelebrationCommentCreate,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    message = payload.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Comment can't be empty")
+    target = db.query(models.User).filter(models.User.id == target_user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    comment = models.CelebrationComment(
+        target_user_id=target_user_id,
+        message=message,
+        posted_by_id=current_user.id,
+        posted_by_name=current_user.full_name,
+    )
+    db.add(comment)
+    db.commit()
+    db.refresh(comment)
+    return comment
+
+
+@app.get("/process-updates", response_model=List[schemas.ProcessUpdateOut])
+def list_process_updates(
+    process_id: int,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Newest first — the process screen shows the latest one most prominently."""
+    _require_process_access(current_user, process_id)
+    return (
+        db.query(models.ProcessUpdate)
+        .filter(models.ProcessUpdate.process_id == process_id)
+        .order_by(models.ProcessUpdate.created_at.desc())
+        .limit(20)
+        .all()
+    )
+
+
+@app.post("/process-updates", response_model=schemas.ProcessUpdateOut)
+def create_process_update(
+    process_id: int,
+    payload: schemas.ProcessUpdateCreate,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    _require_process_access(current_user, process_id)
+    message = payload.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Update message can't be empty")
+    update = models.ProcessUpdate(
+        process_id=process_id,
+        message=message,
+        posted_by_id=current_user.id,
+        posted_by_name=current_user.full_name,
+        posted_by_role=current_user.role,
+    )
+    db.add(update)
+    db.commit()
+    db.refresh(update)
+    return update
+
+
 @app.get("/users/colleagues", response_model=List[schemas.UserOut])
 def list_colleagues(
     process_id: int,

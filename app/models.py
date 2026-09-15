@@ -34,6 +34,39 @@ class Process(Base):
     users = relationship("User", secondary=user_process_association, back_populates="processes")
 
 
+class CelebrationComment(Base):
+    """
+    A comment left on a colleague's birthday/work-anniversary entry on the
+    org-wide 'Today's Celebrations' section. Open to any logged-in user,
+    regardless of process — this is a social feature, not process data.
+    """
+    __tablename__ = "celebration_comments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    target_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    message = Column(String, nullable=False)
+    posted_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    posted_by_name = Column(String, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class ProcessUpdate(Base):
+    """
+    A short announcement posted to one process's queue screen — e.g. a
+    Team Lead flagging a deadline change. Newest shows first and most
+    prominently on the process screen.
+    """
+    __tablename__ = "process_updates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    process_id = Column(Integer, ForeignKey("processes.id"), nullable=False)
+    message = Column(String, nullable=False)
+    posted_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    posted_by_name = Column(String, nullable=False)
+    posted_by_role = Column(String, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+
+
 class AppSetting(Base):
     """Simple key-value store for admin-configurable settings, e.g. the
     inactivity session timeout. Not tied to any one user."""
