@@ -23,19 +23,30 @@ class CelebrationCommentCreate(BaseModel):
     message: str
 
 
+class CelebrationReactRequest(BaseModel):
+    reaction: str  # "like" | "heart" | "thumbsup"
+
+
 class CelebrationPerson(BaseModel):
     user_id: int
     full_name: str
-    designation: Optional[str] = None
     kind: str  # "birthday" or "anniversary"
     years: Optional[int] = None  # anniversaries only, if resolvable
     comments: List[CelebrationCommentOut] = []
+    reaction_counts: dict = {}  # e.g. {"like": 3, "heart": 1, "thumbsup": 0}
+    my_reactions: List[str] = []  # reaction types the current user already gave
 
 
 class ProcessUpdateOut(BaseModel):
     id: int
     process_id: int
+    received_date: Optional[date] = None
+    mode: Optional[str] = None
+    received_from: Optional[str] = None
+    category: Optional[str] = None
+    status: str
     message: str
+    verified_by: Optional[str] = None
     posted_by_name: str
     posted_by_role: str
     created_at: datetime
@@ -45,7 +56,13 @@ class ProcessUpdateOut(BaseModel):
 
 
 class ProcessUpdateCreate(BaseModel):
+    received_date: Optional[date] = None
+    mode: Optional[str] = None
+    received_from: Optional[str] = None
+    category: Optional[str] = None
+    status: str = "Active"
     message: str
+    verified_by: Optional[str] = None
 
 
 class ProcessOut(BaseModel):

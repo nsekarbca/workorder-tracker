@@ -408,6 +408,12 @@ def update_process(
 # Today's Celebrations (org-wide birthdays/anniversaries) + Process Updates
 # ---------------------------------------------------------------------------
 
+REACTION_TYPES = ("like", "heart", "thumbsup")
+UPDATE_MODES = ("Team message", "Email", "Smartsheet", "Call")
+UPDATE_CATEGORIES = ("Payer", "Adjustment", "Generic")
+UPDATE_STATUSES = ("Active", "Inactive")
+
+
 @app.get("/celebrations/today", response_model=List[schemas.CelebrationPerson])
 def todays_celebrations(
     current_user: models.User = Depends(auth.get_current_user),
@@ -416,18 +422,20 @@ def todays_celebrations(
     """
     Every active user, across the whole org (any role, any process), whose
     birthday or work anniversary falls on today's calendar date. Open to
-    anyone logged in — this isn't process-scoped.
+    anyone logged in — this isn't process-scoped. Returns an empty list on
+    any day nobody's celebrating, so the frontend can hide the section
+    entirely rather than show an empty state.
     """
     today = date.today()
     users = db.query(models.User).filter(models.User.employment_status == "Active").all()
     people = []
     for u in users:
         if u.dob and u.dob.month == today.month and u.dob.day == today.day:
-            people.append({"user_id": u.id, "full_name": u.full_name, "designation": u.designation, "kind": "birthday", "years": None})
+            people.append({"user_id": u.id, "full_name": u.full_name, "kind": "birthday", "years": None})
         if u.anniversary_date and u.anniversary_date.month == today.month and u.anniversary_date.day == today.day:
             years = today.year - u.anniversary_date.year
             people.append({
-                "user_id": u.id, "full_name": u.full_name, "designation": u.designation,
+                "user_id": u.id, "full_name": u.full_name,
                 "kind": "anniversary", "years": years if years > 0 else None,
             })
 
@@ -441,11 +449,30 @@ def todays_celebrations(
         .order_by(models.CelebrationComment.created_at.asc())
         .all()
     )
-    by_target = {}
+    comments_by_target = {}
     for c in comments:
-        by_target.setdefault(c.target_user_id, []).append(c)
+        comments_by_target.setdefault(c.target_user_id, []).append(c)
+
+    reactions = (
+        db.query(models.CelebrationReaction)
+        .filter(models.CelebrationReaction.target_user_id.in_(target_ids))
+        .all()
+    )
+    reactions_by_target = {}
+    for r in reactions:
+        reactions_by_target.setdefault(r.target_user_id, []).append(r)
+
     for p in people:
-        p["comments"] = by_target.get(p["user_id"], [])
+        p["comments"] = comments_by_target.get(p["user_id"], [])
+        target_reactions = reactions_by_target.get(p["user_id"], [])
+        counts = {t: 0 for t in REACTION_TYPES}
+        my_reactions = []
+        for r in target_reactions:
+            counts[r.reaction] = counts.get(r.reaction, 0) + 1
+            if r.posted_by_id == current_user.id:
+                my_reactions.append(r.reaction)
+        p["reaction_counts"] = counts
+        p["my_reactions"] = my_reactions
     return people
 
 
@@ -472,6 +499,44 @@ def add_celebration_comment(
     db.commit()
     db.refresh(comment)
     return comment
+
+
+@app.post("/celebrations/{target_user_id}/react")
+def react_to_celebration(
+    target_user_id: int,
+    payload: schemas.CelebrationReactRequest,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Toggles a like/heart/thumbsup — clicking the same reaction again removes it."""
+    if payload.reaction not in REACTION_TYPES:
+        raise HTTPException(status_code=400, detail=f"reaction must be one of {REACTION_TYPES}")
+    target = db.query(models.User).filter(models.User.id == target_user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    existing = (
+        db.query(models.CelebrationReaction)
+        .filter(
+            models.CelebrationReaction.target_user_id == target_user_id,
+            models.CelebrationReaction.posted_by_id == current_user.id,
+            models.CelebrationReaction.reaction == payload.reaction,
+        )
+        .first()
+    )
+    if existing:
+        db.delete(existing)
+        db.commit()
+        return {"status": "removed"}
+
+    db.add(models.CelebrationReaction(
+        target_user_id=target_user_id,
+        reaction=payload.reaction,
+        posted_by_id=current_user.id,
+        posted_by_name=current_user.full_name,
+    ))
+    db.commit()
+    return {"status": "added"}
 
 
 @app.get("/process-updates", response_model=List[schemas.ProcessUpdateOut])
@@ -501,10 +566,23 @@ def create_process_update(
     _require_process_access(current_user, process_id)
     message = payload.message.strip()
     if not message:
-        raise HTTPException(status_code=400, detail="Update message can't be empty")
+        raise HTTPException(status_code=400, detail="Update comment can't be empty")
+    if payload.mode and payload.mode not in UPDATE_MODES:
+        raise HTTPException(status_code=400, detail=f"mode must be one of {UPDATE_MODES}")
+    if payload.category and payload.category not in UPDATE_CATEGORIES:
+        raise HTTPException(status_code=400, detail=f"category must be one of {UPDATE_CATEGORIES}")
+    if payload.status not in UPDATE_STATUSES:
+        raise HTTPException(status_code=400, detail=f"status must be one of {UPDATE_STATUSES}")
+
     update = models.ProcessUpdate(
         process_id=process_id,
+        received_date=payload.received_date,
+        mode=payload.mode,
+        received_from=(payload.received_from.strip() if payload.received_from else None),
+        category=payload.category,
+        status=payload.status,
         message=message,
+        verified_by=(payload.verified_by.strip() if payload.verified_by else None),
         posted_by_id=current_user.id,
         posted_by_name=current_user.full_name,
         posted_by_role=current_user.role,

@@ -50,17 +50,41 @@ class CelebrationComment(Base):
     created_at = Column(DateTime, server_default=func.now())
 
 
+class CelebrationReaction(Base):
+    """
+    A like/heart/thumbs-up left on a colleague's birthday/anniversary entry.
+    One row per (target, reactor, reaction type) — clicking the same
+    reaction again removes it (toggle), so a person can't stack up the
+    same reaction multiple times.
+    """
+    __tablename__ = "celebration_reactions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    target_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    reaction = Column(String, nullable=False)  # "like" | "heart" | "thumbsup"
+    posted_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    posted_by_name = Column(String, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+
+
 class ProcessUpdate(Base):
     """
-    A short announcement posted to one process's queue screen — e.g. a
-    Team Lead flagging a deadline change. Newest shows first and most
-    prominently on the process screen.
+    A structured update posted to one process's queue screen — e.g. a
+    Team Lead logging how a payer communication came in and what was
+    done about it. Newest shows first and most prominently on the
+    process screen.
     """
     __tablename__ = "process_updates"
 
     id = Column(Integer, primary_key=True, index=True)
     process_id = Column(Integer, ForeignKey("processes.id"), nullable=False)
-    message = Column(String, nullable=False)
+    received_date = Column(Date, nullable=True)
+    mode = Column(String, nullable=True)  # Team message / Email / Smartsheet / Call
+    received_from = Column(String, nullable=True)
+    category = Column(String, nullable=True)  # Payer / Adjustment / Generic
+    status = Column(String, nullable=False, default="Active")  # Active / Inactive
+    message = Column(String, nullable=False)  # the update comment itself
+    verified_by = Column(String, nullable=True)  # Verified/Approved by
     posted_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     posted_by_name = Column(String, nullable=False)
     posted_by_role = Column(String, nullable=False)
