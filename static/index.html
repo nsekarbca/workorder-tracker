@@ -34,14 +34,19 @@
   th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; white-space: nowrap; }
   thead th { position: sticky; top: var(--sticky-offset, 0px); z-index: 2; background: var(--navy); color: white; }
   #sticky-top { position: sticky; top: 0; z-index: 30; background: #f4f4f6; box-shadow: 0 2px 4px rgba(0,0,0,.06); }
+  .dashboard-columns { display: flex; gap: 14px; align-items: flex-start; margin-bottom: 14px; }
+  .dashboard-columns > div { flex: 1 1 380px; min-width: 0; background: white; border-radius: 8px; padding: 14px; box-shadow: 0 1px 4px rgba(0,0,0,.06); }
+  @media (max-width: 780px) { .dashboard-columns { flex-direction: column; } }
   .celeb-card { border: 1px solid #eee; border-radius: 6px; padding: 10px 12px; margin-bottom: 8px; background: #fffdf6; }
+  .celeb-card .celeb-name-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
   .celeb-card .celeb-name { font-weight: 600; color: var(--navy); }
-  .celeb-card .celeb-tag { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 10px; margin-left: 8px; color: white; }
+  .celeb-card .celeb-designation { display: block; font-size: 12px; color: #888; margin-top: 2px; }
+  .celeb-card .celeb-tag { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 10px; color: white; white-space: nowrap; }
   .celeb-tag.birthday { background: #d6336c; }
   .celeb-tag.anniversary { background: #2b8a3e; }
-  .celeb-comment { font-size: 12px; color: #444; margin: 4px 0 0 0; padding: 4px 8px; background: #f4f4f6; border-radius: 4px; }
+  .celeb-comment { font-size: 12px; color: #444; margin: 6px 0 0 0; padding: 5px 8px; background: #f4f4f6; border-radius: 4px; }
   .celeb-comment b { color: var(--navy); }
-  .celeb-comment-input { display: flex; gap: 6px; margin-top: 6px; }
+  .celeb-comment-input { display: flex; gap: 6px; margin-top: 8px; }
   .celeb-comment-input input { flex: 1; padding: 5px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px; }
   .update-item { border-left: 4px solid #ccc; padding: 8px 12px; margin-bottom: 8px; background: #fafafa; border-radius: 0 6px 6px 0; }
   .update-item:first-child { border-left-color: var(--accent); background: #eaf3fc; box-shadow: 0 1px 4px rgba(28,126,214,.15); }
@@ -200,12 +205,12 @@
   </div>
 
   <div style="padding: 0 16px 16px 16px;">
-    <div id="dashboard-panel" style="display:none;">
-      <div id="celebrations-card" style="background:white; border-radius:8px; padding:14px; margin-bottom:14px; box-shadow:0 1px 4px rgba(0,0,0,.06);">
+    <div id="dashboard-panel" style="display:none;" class="dashboard-columns">
+      <div id="celebrations-card">
         <h3 style="margin:0 0 10px;">🎉 Today's Celebrations</h3>
         <div id="celebrations-list"><p style="color:#888; font-size:13px; margin:0;">Loading...</p></div>
       </div>
-      <div id="updates-card" style="background:white; border-radius:8px; padding:14px; margin-bottom:14px; box-shadow:0 1px 4px rgba(0,0,0,.06);">
+      <div id="updates-card">
         <h3 style="margin:0 0 10px;">📢 Process Updates</h3>
         <div id="post-update-form" style="display:none; margin-bottom:12px;">
           <textarea id="new-update-text" rows="2" style="width:100%; padding:6px; border:1px solid #ccc; border-radius:4px; font-family:inherit;" placeholder="Post an update for this process..."></textarea>
@@ -1378,9 +1383,8 @@ async function loadCelebrations() {
   people.forEach(p => {
     const tagLabel = p.kind === "birthday" ? "🎂 Birthday" : `🎊 Anniversary${p.years ? " · " + p.years + " yr" + (p.years === 1 ? "" : "s") : ""}`;
     html += `<div class="celeb-card">`;
-    html += `<span class="celeb-name">${p.full_name}</span>`;
-    html += `<span class="celeb-tag ${p.kind}">${tagLabel}</span>`;
-    if (p.designation) html += ` <span style="font-size:12px; color:#888;">${p.designation}</span>`;
+    html += `<div class="celeb-name-row"><span class="celeb-name">${p.full_name}</span><span class="celeb-tag ${p.kind}">${tagLabel}</span></div>`;
+    if (p.designation) html += `<span class="celeb-designation">${p.designation}</span>`;
     p.comments.forEach(c => {
       html += `<div class="celeb-comment"><b>${c.posted_by_name}:</b> ${c.message}</div>`;
     });
