@@ -16,8 +16,13 @@
   }
   * { box-sizing: border-box; }
   body { font-family: Segoe UI, Arial, sans-serif; margin: 0; background: #f4f4f6; color: #222; }
-  header { background: white; color: var(--navy); padding: 10px 20px; display: flex; justify-content: space-between; align-items: center; border-bottom: 3px solid var(--navy); box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  header { background: white; color: var(--navy); padding: 10px 20px; display: flex; justify-content: space-between; align-items: center; border-bottom: 3px solid var(--navy); box-shadow: 0 1px 4px rgba(0,0,0,.08); position: relative; }
   header .brand { display: flex; align-items: center; gap: 12px; }
+  .menu-btn { background: white; border: 1px solid #ddd; border-radius: 6px; width: 36px; height: 36px; font-size: 16px; cursor: pointer; color: var(--navy); }
+  .menu-btn:hover { background: #f4f4f6; }
+  .nav-menu { position: absolute; top: 54px; left: 20px; background: white; border: 1px solid #ddd; border-radius: 6px; box-shadow: 0 4px 14px rgba(0,0,0,.15); z-index: 40; min-width: 190px; overflow: hidden; }
+  .nav-menu-item { display: block; width: 100%; text-align: left; padding: 10px 16px; border: none; background: none; cursor: pointer; font-size: 14px; color: var(--navy); }
+  .nav-menu-item:hover { background: #f4f4f6; }
   header .brand img { height: 44px; width: auto; max-width: 220px; object-fit: contain; display: block; }
   header .brand .wordmark { font-size: 20px; font-weight: 700; letter-spacing: .5px; color: var(--navy); }
   header .brand .wordmark span { color: var(--accent); }
@@ -144,9 +149,17 @@
   <div id="sticky-top">
     <header>
       <div class="brand">
+        <button id="menu-btn" class="menu-btn" onclick="toggleMenu(event)" aria-label="Menu">☰</button>
         <img src="logo.png" alt="Ventra Health" onerror="this.style.display='none'; document.getElementById('app-wordmark').style.display='block';">
         <div id="app-wordmark" style="display:none;" class="wordmark">VENTRA<span>HEALTH</span></div>
         <span class="app-title">Work Order Allocation Tracker</span>
+      </div>
+      <div id="nav-menu" class="nav-menu" style="display:none;">
+        <button class="nav-menu-item" onclick="navTo('home')">🏠 Home</button>
+        <button class="nav-menu-item" onclick="navTo('active')">📋 Active Queue</button>
+        <button class="nav-menu-item" id="nav-production-btn" style="display:none;" onclick="navTo('production')">📦 Production</button>
+        <button class="nav-menu-item" id="nav-admin-btn" style="display:none;" onclick="navTo('admin')">⚙️ Admin</button>
+        <button class="nav-menu-item" id="nav-switch-process-btn" style="display:none;" onclick="navTo('switch')">🔀 Switch Process</button>
       </div>
       <div>
         <span id="process-badge" class="process-badge" style="display:none;"></span>
@@ -749,6 +762,7 @@ function showApp() {
   }
   if (myProcesses.length > 1) {
     document.getElementById("switch-process-btn").style.display = "inline-block";
+    document.getElementById("nav-switch-process-btn").style.display = "block";
   }
 
   // Instructional banner removed — no longer needed.
@@ -758,6 +772,7 @@ function showApp() {
     document.getElementById("run-assign-btn").style.display = "inline-block";
     document.getElementById("clear-data-btn").style.display = "inline-block";
     document.getElementById("production-btn").style.display = "inline-block";
+    document.getElementById("nav-production-btn").style.display = "block";
     document.getElementById("import-file").addEventListener("change", importCSV);
     if (currentProcessId) loadColleagueList();
     if (role === "team_lead") {
@@ -772,16 +787,57 @@ function showApp() {
   } else {
     document.getElementById("submit-day-btn").style.display = "inline-block";
     document.getElementById("production-btn").style.display = "inline-block";
+    document.getElementById("nav-production-btn").style.display = "block";
   }
   if (role === "super_admin") {
     document.getElementById("admin-btn").style.display = "inline-block";
+    document.getElementById("nav-admin-btn").style.display = "block";
   }
 
   if (currentProcessId) {
-    loadOrders();
+    showHomeView();
   } else if (role === "super_admin") {
     showAdminView();
   }
+}
+
+function toggleMenu(event) {
+  if (event) event.stopPropagation();
+  const menu = document.getElementById("nav-menu");
+  menu.style.display = menu.style.display === "block" ? "none" : "block";
+}
+
+document.addEventListener("click", (event) => {
+  const menu = document.getElementById("nav-menu");
+  if (menu && menu.style.display === "block" && !menu.contains(event.target) && event.target.id !== "menu-btn") {
+    menu.style.display = "none";
+  }
+});
+
+function navTo(dest) {
+  document.getElementById("nav-menu").style.display = "none";
+  if (dest === "home") showHomeView();
+  else if (dest === "active") showActiveView();
+  else if (dest === "production") showProductionView();
+  else if (dest === "admin") showAdminView();
+  else if (dest === "switch") showProcessSwitcher();
+}
+
+// ---------------------------------------------------------------------
+// Home screen: Today's Celebrations + Process Updates
+// ---------------------------------------------------------------------
+
+function showHomeView() {
+  viewMode = "home";
+  document.getElementById("toolbar").style.display = "none";
+  document.getElementById("production-bar").style.display = "none";
+  shareMode = false;
+  selectedForShare.clear();
+  document.getElementById("share-bar").style.display = "none";
+  document.getElementById("admin-panel").style.display = "none";
+  document.getElementById("grid-container").innerHTML = "";
+  document.getElementById("dashboard-panel").style.display = "flex";
+  loadDashboard();
 }
 
 async function authFetch(path, opts={}) {
@@ -1210,6 +1266,7 @@ function showActiveView() {
   document.getElementById("toolbar").style.display = "flex";
   document.getElementById("production-bar").style.display = "none";
   document.getElementById("admin-panel").style.display = "none";
+  document.getElementById("dashboard-panel").style.display = "none";
   loadOrders();
 }
 
@@ -1386,9 +1443,8 @@ async function loadOrders() {
   document.getElementById("admin-panel").style.display = "none";
   document.getElementById("toolbar").style.display = "flex";
   document.getElementById("production-bar").style.display = "none";
-  document.getElementById("dashboard-panel").style.display = "block";
+  document.getElementById("dashboard-panel").style.display = "none";
   viewMode = "active";
-  loadDashboard();
   const res = await authFetch(withProcess("/orders"));
   currentOrders = await res.json();
   drafts = {};
@@ -1421,21 +1477,22 @@ async function loadCelebrations() {
     return;
   }
   card.style.display = "block";
-  const REACTIONS = [["like", "👍"], ["heart", "❤️"], ["thumbsup", "👍🏻"]];
+  const REACTIONS = [["like", "👍"], ["heart", "❤️"]];
   let html = "";
   people.forEach(p => {
     const tagLabel = p.kind === "birthday" ? "🎂 Birthday" : `🎊 Anniversary${p.years ? " · " + p.years + " yr" + (p.years === 1 ? "" : "s") : ""}`;
     html += `<div class="celeb-card">`;
     html += `<div class="celeb-name-row"><span class="celeb-name">${p.full_name}</span><span class="celeb-tag ${p.kind}">${tagLabel}</span></div>`;
-    html += `<div class="celeb-reactions">`;
-    REACTIONS.forEach(([key, emoji]) => {
-      const active = p.my_reactions.includes(key);
-      const count = p.reaction_counts[key] || 0;
-      html += `<button class="celeb-react-btn${active ? " active" : ""}" onclick="reactToCelebration(${p.user_id}, '${key}')">${emoji} ${count > 0 ? count : ""}</button>`;
-    });
-    html += `</div>`;
     p.comments.forEach(c => {
-      html += `<div class="celeb-comment"><b>${c.posted_by_name}:</b> ${c.message}</div>`;
+      html += `<div class="celeb-comment">`;
+      html += `<div><b>${c.posted_by_name}:</b> ${c.message}</div>`;
+      html += `<div class="celeb-reactions">`;
+      REACTIONS.forEach(([key, emoji]) => {
+        const active = c.my_reactions.includes(key);
+        const count = c.reaction_counts[key] || 0;
+        html += `<button class="celeb-react-btn${active ? " active" : ""}" onclick="reactToCelebrationComment(${c.id}, '${key}')">${emoji} ${count > 0 ? count : ""}</button>`;
+      });
+      html += `</div></div>`;
     });
     html += `<div class="celeb-comment-input">`;
     html += `<input id="celeb-input-${p.user_id}" placeholder="Say something nice..." onkeydown="if(event.key==='Enter')postCelebrationComment(${p.user_id})">`;
@@ -1445,8 +1502,8 @@ async function loadCelebrations() {
   container.innerHTML = html;
 }
 
-async function reactToCelebration(userId, reaction) {
-  const res = await authFetch(`/celebrations/${userId}/react`, {
+async function reactToCelebrationComment(commentId, reaction) {
+  const res = await authFetch(`/celebrations/comments/${commentId}/react`, {
     method: "POST",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({reaction})
