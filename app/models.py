@@ -52,16 +52,17 @@ class CelebrationComment(Base):
 
 class CelebrationReaction(Base):
     """
-    A like/heart/thumbs-up left on a colleague's birthday/anniversary entry.
-    One row per (target, reactor, reaction type) — clicking the same
-    reaction again removes it (toggle), so a person can't stack up the
-    same reaction multiple times.
+    A like/heart left on a specific comment under a colleague's
+    birthday/anniversary entry (not on the entry itself). One row per
+    (comment, reactor, reaction type) — clicking the same reaction again
+    removes it (toggle), so a person can't stack up the same reaction
+    multiple times on one comment.
     """
     __tablename__ = "celebration_reactions"
 
     id = Column(Integer, primary_key=True, index=True)
-    target_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    reaction = Column(String, nullable=False)  # "like" | "heart" | "thumbsup"
+    comment_id = Column(Integer, ForeignKey("celebration_comments.id"), nullable=False)
+    reaction = Column(String, nullable=False)  # "like" | "heart"
     posted_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     posted_by_name = Column(String, nullable=False)
     created_at = Column(DateTime, server_default=func.now())

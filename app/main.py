@@ -408,7 +408,7 @@ def update_process(
 # Today's Celebrations (org-wide birthdays/anniversaries) + Process Updates
 # ---------------------------------------------------------------------------
 
-REACTION_TYPES = ("like", "heart", "thumbsup")
+REACTION_TYPES = ("like", "heart")
 UPDATE_MODES = ("Team message", "Email", "Smartsheet", "Call")
 UPDATE_CATEGORIES = ("Payer", "Adjustment", "Generic")
 UPDATE_STATUSES = ("Active", "Inactive")
@@ -453,26 +453,34 @@ def todays_celebrations(
     for c in comments:
         comments_by_target.setdefault(c.target_user_id, []).append(c)
 
-    reactions = (
-        db.query(models.CelebrationReaction)
-        .filter(models.CelebrationReaction.target_user_id.in_(target_ids))
-        .all()
-    )
-    reactions_by_target = {}
-    for r in reactions:
-        reactions_by_target.setdefault(r.target_user_id, []).append(r)
+    comment_ids = [c.id for c in comments]
+    reactions_by_comment = {}
+    if comment_ids:
+        reactions = (
+            db.query(models.CelebrationReaction)
+            .filter(models.CelebrationReaction.comment_id.in_(comment_ids))
+            .all()
+        )
+        for r in reactions:
+            reactions_by_comment.setdefault(r.comment_id, []).append(r)
 
     for p in people:
-        p["comments"] = comments_by_target.get(p["user_id"], [])
-        target_reactions = reactions_by_target.get(p["user_id"], [])
-        counts = {t: 0 for t in REACTION_TYPES}
-        my_reactions = []
-        for r in target_reactions:
-            counts[r.reaction] = counts.get(r.reaction, 0) + 1
-            if r.posted_by_id == current_user.id:
-                my_reactions.append(r.reaction)
-        p["reaction_counts"] = counts
-        p["my_reactions"] = my_reactions
+        target_comments = comments_by_target.get(p["user_id"], [])
+        enriched = []
+        for c in target_comments:
+            c_reactions = reactions_by_comment.get(c.id, [])
+            counts = {t: 0 for t in REACTION_TYPES}
+            my_reactions = []
+            for r in c_reactions:
+                counts[r.reaction] = counts.get(r.reaction, 0) + 1
+                if r.posted_by_id == current_user.id:
+                    my_reactions.append(r.reaction)
+            enriched.append({
+                "id": c.id, "target_user_id": c.target_user_id, "message": c.message,
+                "posted_by_name": c.posted_by_name, "created_at": c.created_at,
+                "reaction_counts": counts, "my_reactions": my_reactions,
+            })
+        p["comments"] = enriched
     return people
 
 
@@ -498,27 +506,31 @@ def add_celebration_comment(
     db.add(comment)
     db.commit()
     db.refresh(comment)
-    return comment
+    return {
+        "id": comment.id, "target_user_id": comment.target_user_id, "message": comment.message,
+        "posted_by_name": comment.posted_by_name, "created_at": comment.created_at,
+        "reaction_counts": {t: 0 for t in REACTION_TYPES}, "my_reactions": [],
+    }
 
 
-@app.post("/celebrations/{target_user_id}/react")
-def react_to_celebration(
-    target_user_id: int,
+@app.post("/celebrations/comments/{comment_id}/react")
+def react_to_celebration_comment(
+    comment_id: int,
     payload: schemas.CelebrationReactRequest,
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Toggles a like/heart/thumbsup — clicking the same reaction again removes it."""
+    """Toggles a like/heart on a specific comment — clicking it again removes it."""
     if payload.reaction not in REACTION_TYPES:
         raise HTTPException(status_code=400, detail=f"reaction must be one of {REACTION_TYPES}")
-    target = db.query(models.User).filter(models.User.id == target_user_id).first()
-    if not target:
-        raise HTTPException(status_code=404, detail="User not found")
+    comment = db.query(models.CelebrationComment).filter(models.CelebrationComment.id == comment_id).first()
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
 
     existing = (
         db.query(models.CelebrationReaction)
         .filter(
-            models.CelebrationReaction.target_user_id == target_user_id,
+            models.CelebrationReaction.comment_id == comment_id,
             models.CelebrationReaction.posted_by_id == current_user.id,
             models.CelebrationReaction.reaction == payload.reaction,
         )
@@ -530,7 +542,7 @@ def react_to_celebration(
         return {"status": "removed"}
 
     db.add(models.CelebrationReaction(
-        target_user_id=target_user_id,
+        comment_id=comment_id,
         reaction=payload.reaction,
         posted_by_id=current_user.id,
         posted_by_name=current_user.full_name,

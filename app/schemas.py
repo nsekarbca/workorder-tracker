@@ -14,6 +14,8 @@ class CelebrationCommentOut(BaseModel):
     message: str
     posted_by_name: str
     created_at: datetime
+    reaction_counts: dict = {}  # e.g. {"like": 2, "heart": 1}
+    my_reactions: List[str] = []  # reaction types the current user already gave this comment
 
     class Config:
         from_attributes = True
@@ -24,7 +26,7 @@ class CelebrationCommentCreate(BaseModel):
 
 
 class CelebrationReactRequest(BaseModel):
-    reaction: str  # "like" | "heart" | "thumbsup"
+    reaction: str  # "like" | "heart"
 
 
 class CelebrationPerson(BaseModel):
@@ -33,8 +35,6 @@ class CelebrationPerson(BaseModel):
     kind: str  # "birthday" or "anniversary"
     years: Optional[int] = None  # anniversaries only, if resolvable
     comments: List[CelebrationCommentOut] = []
-    reaction_counts: dict = {}  # e.g. {"like": 3, "heart": 1, "thumbsup": 0}
-    my_reactions: List[str] = []  # reaction types the current user already gave
 
 
 class ProcessUpdateOut(BaseModel):
