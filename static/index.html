@@ -58,8 +58,10 @@
   .celeb-comment-input input { flex: 1; padding: 5px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px; }
   .update-item { border-left: 4px solid #ccc; padding: 8px 12px; margin-bottom: 8px; background: #fafafa; border-radius: 0 6px 6px 0; }
   .update-item:first-child { border-left-color: var(--accent); background: #eaf3fc; box-shadow: 0 1px 4px rgba(28,126,214,.15); }
-  .update-item .update-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; }
+  .update-item .update-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; align-items: center; }
   .update-item .update-tag { font-size: 10px; padding: 2px 8px; border-radius: 10px; background: #6c757d; color: white; }
+  .update-edit-btn { margin-left: auto; border: none; background: none; color: var(--accent); font-size: 11px; cursor: pointer; padding: 2px 4px; }
+  .update-edit-btn:hover { text-decoration: underline; }
   .update-item .update-message { font-size: 13px; color: #222; }
   .update-item .update-meta { font-size: 11px; color: #777; margin-top: 4px; }
   .update-item:first-child .update-meta { color: var(--accent); font-weight: 600; }
@@ -232,6 +234,7 @@
       <div id="updates-card">
         <h3 style="margin:0 0 10px;">📢 Process Updates</h3>
         <div id="post-update-form" style="display:none; margin-bottom:12px; background:#f8f9fb; padding:10px; border-radius:6px;">
+          <h4 id="pu-form-heading" style="margin:0 0 8px;">New Update</h4>
           <label style="display:block;">Process(es)
             <div id="pu-process-list" style="display:flex; flex-wrap:wrap; gap:4px 14px; padding:6px 0;"></div>
           </label>
@@ -266,7 +269,8 @@
           <label style="display:block; margin-top:10px;">Update Comment
             <textarea id="new-update-text" rows="2" style="width:100%; padding:6px; border:1px solid #ccc; border-radius:4px; font-family:inherit;" placeholder="What's the update..."></textarea>
           </label>
-          <button class="action-btn" onclick="postProcessUpdate()" style="margin-top:8px;">Post Update</button>
+          <button class="action-btn" id="pu-submit-btn" onclick="postProcessUpdate()" style="margin-top:8px;">Post Update</button>
+          <button class="action-btn" id="pu-cancel-btn" style="margin-top:8px; display:none; background:#888;" onclick="cancelEditProcessUpdate()">Cancel</button>
         </div>
         <div id="updates-list"><p style="color:#888; font-size:13px; margin:0;">Loading...</p></div>
       </div>
@@ -1533,6 +1537,9 @@ async function postCelebrationComment(userId) {
   loadCelebrations();
 }
 
+let currentProcessUpdates = [];
+let editingUpdateId = null;
+
 async function loadProcessUpdates() {
   if (!currentProcessId) return;
   const canPost = (role === "team_lead" || role === "admin" || role === "super_admin");
@@ -1546,6 +1553,7 @@ async function loadProcessUpdates() {
     return;
   }
   const updates = await res.json();
+  currentProcessUpdates = updates;
   if (!updates.length) {
     container.innerHTML = '<p style="color:#888; font-size:13px; margin:0;">No updates posted yet.</p>';
     return;
@@ -1560,6 +1568,7 @@ async function loadProcessUpdates() {
     if (u.mode) html += `<span class="update-tag">${u.mode}</span>`;
     if (u.category) html += `<span class="update-tag">${u.category}</span>`;
     html += `<span class="update-tag" style="background:${statusColor};">${u.status}</span>`;
+    if (canPost) html += `<button class="update-edit-btn" onclick="editProcessUpdate(${u.id})">✏️ Edit</button>`;
     html += `</div>`;
     html += `<div class="update-message">${u.message}</div>`;
     if (u.received_from) html += `<div class="update-meta">From: ${u.received_from}</div>`;
@@ -1588,25 +1597,47 @@ function togglePuProcessAll(checked) {
   document.querySelectorAll(".pu-process-cb").forEach(cb => cb.checked = checked);
 }
 
+function editProcessUpdate(updateId) {
+  const u = currentProcessUpdates.find(x => x.id === updateId);
+  if (!u) return;
+  editingUpdateId = updateId;
+  document.getElementById("pu-received-date").value = u.received_date || "";
+  document.getElementById("pu-mode").value = u.mode || "";
+  document.getElementById("pu-received-from").value = u.received_from || "";
+  document.getElementById("pu-category").value = u.category || "";
+  document.getElementById("pu-status").value = u.status || "Active";
+  document.getElementById("pu-verified-by").value = u.verified_by || "";
+  document.getElementById("new-update-text").value = u.message;
+  // Editing doesn't change which process(es) it's posted to — hide the
+  // picker rather than let it look like it does something here.
+  document.getElementById("pu-process-list").style.display = "none";
+  document.getElementById("pu-form-heading").textContent = "Edit Update";
+  document.getElementById("pu-submit-btn").textContent = "Save Changes";
+  document.getElementById("pu-cancel-btn").style.display = "inline-block";
+  document.getElementById("post-update-form").scrollIntoView({behavior: "smooth"});
+}
+
+function cancelEditProcessUpdate() {
+  editingUpdateId = null;
+  document.getElementById("new-update-text").value = "";
+  document.getElementById("pu-received-date").value = "";
+  document.getElementById("pu-mode").value = "";
+  document.getElementById("pu-received-from").value = "";
+  document.getElementById("pu-category").value = "";
+  document.getElementById("pu-status").value = "Active";
+  document.getElementById("pu-verified-by").value = "";
+  document.getElementById("pu-process-list").style.display = "flex";
+  document.getElementById("pu-form-heading").textContent = "New Update";
+  document.getElementById("pu-submit-btn").textContent = "Post Update";
+  document.getElementById("pu-cancel-btn").style.display = "none";
+}
+
 async function postProcessUpdate() {
   const textarea = document.getElementById("new-update-text");
   const message = textarea.value.trim();
   if (!message) return;
 
-  let processIds;
-  const checkboxes = document.querySelectorAll(".pu-process-cb");
-  if (checkboxes.length) {
-    processIds = Array.from(checkboxes).filter(cb => cb.checked).map(cb => parseInt(cb.value));
-    if (!processIds.length) {
-      alert("Choose at least one process to post to.");
-      return;
-    }
-  } else {
-    processIds = [currentProcessId];
-  }
-
-  const payload = {
-    process_ids: processIds,
+  const fields = {
     message: message,
     received_date: document.getElementById("pu-received-date").value || null,
     mode: document.getElementById("pu-mode").value || null,
@@ -1615,22 +1646,38 @@ async function postProcessUpdate() {
     status: document.getElementById("pu-status").value,
     verified_by: document.getElementById("pu-verified-by").value.trim() || null,
   };
-  const res = await authFetch("/process-updates", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(payload)
-  });
+
+  let res;
+  if (editingUpdateId) {
+    res = await authFetch(`/process-updates/${editingUpdateId}`, {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(fields)
+    });
+  } else {
+    let processIds;
+    const checkboxes = document.querySelectorAll(".pu-process-cb");
+    if (checkboxes.length) {
+      processIds = Array.from(checkboxes).filter(cb => cb.checked).map(cb => parseInt(cb.value));
+      if (!processIds.length) {
+        alert("Choose at least one process to post to.");
+        return;
+      }
+    } else {
+      processIds = [currentProcessId];
+    }
+    res = await authFetch("/process-updates", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(Object.assign({process_ids: processIds}, fields))
+    });
+  }
+
   if (!res.ok) {
-    alert("Couldn't post update: " + (await res.text()));
+    alert("Couldn't save update: " + (await res.text()));
     return;
   }
-  textarea.value = "";
-  document.getElementById("pu-received-date").value = "";
-  document.getElementById("pu-mode").value = "";
-  document.getElementById("pu-received-from").value = "";
-  document.getElementById("pu-category").value = "";
-  document.getElementById("pu-status").value = "Active";
-  document.getElementById("pu-verified-by").value = "";
+  cancelEditProcessUpdate();
   loadProcessUpdates();
 }
 
