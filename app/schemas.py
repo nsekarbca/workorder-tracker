@@ -29,11 +29,16 @@ class CelebrationReactRequest(BaseModel):
     reaction: str  # "like" | "heart"
 
 
+class CelebrationOccasion(BaseModel):
+    kind: str  # "birthday" or "anniversary"
+    years: Optional[int] = None  # anniversaries only, if resolvable
+
+
 class CelebrationPerson(BaseModel):
     user_id: int
     full_name: str
-    kind: str  # "birthday" or "anniversary"
-    years: Optional[int] = None  # anniversaries only, if resolvable
+    occasions: List[CelebrationOccasion] = []  # usually one, but a birthday and
+    # work anniversary can legitimately fall on the same day for one person
     comments: List[CelebrationCommentOut] = []
 
 
@@ -50,6 +55,9 @@ class ProcessUpdateOut(BaseModel):
     posted_by_name: str
     posted_by_role: str
     created_at: datetime
+    updated_at: Optional[datetime] = None
+    updated_by_name: Optional[str] = None
+    updated_by_role: Optional[str] = None
 
     class Config:
         from_attributes = True

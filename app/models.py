@@ -92,6 +92,9 @@ class ProcessUpdate(Base):
     posted_by_name = Column(String, nullable=False)
     posted_by_role = Column(String, nullable=False)
     created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, nullable=True)
+    updated_by_name = Column(String, nullable=True)
+    updated_by_role = Column(String, nullable=True)
 
 
 class AppSetting(Base):

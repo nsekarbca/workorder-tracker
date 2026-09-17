@@ -428,10 +428,11 @@ def todays_celebrations(
     """
     today = date.today()
     users = db.query(models.User).filter(models.User.employment_status == "Active").all()
-    people = []
+    people_by_id = {}
     for u in users:
+        occasions = []
         if u.dob and u.dob.month == today.month and u.dob.day == today.day:
-            people.append({"user_id": u.id, "full_name": u.full_name, "kind": "birthday", "years": None})
+            occasions.append({"kind": "birthday", "years": None})
         # Work anniversary: prefer an explicitly-set anniversary_date if
         # present, otherwise fall back to Date of Joining — every active
         # user has a doj, but anniversary_date is rarely filled in
@@ -439,15 +440,19 @@ def todays_celebrations(
         anniv_source = u.anniversary_date or u.doj
         if anniv_source and anniv_source.month == today.month and anniv_source.day == today.day:
             years = today.year - anniv_source.year
-            people.append({
-                "user_id": u.id, "full_name": u.full_name,
-                "kind": "anniversary", "years": years if years > 0 else None,
-            })
+            occasions.append({"kind": "anniversary", "years": years if years > 0 else None})
+        if occasions:
+            # A birthday and work anniversary can legitimately land on the
+            # same day for one person — one card, both occasion tags, one
+            # shared comment thread, instead of two duplicate cards with
+            # the same comments/reactions showing under each.
+            people_by_id[u.id] = {"user_id": u.id, "full_name": u.full_name, "occasions": occasions}
 
-    if not people:
+    if not people_by_id:
         return []
 
-    target_ids = [p["user_id"] for p in people]
+    people = list(people_by_id.values())
+    target_ids = list(people_by_id.keys())
     comments = (
         db.query(models.CelebrationComment)
         .filter(models.CelebrationComment.target_user_id.in_(target_ids))
@@ -652,6 +657,9 @@ def edit_process_update(
     update.status = payload.status
     update.message = message
     update.verified_by = (payload.verified_by.strip() if payload.verified_by else None)
+    update.updated_at = datetime.utcnow()
+    update.updated_by_name = current_user.full_name
+    update.updated_by_role = current_user.role
     db.commit()
     db.refresh(update)
     return update
