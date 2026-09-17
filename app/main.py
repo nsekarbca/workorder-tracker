@@ -432,8 +432,13 @@ def todays_celebrations(
     for u in users:
         if u.dob and u.dob.month == today.month and u.dob.day == today.day:
             people.append({"user_id": u.id, "full_name": u.full_name, "kind": "birthday", "years": None})
-        if u.anniversary_date and u.anniversary_date.month == today.month and u.anniversary_date.day == today.day:
-            years = today.year - u.anniversary_date.year
+        # Work anniversary: prefer an explicitly-set anniversary_date if
+        # present, otherwise fall back to Date of Joining — every active
+        # user has a doj, but anniversary_date is rarely filled in
+        # separately, so relying on it alone was hiding most anniversaries.
+        anniv_source = u.anniversary_date or u.doj
+        if anniv_source and anniv_source.month == today.month and anniv_source.day == today.day:
+            years = today.year - anniv_source.year
             people.append({
                 "user_id": u.id, "full_name": u.full_name,
                 "kind": "anniversary", "years": years if years > 0 else None,
@@ -610,6 +615,46 @@ def create_process_update(
     for u in created:
         db.refresh(u)
     return created
+
+
+@app.patch("/process-updates/{update_id}", response_model=schemas.ProcessUpdateOut)
+def edit_process_update(
+    update_id: int,
+    payload: schemas.ProcessUpdateEdit,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    Same posting roles can edit, not just the original author — this is
+    shared operational logging (like a process log), not private content.
+    Which process(es) it's posted to isn't editable; if it was posted to
+    several, each process's copy is edited independently.
+    """
+    update = db.query(models.ProcessUpdate).filter(models.ProcessUpdate.id == update_id).first()
+    if not update:
+        raise HTTPException(status_code=404, detail="Update not found")
+    _require_process_access(current_user, update.process_id)
+
+    message = payload.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Update comment can't be empty")
+    if payload.mode and payload.mode not in UPDATE_MODES:
+        raise HTTPException(status_code=400, detail=f"mode must be one of {UPDATE_MODES}")
+    if payload.category and payload.category not in UPDATE_CATEGORIES:
+        raise HTTPException(status_code=400, detail=f"category must be one of {UPDATE_CATEGORIES}")
+    if payload.status not in UPDATE_STATUSES:
+        raise HTTPException(status_code=400, detail=f"status must be one of {UPDATE_STATUSES}")
+
+    update.received_date = payload.received_date
+    update.mode = payload.mode
+    update.received_from = (payload.received_from.strip() if payload.received_from else None)
+    update.category = payload.category
+    update.status = payload.status
+    update.message = message
+    update.verified_by = (payload.verified_by.strip() if payload.verified_by else None)
+    db.commit()
+    db.refresh(update)
+    return update
 
 
 @app.get("/users/colleagues", response_model=List[schemas.UserOut])

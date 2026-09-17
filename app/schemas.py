@@ -66,6 +66,19 @@ class ProcessUpdateCreate(BaseModel):
     verified_by: Optional[str] = None
 
 
+# Editing an existing update — same fields, minus process_ids since which
+# process(es) it was posted to isn't changeable after the fact (each
+# process got its own independent row at creation time).
+class ProcessUpdateEdit(BaseModel):
+    received_date: Optional[date] = None
+    mode: Optional[str] = None
+    received_from: Optional[str] = None
+    category: Optional[str] = None
+    status: str = "Active"
+    message: str
+    verified_by: Optional[str] = None
+
+
 class ProcessOut(BaseModel):
     id: int
     name: str
