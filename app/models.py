@@ -70,10 +70,12 @@ class CelebrationReaction(Base):
 
 class ProcessUpdate(Base):
     """
-    A structured update posted to one process's queue screen — e.g. a
-    Team Lead logging how a payer communication came in and what was
-    done about it. Newest shows first and most prominently on the
-    process screen.
+    A structured update posted to one or more processes' Home screens —
+    e.g. a Team Lead logging how a payer communication came in and what
+    was done about it. Posting "to all processes" creates one row per
+    process rather than a single shared row, so each process's list stays
+    independently filterable/queryable. Newest shows first and most
+    prominently on the Home screen.
     """
     __tablename__ = "process_updates"
 

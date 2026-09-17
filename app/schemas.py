@@ -56,6 +56,7 @@ class ProcessUpdateOut(BaseModel):
 
 
 class ProcessUpdateCreate(BaseModel):
+    process_ids: List[int]  # post this update to one or more processes at once
     received_date: Optional[date] = None
     mode: Optional[str] = None
     received_from: Optional[str] = None

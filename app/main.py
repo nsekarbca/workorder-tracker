@@ -568,14 +568,17 @@ def list_process_updates(
     )
 
 
-@app.post("/process-updates", response_model=schemas.ProcessUpdateOut)
+@app.post("/process-updates", response_model=List[schemas.ProcessUpdateOut])
 def create_process_update(
-    process_id: int,
     payload: schemas.ProcessUpdateCreate,
     current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
     db: Session = Depends(get_db),
 ):
-    _require_process_access(current_user, process_id)
+    if not payload.process_ids:
+        raise HTTPException(status_code=400, detail="Select at least one process")
+    for pid in payload.process_ids:
+        _require_process_access(current_user, pid)
+
     message = payload.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="Update comment can't be empty")
@@ -586,23 +589,27 @@ def create_process_update(
     if payload.status not in UPDATE_STATUSES:
         raise HTTPException(status_code=400, detail=f"status must be one of {UPDATE_STATUSES}")
 
-    update = models.ProcessUpdate(
-        process_id=process_id,
-        received_date=payload.received_date,
-        mode=payload.mode,
-        received_from=(payload.received_from.strip() if payload.received_from else None),
-        category=payload.category,
-        status=payload.status,
-        message=message,
-        verified_by=(payload.verified_by.strip() if payload.verified_by else None),
-        posted_by_id=current_user.id,
-        posted_by_name=current_user.full_name,
-        posted_by_role=current_user.role,
-    )
-    db.add(update)
+    created = []
+    for pid in payload.process_ids:
+        update = models.ProcessUpdate(
+            process_id=pid,
+            received_date=payload.received_date,
+            mode=payload.mode,
+            received_from=(payload.received_from.strip() if payload.received_from else None),
+            category=payload.category,
+            status=payload.status,
+            message=message,
+            verified_by=(payload.verified_by.strip() if payload.verified_by else None),
+            posted_by_id=current_user.id,
+            posted_by_name=current_user.full_name,
+            posted_by_role=current_user.role,
+        )
+        db.add(update)
+        created.append(update)
     db.commit()
-    db.refresh(update)
-    return update
+    for u in created:
+        db.refresh(u)
+    return created
 
 
 @app.get("/users/colleagues", response_model=List[schemas.UserOut])
