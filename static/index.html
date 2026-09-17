@@ -232,9 +232,11 @@
       <div id="updates-card">
         <h3 style="margin:0 0 10px;">📢 Process Updates</h3>
         <div id="post-update-form" style="display:none; margin-bottom:12px; background:#f8f9fb; padding:10px; border-radius:6px;">
+          <label style="display:block;">Process(es)
+            <div id="pu-process-list" style="display:flex; flex-wrap:wrap; gap:4px 14px; padding:6px 0;"></div>
+          </label>
           <div class="form-grid">
             <label>Received Date <input id="pu-received-date" type="date"></label>
-            <label>Process <input id="pu-process" disabled style="background:#eee;"></label>
             <label>Mode
               <select id="pu-mode">
                 <option value="">—</option>
@@ -1535,10 +1537,7 @@ async function loadProcessUpdates() {
   if (!currentProcessId) return;
   const canPost = (role === "team_lead" || role === "admin" || role === "super_admin");
   document.getElementById("post-update-form").style.display = canPost ? "block" : "none";
-  if (canPost) {
-    const proc = myProcesses.find(p => p.id === currentProcessId);
-    document.getElementById("pu-process").value = proc ? proc.name : "";
-  }
+  if (canPost) renderProcessChecklist();
 
   const res = await authFetch(withProcess("/process-updates"));
   const container = document.getElementById("updates-list");
@@ -1570,11 +1569,44 @@ async function loadProcessUpdates() {
   container.innerHTML = html;
 }
 
+function renderProcessChecklist() {
+  const container = document.getElementById("pu-process-list");
+  if (myProcesses.length <= 1) {
+    // Nothing to pick between — just post to the one process silently.
+    container.innerHTML = "";
+    return;
+  }
+  let html = `<label style="font-weight:600;"><input type="checkbox" id="pu-process-all" onchange="togglePuProcessAll(this.checked)"> All Processes</label>`;
+  myProcesses.forEach(p => {
+    const checked = p.id === currentProcessId ? "checked" : "";
+    html += `<label><input type="checkbox" class="pu-process-cb" value="${p.id}" ${checked}> ${p.name}</label>`;
+  });
+  container.innerHTML = html;
+}
+
+function togglePuProcessAll(checked) {
+  document.querySelectorAll(".pu-process-cb").forEach(cb => cb.checked = checked);
+}
+
 async function postProcessUpdate() {
   const textarea = document.getElementById("new-update-text");
   const message = textarea.value.trim();
   if (!message) return;
+
+  let processIds;
+  const checkboxes = document.querySelectorAll(".pu-process-cb");
+  if (checkboxes.length) {
+    processIds = Array.from(checkboxes).filter(cb => cb.checked).map(cb => parseInt(cb.value));
+    if (!processIds.length) {
+      alert("Choose at least one process to post to.");
+      return;
+    }
+  } else {
+    processIds = [currentProcessId];
+  }
+
   const payload = {
+    process_ids: processIds,
     message: message,
     received_date: document.getElementById("pu-received-date").value || null,
     mode: document.getElementById("pu-mode").value || null,
@@ -1583,7 +1615,7 @@ async function postProcessUpdate() {
     status: document.getElementById("pu-status").value,
     verified_by: document.getElementById("pu-verified-by").value.trim() || null,
   };
-  const res = await authFetch(withProcess("/process-updates"), {
+  const res = await authFetch("/process-updates", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify(payload)
