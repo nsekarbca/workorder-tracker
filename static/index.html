@@ -65,6 +65,10 @@
   .update-item .update-message { font-size: 13px; color: #222; }
   .update-item .update-meta { font-size: 11px; color: #777; margin-top: 4px; }
   .update-item:first-child .update-meta { color: var(--accent); font-weight: 600; }
+  .update-item.update-inactive { background: #f0f0f0; border-left-color: #bbb; opacity: .75; }
+  .update-item.update-inactive .update-message { color: #777; text-decoration: line-through; }
+  .update-item.update-inactive:first-child { box-shadow: none; }
+  .update-edited-meta { font-style: italic; }
   th.tl { background: var(--brown); color: white; }
   th.inv { background: var(--teal); color: white; }
   th.col { background: var(--purple); color: white; }
@@ -1486,9 +1490,12 @@ async function loadCelebrations() {
   const REACTIONS = [["like", "👍"], ["heart", "❤️"]];
   let html = "";
   people.forEach(p => {
-    const tagLabel = p.kind === "birthday" ? "🎂 Birthday" : `🎊 Anniversary${p.years ? " · " + p.years + " yr" + (p.years === 1 ? "" : "s") : ""}`;
+    const tags = p.occasions.map(o => {
+      const label = o.kind === "birthday" ? "🎂 Birthday" : `🎊 Anniversary${o.years ? " · " + o.years + " yr" + (o.years === 1 ? "" : "s") : ""}`;
+      return `<span class="celeb-tag ${o.kind}">${label}</span>`;
+    }).join("");
     html += `<div class="celeb-card">`;
-    html += `<div class="celeb-name-row"><span class="celeb-name">${p.full_name}</span><span class="celeb-tag ${p.kind}">${tagLabel}</span></div>`;
+    html += `<div class="celeb-name-row"><span class="celeb-name">${p.full_name}</span>${tags}</div>`;
     p.comments.forEach(c => {
       html += `<div class="celeb-comment">`;
       html += `<div><b>${c.posted_by_name}:</b> ${c.message}</div>`;
@@ -1561,8 +1568,9 @@ async function loadProcessUpdates() {
   let html = "";
   updates.forEach(u => {
     const when = new Date(u.created_at).toLocaleString();
-    const statusColor = u.status === "Active" ? "#2b8a3e" : "#888";
-    html += `<div class="update-item">`;
+    const isInactive = u.status !== "Active";
+    const statusColor = isInactive ? "#888" : "#2b8a3e";
+    html += `<div class="update-item${isInactive ? " update-inactive" : ""}">`;
     html += `<div class="update-tags">`;
     if (u.received_date) html += `<span class="update-tag">📅 ${u.received_date}</span>`;
     if (u.mode) html += `<span class="update-tag">${u.mode}</span>`;
@@ -1573,7 +1581,12 @@ async function loadProcessUpdates() {
     html += `<div class="update-message">${u.message}</div>`;
     if (u.received_from) html += `<div class="update-meta">From: ${u.received_from}</div>`;
     if (u.verified_by) html += `<div class="update-meta">Verified/Approved by: ${u.verified_by}</div>`;
-    html += `<div class="update-meta">${u.posted_by_name} (${u.posted_by_role.replace("_", " ")}) · ${when}</div></div>`;
+    html += `<div class="update-meta">${u.posted_by_name} (${u.posted_by_role.replace("_", " ")}) · ${when}</div>`;
+    if (u.updated_at) {
+      const editedWhen = new Date(u.updated_at).toLocaleString();
+      html += `<div class="update-meta update-edited-meta">${isInactive ? "Marked Inactive" : "Last updated"} by ${u.updated_by_name} (${u.updated_by_role.replace("_", " ")}) · ${editedWhen}</div>`;
+    }
+    html += `</div>`;
   });
   container.innerHTML = html;
 }
