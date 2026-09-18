@@ -1367,9 +1367,13 @@ function renderProductionGrid(orders) {
     html += "<tr>";
     COLUMNS.forEach(c => {
       const val = o[c.k] ?? "";
-      html += `<td>${c.currency ? formatCurrency(val) : val}</td>`;
+      if (c.k === "created") {
+        html += `<td>${formatIST(val)}</td>`;
+      } else {
+        html += `<td>${c.currency ? formatCurrency(val) : val}</td>`;
+      }
     });
-    html += `<td>${o.submitted_at ?? ""}</td>`;
+    html += `<td>${formatIST(o.submitted_at)}</td>`;
     html += "</tr>";
   });
   html += "</tbody></table>";
@@ -1389,7 +1393,7 @@ function exportProductionCSV() {
   const keys = COLUMNS.map(c => c.k).concat(["submitted_at"]);
   const rows = currentProduction.map(o =>
     keys.map(k => {
-      let v = o[k] ?? "";
+      let v = (k === "created" || k === "submitted_at") ? formatIST(o[k]) : (o[k] ?? "");
       v = String(v).replace(/"/g, '""');
       return `"${v}"`;
     }).join(",")
@@ -1553,6 +1557,24 @@ async function postCelebrationComment(userId) {
 let currentProcessUpdates = [];
 let editingUpdateId = null;
 
+// Backend timestamps are UTC but often arrive without an explicit
+// 'Z'/offset suffix, which the browser then misreads as already being
+// in its own local time. Force UTC parsing, then render explicitly in
+// India Standard Time regardless of the viewer's own browser/OS
+// timezone, since the whole org operates on IST.
+function formatIST(isoString) {
+  if (!isoString) return "";
+  let s = isoString;
+  if (!/Z$|[+-]\d\d:\d\d$/.test(s)) s += "Z";
+  const d = new Date(s);
+  const formatted = d.toLocaleString("en-IN", {
+    timeZone: "Asia/Kolkata",
+    day: "2-digit", month: "2-digit", year: "numeric",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true,
+  });
+  return formatted + " IST";
+}
+
 async function loadProcessUpdates() {
   if (!currentProcessId) return;
   const canPost = (role === "team_lead" || role === "admin" || role === "super_admin");
@@ -1573,7 +1595,7 @@ async function loadProcessUpdates() {
   }
   let html = "";
   updates.forEach(u => {
-    const when = new Date(u.created_at).toLocaleString();
+    const when = formatIST(u.created_at);
     const isInactive = u.status !== "Active";
     const statusColor = isInactive ? "#888" : "#2b8a3e";
     html += `<div class="update-item${isInactive ? " update-inactive" : ""}">`;
@@ -1589,7 +1611,7 @@ async function loadProcessUpdates() {
     if (u.verified_by) html += `<div class="update-meta">Verified/Approved by: ${u.verified_by}</div>`;
     html += `<div class="update-meta">${u.posted_by_name} (${u.posted_by_role.replace("_", " ")}) · ${when}</div>`;
     if (u.updated_at) {
-      const editedWhen = new Date(u.updated_at).toLocaleString();
+      const editedWhen = formatIST(u.updated_at);
       html += `<div class="update-meta update-edited-meta">${isInactive ? "Marked Inactive" : "Last updated"} by ${u.updated_by_name} (${u.updated_by_role.replace("_", " ")}) · ${editedWhen}</div>`;
     } else if (isInactive) {
       // Never edited — it was posted as Inactive from the start, so the
@@ -1862,6 +1884,11 @@ function renderGrid(orders) {
         } else {
           html += `<td>${rawVal}</td>`;
         }
+        return;
+      }
+
+      if (c.k === "created") {
+        html += `<td>${formatIST(rawVal)}</td>`;
         return;
       }
 
