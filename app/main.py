@@ -1,4 +1,4 @@
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
 from dateutil import parser as date_parser
 import secrets
@@ -408,6 +408,7 @@ def update_process(
 # Today's Celebrations (org-wide birthdays/anniversaries) + Process Updates
 # ---------------------------------------------------------------------------
 
+IST = timezone(timedelta(hours=5, minutes=30))
 REACTION_TYPES = ("like", "heart")
 UPDATE_MODES = ("Team message", "Email", "Smartsheet", "Call")
 UPDATE_CATEGORIES = ("Payer", "Adjustment", "Generic")
@@ -426,7 +427,11 @@ def todays_celebrations(
     any day nobody's celebrating, so the frontend can hide the section
     entirely rather than show an empty state.
     """
-    today = date.today()
+    # "Today" has to mean today in India, not on the server — the server
+    # (Render) runs in UTC, so for roughly the first 5.5 hours of every
+    # IST day, date.today() would still report yesterday's date, either
+    # delaying a real celebration or holding yesterday's over too long.
+    today = datetime.now(IST).date()
     users = db.query(models.User).filter(models.User.employment_status == "Active").all()
     people_by_id = {}
     for u in users:
@@ -736,7 +741,7 @@ def reassign_order(
         raise HTTPException(status_code=400, detail="Not a valid colleague for this process")
 
     order.assigned_to_id = new_colleague.id
-    order.assigned_date = date.today()
+    order.assigned_date = datetime.now(IST).date()
     order.employee_id = new_colleague.employee_id or new_colleague.username
     order.employee_name = new_colleague.full_name
     order.last_edited_by = current_user.username
@@ -875,7 +880,9 @@ def import_inventory(
     content = file.file.read().decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(content))
     created_count = 0
-    today = date.today()
+    # IST, not the server's own (UTC) date — see todays_celebrations for
+    # why: near IST midnight the two disagree on which calendar day it is.
+    today = datetime.now(IST).date()
     for row in reader:
         order = models.WorkOrder(
             process_id=process_id,
@@ -974,7 +981,7 @@ def _auto_assign_open_slots(db: Session, process_id: int):
 
         if next_order:
             next_order.assigned_to_id = colleague.id
-            next_order.assigned_date = date.today()
+            next_order.assigned_date = datetime.now(IST).date()
             next_order.employee_id = colleague.employee_id or colleague.username
             next_order.employee_name = colleague.full_name
             next_order.posting_status = "In-Process"
@@ -1209,12 +1216,12 @@ def update_colleague_fields(
     # Auto-set Issue Raised Date the moment a colleague flags Clarification,
     # if it isn't already set.
     if order.posting_status == "Clarification" and not order.issue_raised_date:
-        order.issue_raised_date = date.today()
+        order.issue_raised_date = datetime.now(IST).date()
 
     # Auto-set Posted Date the moment a colleague marks Completed — no manual
     # entry needed, and it guarantees TAT can always be calculated below.
     if order.posting_status == "Completed" and not order.posted_date:
-        order.posted_date = date.today()
+        order.posted_date = datetime.now(IST).date()
 
     # Resolving a Clarification (moving to any other status) auto-stamps
     # Issue Closed Date, mirroring how Issue Raised Date auto-stamps on the
@@ -1222,7 +1229,7 @@ def update_colleague_fields(
     # NOT cleared anymore — they're kept as history so the TAT pause-window
     # calculation at Completion stays accurate.
     if previous_status == "Clarification" and order.posting_status != "Clarification" and not order.issue_closed_date:
-        order.issue_closed_date = date.today()
+        order.issue_closed_date = datetime.now(IST).date()
 
     # Pending $ = Amount - Posted $, recalculated any time either changes.
     if order.amount is not None:
