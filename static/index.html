@@ -47,6 +47,7 @@
   .celeb-card .celeb-name { font-weight: 600; color: var(--navy); }
   .celeb-card .celeb-tag { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 10px; color: white; white-space: nowrap; }
   .celeb-tag.birthday { background: #d6336c; }
+  .celeb-tag.work_anniversary { background: #1c7ed6; }
   .celeb-tag.anniversary { background: #2b8a3e; }
   .celeb-comment { font-size: 12px; color: #444; margin: 6px 0 0 0; padding: 5px 8px; background: #f4f4f6; border-radius: 4px; }
   .celeb-comment b { color: var(--navy); }
@@ -1491,7 +1492,12 @@ async function loadCelebrations() {
   let html = "";
   people.forEach(p => {
     const tags = p.occasions.map(o => {
-      const label = o.kind === "birthday" ? "🎂 Birthday" : `🎊 Anniversary${o.years ? " · " + o.years + " yr" + (o.years === 1 ? "" : "s") : ""}`;
+      const labels = {
+        birthday: "🎂 Birthday",
+        work_anniversary: `💼 Work Anniversary${o.years ? " · " + o.years + " yr" + (o.years === 1 ? "" : "s") : ""}`,
+        anniversary: `🎊 Anniversary${o.years ? " · " + o.years + " yr" + (o.years === 1 ? "" : "s") : ""}`,
+      };
+      const label = labels[o.kind] || o.kind;
       return `<span class="celeb-tag ${o.kind}">${label}</span>`;
     }).join("");
     html += `<div class="celeb-card">`;
@@ -1585,6 +1591,10 @@ async function loadProcessUpdates() {
     if (u.updated_at) {
       const editedWhen = new Date(u.updated_at).toLocaleString();
       html += `<div class="update-meta update-edited-meta">${isInactive ? "Marked Inactive" : "Last updated"} by ${u.updated_by_name} (${u.updated_by_role.replace("_", " ")}) · ${editedWhen}</div>`;
+    } else if (isInactive) {
+      // Never edited — it was posted as Inactive from the start, so the
+      // "who/when" is the original poster/timestamp, not an edit.
+      html += `<div class="update-meta update-edited-meta">Marked Inactive by ${u.posted_by_name} (${u.posted_by_role.replace("_", " ")}) · ${when}</div>`;
     }
     html += `</div>`;
   });
