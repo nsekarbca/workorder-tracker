@@ -70,6 +70,9 @@
   .update-item.update-inactive .update-message { color: #777; text-decoration: line-through; }
   .update-item.update-inactive:first-child { box-shadow: none; }
   .update-edited-meta { font-style: italic; }
+  .update-attachments { font-size: 12px; margin-top: 6px; }
+  .update-attachments a { color: var(--accent); text-decoration: none; }
+  .update-attachments a:hover { text-decoration: underline; }
   th.tl { background: var(--brown); color: white; }
   th.inv { background: var(--teal); color: white; }
   th.col { background: var(--purple); color: white; }
@@ -273,6 +276,9 @@
           </div>
           <label style="display:block; margin-top:10px;">Update Comment
             <textarea id="new-update-text" rows="2" style="width:100%; padding:6px; border:1px solid #ccc; border-radius:4px; font-family:inherit;" placeholder="What's the update..."></textarea>
+          </label>
+          <label style="display:block; margin-top:10px;">Attach Image(s)/Document(s) <span style="font-weight:normal; color:#888; font-size:11px;">(5 MB max each, 5 max per update)</span>
+            <input type="file" id="pu-attachments" multiple style="display:block; margin-top:4px;">
           </label>
           <button class="action-btn" id="pu-submit-btn" onclick="postProcessUpdate()" style="margin-top:8px;">Post Update</button>
           <button class="action-btn" id="pu-cancel-btn" style="margin-top:8px; display:none; background:#888;" onclick="cancelEditProcessUpdate()">Cancel</button>
@@ -1614,9 +1620,29 @@ async function loadProcessUpdates() {
       // "who/when" is the original poster/timestamp, not an edit.
       html += `<div class="update-meta update-edited-meta">Marked Inactive by ${u.posted_by_name} (${u.posted_by_role.replace("_", " ")}) · ${when}</div>`;
     }
+    if (u.attachments && u.attachments.length) {
+      html += `<div class="update-attachments">📎 `;
+      html += u.attachments.map(a =>
+        `<a href="#" onclick="viewAttachment(${a.id}, '${a.file_name.replace(/'/g, "\\'")}'); return false;">${a.file_name}</a>`
+      ).join(", ");
+      html += `</div>`;
+    }
     html += `</div>`;
   });
   container.innerHTML = html;
+}
+
+async function viewAttachment(attachmentId, fileName) {
+  const res = await authFetch(`/process-updates/attachments/${attachmentId}`);
+  if (!res.ok) {
+    alert("Couldn't load attachment: " + (await res.text()));
+    return;
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  window.open(url, "_blank");
+  // Give the new tab a moment to actually load the blob before revoking.
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
 }
 
 function renderProcessChecklist() {
@@ -1667,6 +1693,7 @@ function cancelEditProcessUpdate() {
   document.getElementById("pu-category").value = "";
   document.getElementById("pu-status").value = "Active";
   document.getElementById("pu-verified-by").value = "";
+  document.getElementById("pu-attachments").value = "";
   document.getElementById("pu-process-list").style.display = "flex";
   document.getElementById("pu-form-heading").textContent = "New Update";
   document.getElementById("pu-submit-btn").textContent = "Post Update";
@@ -1688,13 +1715,14 @@ async function postProcessUpdate() {
     verified_by: document.getElementById("pu-verified-by").value.trim() || null,
   };
 
-  let res;
+  let res, targetUpdateIds;
   if (editingUpdateId) {
     res = await authFetch(`/process-updates/${editingUpdateId}`, {
       method: "PATCH",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify(fields)
     });
+    targetUpdateIds = [editingUpdateId];
   } else {
     let processIds;
     const checkboxes = document.querySelectorAll(".pu-process-cb");
@@ -1712,12 +1740,32 @@ async function postProcessUpdate() {
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify(Object.assign({process_ids: processIds}, fields))
     });
+    if (res.ok) {
+      const createdUpdates = await res.json();
+      targetUpdateIds = createdUpdates.map(u => u.id);
+    }
   }
 
   if (!res.ok) {
     alert("Couldn't save update: " + (await res.text()));
     return;
   }
+
+  const fileInput = document.getElementById("pu-attachments");
+  if (fileInput.files.length && targetUpdateIds) {
+    for (const updateId of targetUpdateIds) {
+      const formData = new FormData();
+      Array.from(fileInput.files).forEach(f => formData.append("files", f));
+      const uploadRes = await authFetch(`/process-updates/${updateId}/attachments`, {
+        method: "POST",
+        body: formData,
+      });
+      if (!uploadRes.ok) {
+        alert("Update saved, but attachment upload failed: " + (await uploadRes.text()));
+      }
+    }
+  }
+
   cancelEditProcessUpdate();
   loadProcessUpdates();
 }
