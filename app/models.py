@@ -39,11 +39,17 @@ class CelebrationComment(Base):
     A comment left on a colleague's birthday/work-anniversary entry on the
     org-wide 'Today's Celebrations' section. Open to any logged-in user,
     regardless of process — this is a social feature, not process data.
+    occasion_date scopes the comment to the specific calendar day it was
+    posted on: without it, a comment from last year's birthday would keep
+    resurfacing every later date that person shows up for (their work
+    anniversary, next year's birthday, etc.), since it's otherwise only
+    tied to the person, not to which celebration it was actually for.
     """
     __tablename__ = "celebration_comments"
 
     id = Column(Integer, primary_key=True, index=True)
     target_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    occasion_date = Column(Date, nullable=True)
     message = Column(String, nullable=False)
     posted_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     posted_by_name = Column(String, nullable=False)

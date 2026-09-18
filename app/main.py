@@ -463,7 +463,10 @@ def todays_celebrations(
     target_ids = list(people_by_id.keys())
     comments = (
         db.query(models.CelebrationComment)
-        .filter(models.CelebrationComment.target_user_id.in_(target_ids))
+        .filter(
+            models.CelebrationComment.target_user_id.in_(target_ids),
+            models.CelebrationComment.occasion_date == today,
+        )
         .order_by(models.CelebrationComment.created_at.asc())
         .all()
     )
@@ -517,6 +520,7 @@ def add_celebration_comment(
         raise HTTPException(status_code=404, detail="User not found")
     comment = models.CelebrationComment(
         target_user_id=target_user_id,
+        occasion_date=datetime.now(IST).date(),
         message=message,
         posted_by_id=current_user.id,
         posted_by_name=current_user.full_name,
