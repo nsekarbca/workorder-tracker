@@ -433,19 +433,22 @@ def todays_celebrations(
         occasions = []
         if u.dob and u.dob.month == today.month and u.dob.day == today.day:
             occasions.append({"kind": "birthday", "years": None})
-        # Work anniversary: prefer an explicitly-set anniversary_date if
-        # present, otherwise fall back to Date of Joining — every active
-        # user has a doj, but anniversary_date is rarely filled in
-        # separately, so relying on it alone was hiding most anniversaries.
-        anniv_source = u.anniversary_date or u.doj
-        if anniv_source and anniv_source.month == today.month and anniv_source.day == today.day:
-            years = today.year - anniv_source.year
+        # Work anniversary (Date of Joining) and Anniversary Date are two
+        # independent fields — check each on its own rather than one
+        # falling back to the other, so both can show (as separate badges
+        # on the same merged card) if they land on the same day.
+        if u.doj and u.doj.month == today.month and u.doj.day == today.day:
+            years = today.year - u.doj.year
+            occasions.append({"kind": "work_anniversary", "years": years if years > 0 else None})
+        if u.anniversary_date and u.anniversary_date.month == today.month and u.anniversary_date.day == today.day:
+            years = today.year - u.anniversary_date.year
             occasions.append({"kind": "anniversary", "years": years if years > 0 else None})
         if occasions:
-            # A birthday and work anniversary can legitimately land on the
-            # same day for one person — one card, both occasion tags, one
-            # shared comment thread, instead of two duplicate cards with
-            # the same comments/reactions showing under each.
+            # A birthday and one or more anniversaries can legitimately
+            # land on the same day for one person — one card, all
+            # occasion tags together, one shared comment thread, instead
+            # of duplicate cards with the same comments/reactions
+            # showing under each.
             people_by_id[u.id] = {"user_id": u.id, "full_name": u.full_name, "occasions": occasions}
 
     if not people_by_id:
