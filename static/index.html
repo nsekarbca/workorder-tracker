@@ -1367,11 +1367,7 @@ function renderProductionGrid(orders) {
     html += "<tr>";
     COLUMNS.forEach(c => {
       const val = o[c.k] ?? "";
-      if (c.k === "created") {
-        html += `<td>${formatIST(val)}</td>`;
-      } else {
-        html += `<td>${c.currency ? formatCurrency(val) : val}</td>`;
-      }
+      html += `<td>${c.currency ? formatCurrency(val) : val}</td>`;
     });
     html += `<td>${formatIST(o.submitted_at)}</td>`;
     html += "</tr>";
@@ -1393,7 +1389,7 @@ function exportProductionCSV() {
   const keys = COLUMNS.map(c => c.k).concat(["submitted_at"]);
   const rows = currentProduction.map(o =>
     keys.map(k => {
-      let v = (k === "created" || k === "submitted_at") ? formatIST(o[k]) : (o[k] ?? "");
+      let v = (k === "submitted_at") ? formatIST(o[k]) : (o[k] ?? "");
       v = String(v).replace(/"/g, '""');
       return `"${v}"`;
     }).join(",")
@@ -1884,11 +1880,6 @@ function renderGrid(orders) {
         } else {
           html += `<td>${rawVal}</td>`;
         }
-        return;
-      }
-
-      if (c.k === "created") {
-        html += `<td>${formatIST(rawVal)}</td>`;
         return;
       }
 
