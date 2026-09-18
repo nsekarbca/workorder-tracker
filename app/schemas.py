@@ -42,6 +42,16 @@ class CelebrationPerson(BaseModel):
     comments: List[CelebrationCommentOut] = []
 
 
+class ProcessUpdateAttachmentOut(BaseModel):
+    id: int
+    file_name: str
+    content_type: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class ProcessUpdateOut(BaseModel):
     id: int
     process_id: int
@@ -58,6 +68,7 @@ class ProcessUpdateOut(BaseModel):
     updated_at: Optional[datetime] = None
     updated_by_name: Optional[str] = None
     updated_by_role: Optional[str] = None
+    attachments: List[ProcessUpdateAttachmentOut] = []
 
     class Config:
         from_attributes = True

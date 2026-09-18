@@ -3,7 +3,7 @@ from typing import List, Optional
 from dateutil import parser as date_parser
 import secrets
 
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_
 import csv
 import io
+import base64
 
 import os
 
@@ -675,6 +676,91 @@ def edit_process_update(
     db.commit()
     db.refresh(update)
     return update
+
+
+MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024  # 5 MB per file
+MAX_ATTACHMENTS_PER_UPDATE = 5
+
+
+@app.post("/process-updates/{update_id}/attachments", response_model=List[schemas.ProcessUpdateAttachmentOut])
+def upload_process_update_attachments(
+    update_id: int,
+    files: List[UploadFile] = File(...),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    Attaches one or more images/documents to an existing Process Update.
+    Stored inline as base64 (see ProcessUpdateAttachment) since there's no
+    object storage configured — capped in size and count to keep that
+    reasonable.
+    """
+    update = db.query(models.ProcessUpdate).filter(models.ProcessUpdate.id == update_id).first()
+    if not update:
+        raise HTTPException(status_code=404, detail="Update not found")
+    _require_process_access(current_user, update.process_id)
+
+    existing_count = (
+        db.query(models.ProcessUpdateAttachment)
+        .filter(models.ProcessUpdateAttachment.process_update_id == update_id)
+        .count()
+    )
+    if existing_count + len(files) > MAX_ATTACHMENTS_PER_UPDATE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Max {MAX_ATTACHMENTS_PER_UPDATE} attachments per update ({existing_count} already there)",
+        )
+
+    created = []
+    for f in files:
+        content = f.file.read()
+        if len(content) > MAX_ATTACHMENT_BYTES:
+            raise HTTPException(status_code=400, detail=f"{f.filename} is over the 5 MB limit")
+        attachment = models.ProcessUpdateAttachment(
+            process_update_id=update_id,
+            file_name=f.filename,
+            content_type=f.content_type,
+            file_data=base64.b64encode(content).decode("ascii"),
+            uploaded_by_name=current_user.full_name,
+        )
+        db.add(attachment)
+        created.append(attachment)
+    db.commit()
+    for a in created:
+        db.refresh(a)
+    return created
+
+
+@app.get("/process-updates/attachments/{attachment_id}")
+def get_process_update_attachment(
+    attachment_id: int,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Serves the raw file so the frontend can open/download it. Requires the
+    same Bearer auth as everything else, so the frontend fetches this as a
+    blob (via authFetch) rather than linking to it directly — a plain
+    anchor click wouldn't carry the Authorization header.
+    """
+    attachment = (
+        db.query(models.ProcessUpdateAttachment)
+        .filter(models.ProcessUpdateAttachment.id == attachment_id)
+        .first()
+    )
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    update = db.query(models.ProcessUpdate).filter(models.ProcessUpdate.id == attachment.process_update_id).first()
+    if not update:
+        raise HTTPException(status_code=404, detail="Update not found")
+    _require_process_access(current_user, update.process_id)
+
+    content = base64.b64decode(attachment.file_data)
+    return Response(
+        content=content,
+        media_type=attachment.content_type or "application/octet-stream",
+        headers={"Content-Disposition": f'inline; filename="{attachment.file_name}"'},
+    )
 
 
 @app.get("/users/colleagues", response_model=List[schemas.UserOut])

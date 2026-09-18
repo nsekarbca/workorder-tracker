@@ -102,6 +102,33 @@ class ProcessUpdate(Base):
     updated_by_name = Column(String, nullable=True)
     updated_by_role = Column(String, nullable=True)
 
+    attachments = relationship(
+        "ProcessUpdateAttachment",
+        order_by="ProcessUpdateAttachment.created_at",
+        cascade="all, delete-orphan",
+    )
+
+
+class ProcessUpdateAttachment(Base):
+    """
+    An image or document attached to a Process Update. Stored inline as
+    base64 in Postgres — there's no separate object storage (S3, Supabase
+    Storage, etc.) configured for this app, so this keeps things working
+    with zero extra setup. Capped at 5 MB/file and 5 files/update (enforced
+    in the upload endpoint) to keep that reasonable; if attachments end up
+    being used heavily, moving this to real object storage would be worth
+    revisiting.
+    """
+    __tablename__ = "process_update_attachments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    process_update_id = Column(Integer, ForeignKey("process_updates.id"), nullable=False)
+    file_name = Column(String, nullable=False)
+    content_type = Column(String, nullable=True)
+    file_data = Column(String, nullable=False)  # base64-encoded file bytes
+    uploaded_by_name = Column(String, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+
 
 class AppSetting(Base):
     """Simple key-value store for admin-configurable settings, e.g. the
