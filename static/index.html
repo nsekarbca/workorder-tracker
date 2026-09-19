@@ -38,7 +38,8 @@
   table { border-collapse: separate; border-spacing: 0; width: 100%; background: white; font-size: 12px; }
   th, td { border-right: 1px solid #ddd; border-bottom: 1px solid #ddd; padding: 6px 8px; text-align: left; white-space: nowrap; }
   th:first-child, td:first-child { border-left: 1px solid #ddd; }
-  thead th { border-top: 1px solid #ddd; position: sticky; top: var(--sticky-offset, 0px); z-index: 2; background: var(--navy); color: white; }
+  thead th { border-top: 1px solid #ddd; position: sticky; top: 0; z-index: 2; background: var(--navy); color: white; }
+  #grid-container { max-height: calc(100vh - var(--sticky-offset, 140px) - 20px); overflow: auto; }
   #sticky-top { position: sticky; top: 0; z-index: 30; background: #f4f4f6; box-shadow: 0 2px 4px rgba(0,0,0,.06); }
   .dashboard-columns { display: flex; gap: 14px; align-items: flex-start; margin-bottom: 14px; }
   .dashboard-columns > div { flex: 1 1 380px; min-width: 0; background: white; border-radius: 8px; padding: 14px; box-shadow: 0 1px 4px rgba(0,0,0,.06); }
