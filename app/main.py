@@ -1190,6 +1190,31 @@ def list_production_orders(
     return query.order_by(models.WorkOrder.posted_date.asc(), models.WorkOrder.id.asc()).all()
 
 
+@app.get("/orders/escalations", response_model=List[schemas.WorkOrderOut])
+def list_escalations(
+    process_id: int,
+    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    Rows currently locked awaiting a Team Lead's resolution — a Team Lead
+    sees only their own team's escalations; a Super Admin sees every
+    escalation in the process. Registered before /orders/{order_id} on
+    purpose: FastAPI matches routes in registration order, so a literal
+    path like this one has to come before a dynamic {order_id}: int path
+    or "escalations" gets swallowed as an attempted (and invalid) order_id.
+    """
+    _require_process_access(current_user, process_id)
+    query = db.query(models.WorkOrder).filter(
+        models.WorkOrder.process_id == process_id,
+        models.WorkOrder.escalated == True,  # noqa: E712
+        models.WorkOrder.submitted == False,  # noqa: E712
+    )
+    if current_user.role == "team_lead":
+        query = query.filter(models.WorkOrder.team_lead_id == current_user.id)
+    return query.order_by(models.WorkOrder.issue_raised_date.asc()).all()
+
+
 @app.get("/orders/{order_id}", response_model=schemas.WorkOrderOut)
 def get_order(order_id: int, current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
     order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
@@ -1467,28 +1492,6 @@ def correct_completed_order(
     db.commit()
     db.refresh(order)
     return order
-
-
-@app.get("/orders/escalations", response_model=List[schemas.WorkOrderOut])
-def list_escalations(
-    process_id: int,
-    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
-    db: Session = Depends(get_db),
-):
-    """
-    Rows currently locked awaiting a Team Lead's resolution — a Team Lead
-    sees only their own team's escalations; a Super Admin sees every
-    escalation in the process.
-    """
-    _require_process_access(current_user, process_id)
-    query = db.query(models.WorkOrder).filter(
-        models.WorkOrder.process_id == process_id,
-        models.WorkOrder.escalated == True,  # noqa: E712
-        models.WorkOrder.submitted == False,  # noqa: E712
-    )
-    if current_user.role == "team_lead":
-        query = query.filter(models.WorkOrder.team_lead_id == current_user.id)
-    return query.order_by(models.WorkOrder.issue_raised_date.asc()).all()
 
 
 @app.patch("/orders/{order_id}/resolve-escalation", response_model=schemas.WorkOrderOut)
