@@ -125,6 +125,7 @@ class UserOut(BaseModel):
     full_name: str
     role: str
     email: Optional[str] = None
+    employee_id: Optional[str] = None
     dob: Optional[date] = None
     doj: Optional[date] = None
     anniversary_date: Optional[date] = None
@@ -192,6 +193,30 @@ class CreateUserResponse(BaseModel):
 class ResetPasswordResponse(BaseModel):
     username: str
     temporary_password: str
+
+
+class ClarificationDetailOut(BaseModel):
+    order_id: int
+    deposit_type: Optional[str] = None
+    exchange: Optional[str] = None
+    era_check: Optional[str] = None
+    edm_batch_number: Optional[str] = None
+    bar_batch_number: Optional[str] = None
+    batch_description: Optional[str] = None
+    escalation_type: Optional[str] = None
+    clarification_details: Optional[str] = None
+    team: Optional[str] = None
+    poster_login: Optional[str] = None
+    amount_posted: Optional[str] = None
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ClarificationDetailSave(BaseModel):
+    escalation_type: Optional[str] = None
+    clarification_details: Optional[str] = None
 
 
 class ReassignRequest(BaseModel):

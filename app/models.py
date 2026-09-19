@@ -130,6 +130,37 @@ class ProcessUpdateAttachment(Base):
     created_at = Column(DateTime, server_default=func.now())
 
 
+class ClarificationDetail(Base):
+    """
+    The extra structured detail captured when a colleague sets an order's
+    Escalation Category to 'Clarification' — one row per order (upsert,
+    not append-only), filled via a popup rather than grid columns since
+    most of the app's users never touch it. Several fields are
+    auto-filled and not user-editable (deposit_type from the process
+    name, exchange/era_check/team are fixed constants, edm/bar batch
+    number, batch description and amount posted are copied from the
+    order itself) — only escalation_type and clarification_details are
+    actually typed in by the colleague.
+    """
+    __tablename__ = "clarification_details"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("work_orders.id"), nullable=False, unique=True)
+    deposit_type = Column(String, nullable=True)  # process name, e.g. "EDM"
+    exchange = Column(String, nullable=True, default="-")
+    era_check = Column(String, nullable=True, default="-")
+    edm_batch_number = Column(String, nullable=True)
+    bar_batch_number = Column(String, nullable=True)
+    batch_description = Column(String, nullable=True)
+    escalation_type = Column(String, nullable=True)  # e.g. "Duplicate", "Images", ...
+    clarification_details = Column(String, nullable=True)  # free text, manual input
+    team = Column(String, nullable=True, default="CBE")
+    poster_login = Column(String, nullable=True)  # full name of whoever filled this in
+    amount_posted = Column(String, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, nullable=True)
+
+
 class AppSetting(Base):
     """Simple key-value store for admin-configurable settings, e.g. the
     inactivity session timeout. Not tied to any one user."""

@@ -1444,7 +1444,94 @@ def correct_completed_order(
     return order
 
 
-def _count_business_days(start: date, end: date) -> int:
+ESCALATION_TYPES = (
+    "Duplicate", "Images", "Pending Generic Account",
+    "Out of Balance/Posting Clarification", "Lockbox - Posting Variance",
+    "PO Box - Posting Variance", "Pulled/Logged from ORM - OOB",
+    "Not a Client Payment", "Client File Name Issue", "Insurance CC",
+    "Not in Batch Division", "Withhold Fee",
+)
+
+
+def _require_clarification_access(current_user: models.User, order: models.WorkOrder):
+    """Same actors who can touch escalation_category on a row: the
+    colleague it's assigned to, or a Team Lead/Super Admin with access
+    to its process."""
+    if current_user.role == "colleague":
+        if order.assigned_to_id != current_user.id:
+            raise HTTPException(status_code=403, detail="This order is not assigned to you")
+    else:
+        _require_process_access(current_user, order.process_id)
+
+
+@app.get("/orders/{order_id}/clarification-detail", response_model=Optional[schemas.ClarificationDetailOut])
+def get_clarification_detail(
+    order_id: int,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    _require_clarification_access(current_user, order)
+    return (
+        db.query(models.ClarificationDetail)
+        .filter(models.ClarificationDetail.order_id == order_id)
+        .first()
+    )
+
+
+@app.put("/orders/{order_id}/clarification-detail", response_model=schemas.ClarificationDetailOut)
+def save_clarification_detail(
+    order_id: int,
+    payload: schemas.ClarificationDetailSave,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Creates or updates the Clarification popup's detail record for one
+    order. Only escalation_type and clarification_details come from the
+    person filling it in — everything else (deposit_type, exchange,
+    era_check, batch numbers, description, team, poster_login, amount
+    posted) is derived here from the order/process/current user, never
+    trusted from the client, since the form presents those as fixed/
+    read-only.
+    """
+    order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    _require_clarification_access(current_user, order)
+
+    if payload.escalation_type and payload.escalation_type not in ESCALATION_TYPES:
+        raise HTTPException(status_code=400, detail=f"escalation_type must be one of {ESCALATION_TYPES}")
+
+    process = db.query(models.Process).filter(models.Process.id == order.process_id).first()
+
+    detail = (
+        db.query(models.ClarificationDetail)
+        .filter(models.ClarificationDetail.order_id == order_id)
+        .first()
+    )
+    if not detail:
+        detail = models.ClarificationDetail(order_id=order_id)
+        db.add(detail)
+
+    detail.deposit_type = process.name if process else None
+    detail.exchange = "-"
+    detail.era_check = "-"
+    detail.edm_batch_number = order.edm
+    detail.bar_batch_number = order.bar_batch
+    detail.batch_description = order.description
+    detail.team = "CBE"
+    detail.poster_login = current_user.full_name
+    detail.amount_posted = str(order.posted_amount) if order.posted_amount is not None else None
+    detail.escalation_type = payload.escalation_type
+    detail.clarification_details = payload.clarification_details
+    detail.updated_at = datetime.now(IST)
+
+    db.commit()
+    db.refresh(detail)
+    return detail
     """Counts weekdays (Mon-Fri) strictly after `start` up to and including `end`."""
     if not start or not end or end <= start:
         return 0
