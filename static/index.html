@@ -35,9 +35,10 @@
   #forgot-link, #forgot-back-link { display: block; margin-top: 4px; font-size: 12px; color: var(--accent); cursor: pointer; text-decoration: underline; }
   #forgot-screen label { display: block; font-size: 13px; margin-top: 6px; }
   #app { display: none; padding: 16px; }
-  table { border-collapse: collapse; width: 100%; background: white; font-size: 12px; }
-  th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; white-space: nowrap; }
-  thead th { position: sticky; top: var(--sticky-offset, 0px); z-index: 2; background: var(--navy); color: white; }
+  table { border-collapse: separate; border-spacing: 0; width: 100%; background: white; font-size: 12px; }
+  th, td { border-right: 1px solid #ddd; border-bottom: 1px solid #ddd; padding: 6px 8px; text-align: left; white-space: nowrap; }
+  th:first-child, td:first-child { border-left: 1px solid #ddd; }
+  thead th { border-top: 1px solid #ddd; position: sticky; top: var(--sticky-offset, 0px); z-index: 2; background: var(--navy); color: white; }
   #sticky-top { position: sticky; top: 0; z-index: 30; background: #f4f4f6; box-shadow: 0 2px 4px rgba(0,0,0,.06); }
   .dashboard-columns { display: flex; gap: 14px; align-items: flex-start; margin-bottom: 14px; }
   .dashboard-columns > div { flex: 1 1 380px; min-width: 0; background: white; border-radius: 8px; padding: 14px; box-shadow: 0 1px 4px rgba(0,0,0,.06); }
@@ -79,6 +80,8 @@
   th.tat { background: var(--green); color: white; }
   tr:nth-child(even) { background: #fafafa; }
   input.cell-edit { width: 90px; font-size: 12px; padding: 2px 4px; }
+  .clarification-link { font-size: 11px; margin-left: 4px; white-space: nowrap; }
+  textarea.cell-comment { width: 200px; min-height: 32px; font-size: 12px; padding: 3px 5px; font-family: inherit; white-space: normal; resize: vertical; }
   #toolbar { margin-bottom: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
   .badge { background: #eee; color: #222; padding: 4px 10px; border-radius: 12px; font-size: 12px; }
   .process-badge { background: var(--accent); color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; }
@@ -349,6 +352,34 @@
   </div>
 </div>
 
+<div id="clarification-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:100; align-items:center; justify-content:center;">
+  <div style="background:white; border-radius:8px; padding:20px; width:520px; max-width:92vw; max-height:88vh; overflow-y:auto;">
+    <h3 style="margin-top:0;">Clarification Details</h3>
+    <div class="form-grid">
+      <label>Deposit Type <input id="cd-deposit-type" disabled></label>
+      <label>Exchange <input id="cd-exchange" disabled></label>
+      <label>ERA Check # <input id="cd-era-check" disabled></label>
+      <label>Team <input id="cd-team" disabled></label>
+      <label>EDM Batch Number <input id="cd-edm-batch" disabled></label>
+      <label>BAR Batch Number <input id="cd-bar-batch" disabled></label>
+      <label>Poster Login <input id="cd-poster-login" disabled></label>
+      <label>Amount Posted <input id="cd-amount-posted" disabled></label>
+    </div>
+    <label style="display:block; margin-top:10px;">Batch Description <input id="cd-batch-description" disabled style="width:100%;"></label>
+    <label style="display:block; margin-top:10px;">Escalation Type
+      <select id="cd-escalation-type" style="width:100%;">
+        <option value="">—</option>
+      </select>
+    </label>
+    <label style="display:block; margin-top:10px;">Clarification Details
+      <textarea id="cd-clarification-details" rows="3" style="width:100%; padding:6px; border:1px solid #ccc; border-radius:4px; font-family:inherit;"></textarea>
+    </label>
+    <div style="margin-top:14px;">
+      <button class="action-btn" onclick="saveClarificationDetail()">Save</button>
+      <button class="action-btn" style="background:#888;" onclick="closeClarificationModal()">Cancel</button>
+    </div>
+  </div>
+</div>
 
 <script>
 const API = "";
@@ -397,7 +428,14 @@ const COL_FIELDS = ["posted_amount","bar_batch","trans_count","posting_status",
 const CLARIFICATION_ONLY_FIELDS = ["poster_comment","escalation_category","issue_raised_date"];
 const HIDDEN_FOR_COLLEAGUE = ["received_date","assigned_date","employee_id","employee_name"];
 const POSTING_STATUS_OPTIONS = ["In-Process", "Clarification", "Completed"];
-const ESCALATION_OPTIONS = ["Patient not found", "DUVA Verification", "EOB not found", "Invoice Creation", "Other"];
+const ESCALATION_OPTIONS = ["Patient not found", "DUVA Verification", "EOB not found", "Invoice Creation", "Clarification"];
+const ESCALATION_TYPES = [
+  "Duplicate", "Images", "Pending Generic Account",
+  "Out of Balance/Posting Clarification", "Lockbox - Posting Variance",
+  "PO Box - Posting Variance", "Pulled/Logged from ORM - OOB",
+  "Not a Client Payment", "Client File Name Issue", "Insurance CC",
+  "Not in Batch Division", "Withhold Fee",
+];
 
 function isLeadRole() { return role === "team_lead" || role === "super_admin"; }
 
@@ -1908,17 +1946,21 @@ function renderGrid(orders) {
       }
 
       if (c.k === "escalation_category" && (role === "colleague" || isLeadRole())) {
-        html += `<td><select class="cell-edit" data-id="${o.id}" data-field="escalation_category" onchange="updateDraft(this)" ${editable ? "" : "disabled"}>`;
+        html += `<td><select class="cell-edit" data-id="${o.id}" data-field="escalation_category" onchange="updateDraft(this); onEscalationCategoryChange(this, ${o.id});" ${editable ? "" : "disabled"}>`;
         html += `<option value=""></option>`;
         ESCALATION_OPTIONS.forEach(opt => {
           html += `<option value="${opt}" ${opt === rawVal ? "selected" : ""}>${opt}</option>`;
         });
-        html += `</select></td>`;
+        html += `</select>`;
+        if (rawVal === "Clarification") {
+          html += ` <a href="#" class="clarification-link" onclick="openClarificationModal(${o.id}); return false;">📋 Details</a>`;
+        }
+        html += `</td>`;
         return;
       }
 
       if ((c.k === "poster_comment" || c.k === "ventra_comment") && (role === "colleague" || isLeadRole())) {
-        html += `<td><input class="cell-edit" data-id="${o.id}" data-field="${c.k}" value="${rawVal}" onchange="updateDraft(this)" ${editable ? "" : "disabled"}></td>`;
+        html += `<td><textarea class="cell-edit cell-comment" data-id="${o.id}" data-field="${c.k}" onchange="updateDraft(this)" ${editable ? "" : "disabled"}>${rawVal}</textarea></td>`;
         return;
       }
 
@@ -1975,6 +2017,83 @@ function renderGrid(orders) {
   });
   html += "</tbody></table>";
   document.getElementById("grid-container").innerHTML = html || "<p>No orders.</p>";
+}
+
+// ---------------------------------------------------------------------
+// Clarification Details popup (Escalation Category = "Clarification")
+// ---------------------------------------------------------------------
+
+let clarificationOrderId = null;
+
+function onEscalationCategoryChange(selectEl, orderId) {
+  if (selectEl.value === "Clarification") {
+    openClarificationModal(orderId);
+  }
+}
+
+async function openClarificationModal(orderId) {
+  clarificationOrderId = orderId;
+  const order = currentOrders.find(o => o.id === orderId);
+  if (!order) return;
+
+  const typeSelect = document.getElementById("cd-escalation-type");
+  if (typeSelect.options.length <= 1) {
+    ESCALATION_TYPES.forEach(t => {
+      const opt = document.createElement("option");
+      opt.value = t; opt.textContent = t;
+      typeSelect.appendChild(opt);
+    });
+  }
+
+  // Auto-filled/read-only fields — a preview of what the backend will
+  // compute authoritatively on save (it never trusts these from the
+  // client, so this is just so the person filling it in can see them).
+  const proc = myProcesses.find(p => p.id === currentProcessId);
+  document.getElementById("cd-deposit-type").value = proc ? proc.name : "";
+  document.getElementById("cd-exchange").value = "-";
+  document.getElementById("cd-era-check").value = "-";
+  document.getElementById("cd-team").value = "CBE";
+  document.getElementById("cd-edm-batch").value = order.edm || "";
+  document.getElementById("cd-bar-batch").value = order.bar_batch || "";
+  document.getElementById("cd-poster-login").value = fullName;
+  document.getElementById("cd-amount-posted").value = order.posted_amount ?? "";
+  document.getElementById("cd-batch-description").value = order.description || "";
+  document.getElementById("cd-escalation-type").value = "";
+  document.getElementById("cd-clarification-details").value = "";
+
+  const res = await authFetch(`/orders/${orderId}/clarification-detail`);
+  if (res.ok) {
+    const detail = await res.json();
+    if (detail) {
+      document.getElementById("cd-escalation-type").value = detail.escalation_type || "";
+      document.getElementById("cd-clarification-details").value = detail.clarification_details || "";
+    }
+  }
+
+  document.getElementById("clarification-modal").style.display = "flex";
+}
+
+function closeClarificationModal() {
+  document.getElementById("clarification-modal").style.display = "none";
+  clarificationOrderId = null;
+}
+
+async function saveClarificationDetail() {
+  if (!clarificationOrderId) return;
+  const payload = {
+    escalation_type: document.getElementById("cd-escalation-type").value || null,
+    clarification_details: document.getElementById("cd-clarification-details").value.trim() || null,
+  };
+  const res = await authFetch(`/orders/${clarificationOrderId}/clarification-detail`, {
+    method: "PUT",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) {
+    alert("Couldn't save clarification details: " + (await res.text()));
+    return;
+  }
+  closeClarificationModal();
 }
 
 function updateDraft(input) {
