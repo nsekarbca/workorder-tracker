@@ -80,6 +80,7 @@
   th.tat { background: var(--green); color: white; }
   tr:nth-child(even) { background: #fafafa; }
   input.cell-edit { width: 90px; font-size: 12px; padding: 2px 4px; }
+  tr.row-escalated td { background: #fff3e0 !important; }
   .clarification-link { font-size: 11px; margin-left: 4px; white-space: nowrap; }
   textarea.cell-comment { width: 200px; min-height: 32px; font-size: 12px; padding: 3px 5px; font-family: inherit; white-space: normal; resize: vertical; }
   #toolbar { margin-bottom: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
@@ -171,6 +172,7 @@
         <button class="nav-menu-item" onclick="navTo('home')">🏠 Home</button>
         <button class="nav-menu-item" onclick="navTo('active')">📋 Active Queue</button>
         <button class="nav-menu-item" id="nav-production-btn" style="display:none;" onclick="navTo('production')">📦 Production</button>
+        <button class="nav-menu-item" id="nav-escalations-btn" style="display:none;" onclick="navTo('escalations')">🚨 Escalations</button>
         <button class="nav-menu-item" id="nav-admin-btn" style="display:none;" onclick="navTo('admin')">⚙️ Admin</button>
         <button class="nav-menu-item" id="nav-switch-process-btn" style="display:none;" onclick="navTo('switch')">🔀 Switch Process</button>
       </div>
@@ -372,7 +374,7 @@
       </select>
     </label>
     <label style="display:block; margin-top:10px;">Clarification Details
-      <textarea id="cd-clarification-details" rows="3" style="width:100%; padding:6px; border:1px solid #ccc; border-radius:4px; font-family:inherit;"></textarea>
+      <textarea id="cd-clarification-details" rows="3" disabled style="width:100%; padding:6px; border:1px solid #ccc; border-radius:4px; font-family:inherit; background:#eee;"></textarea>
     </label>
     <div style="margin-top:14px;">
       <button class="action-btn" onclick="saveClarificationDetail()">Save</button>
@@ -828,6 +830,7 @@ function showApp() {
     document.getElementById("clear-data-btn").style.display = "inline-block";
     document.getElementById("production-btn").style.display = "inline-block";
     document.getElementById("nav-production-btn").style.display = "block";
+    document.getElementById("nav-escalations-btn").style.display = "block";
     document.getElementById("import-file").addEventListener("change", importCSV);
     if (currentProcessId) loadColleagueList();
     if (role === "team_lead") {
@@ -874,6 +877,7 @@ function navTo(dest) {
   if (dest === "home") showHomeView();
   else if (dest === "active") showActiveView();
   else if (dest === "production") showProductionView();
+  else if (dest === "escalations") showEscalationsView();
   else if (dest === "admin") showAdminView();
   else if (dest === "switch") showProcessSwitcher();
 }
@@ -893,6 +897,85 @@ function showHomeView() {
   document.getElementById("grid-container").innerHTML = "";
   document.getElementById("dashboard-panel").style.display = "flex";
   loadDashboard();
+}
+
+// ---------------------------------------------------------------------
+// Escalations queue (Team Lead / Super Admin): Clarification rows a
+// colleague has handed off, awaiting a VENTRA Comment to resolve.
+// ---------------------------------------------------------------------
+
+let currentEscalations = [];
+
+async function showEscalationsView() {
+  viewMode = "escalations";
+  document.getElementById("toolbar").style.display = "none";
+  document.getElementById("production-bar").style.display = "none";
+  document.getElementById("dashboard-panel").style.display = "none";
+  shareMode = false;
+  selectedForShare.clear();
+  document.getElementById("share-bar").style.display = "none";
+  document.getElementById("admin-panel").style.display = "none";
+  await loadEscalations();
+}
+
+async function loadEscalations() {
+  if (!currentProcessId) return;
+  const container = document.getElementById("grid-container");
+  container.innerHTML = "<p>Loading\u2026</p>";
+  const res = await authFetch(withProcess("/orders/escalations"));
+  if (!res.ok) {
+    container.innerHTML = "<p>Couldn't load escalations.</p>";
+    return;
+  }
+  currentEscalations = await res.json();
+  renderEscalations(currentEscalations);
+}
+
+function renderEscalations(list) {
+  const container = document.getElementById("grid-container");
+  if (!list.length) {
+    container.innerHTML = "<p>No open escalations right now.</p>";
+    return;
+  }
+  let html = "<table><thead><tr>";
+  html += "<th>EDM</th><th>Employee</th><th>Poster Comment</th><th>Escalation Type</th><th>Clarification Details</th><th>Issue Raised Date</th><th>VENTRA Comment</th><th>Action</th>";
+  html += "</tr></thead><tbody>";
+  list.forEach(o => {
+    const detail = o.clarification_detail || {};
+    html += "<tr>";
+    html += `<td>${o.edm ?? ""}</td>`;
+    html += `<td>${o.employee_name ?? ""}</td>`;
+    html += `<td style="max-width:220px; white-space:normal;">${o.poster_comment ?? ""}</td>`;
+    html += `<td>${detail.escalation_type ?? ""}</td>`;
+    html += `<td style="max-width:220px; white-space:normal;">${detail.clarification_details ?? ""}</td>`;
+    html += `<td>${o.issue_raised_date ?? ""}</td>`;
+    html += `<td><textarea id="resolve-comment-${o.id}" rows="2" style="width:180px; font-family:inherit; padding:4px;"></textarea></td>`;
+    html += `<td><button class="action-btn" onclick="resolveEscalation(${o.id}, this)">Resolve</button></td>`;
+    html += "</tr>";
+  });
+  html += "</tbody></table>";
+  container.innerHTML = html;
+}
+
+async function resolveEscalation(orderId, btn) {
+  const textarea = document.getElementById(`resolve-comment-${orderId}`);
+  const comment = textarea.value.trim();
+  if (!comment) {
+    alert("Enter a VENTRA Comment to resolve this escalation.");
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = "Resolving\u2026"; }
+  const res = await authFetch(`/orders/${orderId}/resolve-escalation`, {
+    method: "PATCH",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ventra_comment: comment})
+  });
+  if (!res.ok) {
+    alert("Couldn't resolve: " + (await res.text()));
+    if (btn) { btn.disabled = false; btn.textContent = "Resolve"; }
+    return;
+  }
+  loadEscalations();
 }
 
 async function authFetch(path, opts={}) {
@@ -1917,12 +2000,13 @@ function renderGrid(orders) {
 
   orders.forEach(o => {
     const savedCompleted = o.posting_status === "Completed";
-    const locked = role === "colleague" && savedCompleted;
+    const isEscalated = o.escalated === true;
+    const locked = role === "colleague" && (savedCompleted || isEscalated);
     const tlCanCorrect = isLeadRole() && savedCompleted;
     const effStatus = effectiveValue(o, "posting_status");
     const hasDraft = drafts[o.id] && Object.keys(drafts[o.id]).length > 0;
 
-    html += `<tr>`;
+    html += `<tr${isEscalated ? ' class="row-escalated"' : ""}>`;
     if (shareMode) {
       const shareable = o.team_lead_id === myUserId && !savedCompleted;
       html += `<td>${shareable ? `<input type="checkbox" onchange="toggleShareRow(${o.id}, this.checked)" ${selectedForShare.has(o.id) ? "checked" : ""}>` : ""}</td>`;
@@ -1996,7 +2080,7 @@ function renderGrid(orders) {
 
     if (role === "colleague") {
       if (locked) {
-        html += `<td>Locked</td>`;
+        html += `<td>${isEscalated ? "🔒 Escalated" : "Locked"}</td>`;
       } else {
         html += `<td><button class="action-btn" onclick="saveRow(${o.id}, this)" ${hasDraft ? "" : "disabled"}>Save</button></td>`;
       }
@@ -2059,14 +2143,14 @@ async function openClarificationModal(orderId) {
   document.getElementById("cd-amount-posted").value = order.posted_amount ?? "";
   document.getElementById("cd-batch-description").value = order.description || "";
   document.getElementById("cd-escalation-type").value = "";
-  document.getElementById("cd-clarification-details").value = "";
+  document.getElementById("cd-clarification-details").value = order.poster_comment || "";
 
   const res = await authFetch(`/orders/${orderId}/clarification-detail`);
   if (res.ok) {
     const detail = await res.json();
     if (detail) {
       document.getElementById("cd-escalation-type").value = detail.escalation_type || "";
-      document.getElementById("cd-clarification-details").value = detail.clarification_details || "";
+      document.getElementById("cd-clarification-details").value = detail.clarification_details || order.poster_comment || "";
     }
   }
 
@@ -2082,7 +2166,6 @@ async function saveClarificationDetail() {
   if (!clarificationOrderId) return;
   const payload = {
     escalation_type: document.getElementById("cd-escalation-type").value || null,
-    clarification_details: document.getElementById("cd-clarification-details").value.trim() || null,
   };
   const res = await authFetch(`/orders/${clarificationOrderId}/clarification-detail`, {
     method: "PUT",
