@@ -1047,6 +1047,7 @@ def _auto_assign_open_slots(db: Session, process_id: int):
                 models.WorkOrder.process_id == process_id,
                 models.WorkOrder.assigned_to_id == colleague.id,
                 models.WorkOrder.posting_status != "Completed",
+                models.WorkOrder.escalated == False,  # noqa: E712
             )
             .first()
         )
@@ -1237,6 +1238,11 @@ def update_colleague_fields(
         raise HTTPException(status_code=403, detail="This order is not assigned to you")
     if order.posting_status == "Completed":
         raise HTTPException(status_code=403, detail="This order is completed and locked for further edits")
+    if order.escalated:
+        raise HTTPException(
+            status_code=403,
+            detail="This order is escalated to your Team Lead and locked until they resolve it",
+        )
 
     payload_data = payload.dict(exclude_unset=True)
     if "posting_status" in payload_data and payload_data["posting_status"] not in (
@@ -1321,6 +1327,25 @@ def update_colleague_fields(
     if previous_status == "Clarification" and order.posting_status != "Clarification" and not order.issue_closed_date:
         order.issue_closed_date = datetime.now(IST).date()
 
+    # Saving with Escalation Category = "Clarification" hands the row off
+    # to the Team Lead: it locks for the colleague (still visible, read-
+    # only) and, once committed, frees their one-open-order slot so they
+    # get handed new work instead of sitting idle waiting on a resolution.
+    # Requires the Clarification Details popup to have actually been
+    # completed (Escalation Type chosen) — otherwise nothing to hand off.
+    if order.posting_status == "Clarification" and order.escalation_category == "Clarification":
+        detail = (
+            db.query(models.ClarificationDetail)
+            .filter(models.ClarificationDetail.order_id == order.id)
+            .first()
+        )
+        if not detail or not detail.escalation_type:
+            raise HTTPException(
+                status_code=400,
+                detail="Fill in the Clarification Details popup (📋 Details) — choose an Escalation Type — before saving",
+            )
+        order.escalated = True
+
     # Pending $ = Amount - Posted $, recalculated any time either changes.
     if order.amount is not None:
         order.pending_amount = order.amount - (order.posted_amount or 0)
@@ -1357,7 +1382,7 @@ def update_colleague_fields(
     db.commit()
     db.refresh(order)
 
-    if order.posting_status == "Completed":
+    if order.posting_status == "Completed" or order.escalated:
         _auto_assign_open_slots(db, order.process_id)
 
     return order
@@ -1444,6 +1469,60 @@ def correct_completed_order(
     return order
 
 
+@app.get("/orders/escalations", response_model=List[schemas.WorkOrderOut])
+def list_escalations(
+    process_id: int,
+    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    Rows currently locked awaiting a Team Lead's resolution — a Team Lead
+    sees only their own team's escalations; a Super Admin sees every
+    escalation in the process.
+    """
+    _require_process_access(current_user, process_id)
+    query = db.query(models.WorkOrder).filter(
+        models.WorkOrder.process_id == process_id,
+        models.WorkOrder.escalated == True,  # noqa: E712
+        models.WorkOrder.submitted == False,  # noqa: E712
+    )
+    if current_user.role == "team_lead":
+        query = query.filter(models.WorkOrder.team_lead_id == current_user.id)
+    return query.order_by(models.WorkOrder.issue_raised_date.asc()).all()
+
+
+@app.patch("/orders/{order_id}/resolve-escalation", response_model=schemas.WorkOrderOut)
+def resolve_escalation(
+    order_id: int,
+    payload: schemas.EscalationResolve,
+    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    A Team Lead's VENTRA Comment resolves the escalation: it auto-stamps
+    Issue Closed Date and unlocks the row back to the colleague — Posting
+    Status stays 'Clarification' so they can finish posting it themselves.
+    """
+    order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    _require_process_access(current_user, order.process_id)
+    if not order.escalated:
+        raise HTTPException(status_code=400, detail="This order isn't currently escalated")
+
+    comment = payload.ventra_comment.strip()
+    if not comment:
+        raise HTTPException(status_code=400, detail="VENTRA Comment can't be empty")
+
+    order.ventra_comment = comment
+    order.issue_closed_date = datetime.now(IST).date()
+    order.escalated = False
+    order.last_edited_by = current_user.username
+    db.commit()
+    db.refresh(order)
+    return order
+
+
 ESCALATION_TYPES = (
     "Duplicate", "Images", "Pending Generic Account",
     "Out of Balance/Posting Clarification", "Lockbox - Posting Variance",
@@ -1490,12 +1569,12 @@ def save_clarification_detail(
 ):
     """
     Creates or updates the Clarification popup's detail record for one
-    order. Only escalation_type and clarification_details come from the
-    person filling it in — everything else (deposit_type, exchange,
-    era_check, batch numbers, description, team, poster_login, amount
-    posted) is derived here from the order/process/current user, never
-    trusted from the client, since the form presents those as fixed/
-    read-only.
+    order. Only escalation_type comes from the person filling it in —
+    everything else (deposit_type, exchange, era_check, batch numbers,
+    description, team, poster_login, amount posted, and now
+    clarification_details itself, copied from Poster Comment) is derived
+    here from the order/process/current user, never trusted from the
+    client, since the form presents those as fixed/read-only.
     """
     order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
     if not order:
@@ -1526,7 +1605,7 @@ def save_clarification_detail(
     detail.poster_login = current_user.full_name
     detail.amount_posted = str(order.posted_amount) if order.posted_amount is not None else None
     detail.escalation_type = payload.escalation_type
-    detail.clarification_details = payload.clarification_details
+    detail.clarification_details = order.poster_comment
     detail.updated_at = datetime.now(IST)
 
     db.commit()

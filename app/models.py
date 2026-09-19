@@ -267,4 +267,12 @@ class WorkOrder(Base):
     assigned_to_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     assignee = relationship("User", back_populates="orders", foreign_keys=[assigned_to_id])
 
+    # True while a Clarification escalation is sitting with the Team Lead
+    # awaiting their VENTRA Comment — locks the row from the colleague (it
+    # stays visible in their queue, read-only) and frees their one-open-
+    # order slot for a new assignment. Cleared back to False the moment the
+    # Team Lead resolves it, handing the row back to the colleague.
+    escalated = Column(Boolean, default=False, nullable=False)
+    clarification_detail = relationship("ClarificationDetail", uselist=False, cascade="all, delete-orphan")
+
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

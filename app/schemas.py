@@ -216,7 +216,6 @@ class ClarificationDetailOut(BaseModel):
 
 class ClarificationDetailSave(BaseModel):
     escalation_type: Optional[str] = None
-    clarification_details: Optional[str] = None
 
 
 class ReassignRequest(BaseModel):
@@ -319,6 +318,12 @@ class WorkOrderOut(BaseModel):
     assigned_to_id: Optional[int]
     submitted: bool
     submitted_at: Optional[datetime]
+    escalated: bool = False
+    clarification_detail: Optional[ClarificationDetailOut] = None
 
     class Config:
         from_attributes = True
+
+
+class EscalationResolve(BaseModel):
+    ventra_comment: str
