@@ -240,6 +240,9 @@
   </div>
 
   <div style="padding: 0 16px 16px 16px;">
+    <div id="under-construction-banner" style="display:none; background:#fff3cd; border:1px solid #ffe08a; color:#7a5c00; padding:14px 18px; border-radius:8px; margin-bottom:14px; font-size:14px;">
+      🚧 <strong>This process is under construction.</strong> Full functionality is still being rolled out here — some things may not work as expected yet.
+    </div>
     <div id="dashboard-panel" style="display:none;" class="dashboard-columns">
       <div id="celebrations-card">
         <h3 style="margin:0 0 10px;">🎉 Today's Celebrations</h3>
@@ -378,7 +381,7 @@
       <textarea id="cd-clarification-details" rows="3" disabled style="width:100%; padding:6px; border:1px solid #ccc; border-radius:4px; font-family:inherit; background:#eee;"></textarea>
     </label>
     <div style="margin-top:14px;">
-      <button class="action-btn" onclick="saveClarificationDetail()">Save</button>
+      <button class="action-btn" id="cd-save-btn" onclick="saveClarificationDetail()">Save</button>
       <button class="action-btn" style="background:#888;" onclick="closeClarificationModal()">Cancel</button>
     </div>
   </div>
@@ -897,6 +900,11 @@ function showHomeView() {
   document.getElementById("admin-panel").style.display = "none";
   document.getElementById("grid-container").innerHTML = "";
   document.getElementById("dashboard-panel").style.display = "flex";
+
+  const proc = myProcesses.find(p => p.id === currentProcessId);
+  document.getElementById("under-construction-banner").style.display =
+    (proc && proc.name !== "EDM") ? "block" : "none";
+
   loadDashboard();
 }
 
@@ -906,24 +914,33 @@ function showHomeView() {
 // ---------------------------------------------------------------------
 
 let currentEscalations = [];
+let escalationsTab = "open"; // "open" or "resolved"
 
 async function showEscalationsView() {
   viewMode = "escalations";
   document.getElementById("toolbar").style.display = "none";
   document.getElementById("production-bar").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
+  document.getElementById("under-construction-banner").style.display = "none";
   shareMode = false;
   selectedForShare.clear();
   document.getElementById("share-bar").style.display = "none";
   document.getElementById("admin-panel").style.display = "none";
+  escalationsTab = "open";
   await loadEscalations();
+}
+
+function switchEscalationsTab(tab) {
+  escalationsTab = tab;
+  loadEscalations();
 }
 
 async function loadEscalations() {
   if (!currentProcessId) return;
   const container = document.getElementById("grid-container");
   container.innerHTML = "<p>Loading\u2026</p>";
-  const res = await authFetch(withProcess("/orders/escalations"));
+  const resolved = escalationsTab === "resolved";
+  const res = await authFetch(withProcess("/orders/escalations") + `&resolved=${resolved}`);
   if (!res.ok) {
     container.innerHTML = "<p>Couldn't load escalations.</p>";
     return;
@@ -945,24 +962,39 @@ function _escalationCellValue(o, key) {
   return detail[key] ?? "";
 }
 
+function _escalationsTabBar() {
+  const openActive = escalationsTab === "open";
+  return `<div style="margin-bottom:10px; display:flex; gap:8px; align-items:center;">`
+    + `<button class="action-btn" style="${openActive ? "" : "background:#888;"}" onclick="switchEscalationsTab('open')">Open</button>`
+    + `<button class="action-btn" style="${openActive ? "background:#888;" : ""}" onclick="switchEscalationsTab('resolved')">Resolved</button>`
+    + `<button class="action-btn" onclick="exportEscalationsCSV()">Export CSV</button>`
+    + `</div>`;
+}
+
 function renderEscalations(list) {
   const container = document.getElementById("grid-container");
+  const resolved = escalationsTab === "resolved";
   if (!list.length) {
-    container.innerHTML = "<p>No open escalations right now.</p>";
+    container.innerHTML = _escalationsTabBar() + `<p>No ${resolved ? "resolved" : "open"} escalations right now.</p>`;
     return;
   }
-  let html = `<div style="margin-bottom:10px;"><button class="action-btn" onclick="exportEscalationsCSV()">Export CSV</button></div>`;
+  let html = _escalationsTabBar();
   html += "<table><thead><tr>";
   ESCALATION_COLUMNS.forEach(([, label]) => html += `<th>${label}</th>`);
-  html += "<th>VENTRA Comment</th><th>Action</th>";
+  html += resolved ? "<th>VENTRA Comment</th><th>Issue Closed Date</th>" : "<th>VENTRA Comment</th><th>Action</th>";
   html += "</tr></thead><tbody>";
   list.forEach(o => {
     html += "<tr>";
     ESCALATION_COLUMNS.forEach(([key]) => {
       html += `<td style="max-width:220px; white-space:normal;">${_escalationCellValue(o, key)}</td>`;
     });
-    html += `<td><textarea id="resolve-comment-${o.id}" rows="2" style="width:180px; font-family:inherit; padding:4px;"></textarea></td>`;
-    html += `<td><button class="action-btn" onclick="resolveEscalation(${o.id}, this)">Resolve</button></td>`;
+    if (resolved) {
+      html += `<td style="max-width:220px; white-space:normal;">${o.ventra_comment ?? ""}</td>`;
+      html += `<td>${o.issue_closed_date ?? ""}</td>`;
+    } else {
+      html += `<td><textarea id="resolve-comment-${o.id}" rows="2" style="width:180px; font-family:inherit; padding:4px;"></textarea></td>`;
+      html += `<td><button class="action-btn" onclick="resolveEscalation(${o.id}, this)">Resolve</button></td>`;
+    }
     html += "</tr>";
   });
   html += "</tbody></table>";
@@ -974,9 +1006,12 @@ function exportEscalationsCSV() {
     alert("Nothing to export.");
     return;
   }
-  const headers = ESCALATION_COLUMNS.map(([, label]) => label).concat(["VENTRA Comment"]);
+  const resolved = escalationsTab === "resolved";
+  const headers = ESCALATION_COLUMNS.map(([, label]) => label)
+    .concat(resolved ? ["VENTRA Comment", "Issue Closed Date"] : ["VENTRA Comment"]);
   const rows = currentEscalations.map(o => {
-    const cells = ESCALATION_COLUMNS.map(([key]) => _escalationCellValue(o, key)).concat([o.ventra_comment ?? ""]);
+    const cells = ESCALATION_COLUMNS.map(([key]) => _escalationCellValue(o, key))
+      .concat(resolved ? [o.ventra_comment ?? "", o.issue_closed_date ?? ""] : [o.ventra_comment ?? ""]);
     return cells.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",");
   });
   const csv = [headers.map(h => `"${h}"`).join(","), ...rows].join("\n");
@@ -984,7 +1019,7 @@ function exportEscalationsCSV() {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `escalations_${new Date().toISOString().slice(0, 10)}.csv`;
+  a.download = `escalations_${escalationsTab}_${new Date().toISOString().slice(0, 10)}.csv`;
   a.click();
   URL.revokeObjectURL(url);
 }
@@ -1031,6 +1066,7 @@ async function showAdminView() {
   document.getElementById("toolbar").style.display = "none";
   document.getElementById("production-bar").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
+  document.getElementById("under-construction-banner").style.display = "none";
   shareMode = false;
   selectedForShare.clear();
   document.getElementById("share-bar").style.display = "none";
@@ -1412,6 +1448,7 @@ async function showProductionView() {
   document.getElementById("toolbar").style.display = "none";
   document.getElementById("admin-panel").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
+  document.getElementById("under-construction-banner").style.display = "none";
   shareMode = false;
   selectedForShare.clear();
   document.getElementById("share-bar").style.display = "none";
@@ -1437,6 +1474,7 @@ function showActiveView() {
   document.getElementById("production-bar").style.display = "none";
   document.getElementById("admin-panel").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
+  document.getElementById("under-construction-banner").style.display = "none";
   loadOrders();
 }
 
@@ -1614,6 +1652,7 @@ async function loadOrders() {
   document.getElementById("toolbar").style.display = "flex";
   document.getElementById("production-bar").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
+  document.getElementById("under-construction-banner").style.display = "none";
   viewMode = "active";
   const res = await authFetch(withProcess("/orders"));
   currentOrders = await res.json();
@@ -2132,7 +2171,13 @@ function renderGrid(orders) {
     html += `</tr>`;
   });
   html += "</tbody></table>";
-  document.getElementById("grid-container").innerHTML = html || "<p>No orders.</p>";
+  let emptyMessage;
+  if (role === "colleague") {
+    emptyMessage = "<p style=\"font-size:14px;\">\ud83c\udf89 All caught up! There's no order currently assigned to you \u2014 you'll get one automatically as soon as new inventory comes in.</p>";
+  } else {
+    emptyMessage = "<p style=\"font-size:14px;\">No orders in this process's active queue right now. Import inventory or check back once new orders come in.</p>";
+  }
+  document.getElementById("grid-container").innerHTML = html || emptyMessage;
 }
 
 // ---------------------------------------------------------------------
@@ -2151,6 +2196,7 @@ async function openClarificationModal(orderId) {
   clarificationOrderId = orderId;
   const order = currentOrders.find(o => o.id === orderId);
   if (!order) return;
+  const draft = drafts[orderId] || {};
 
   const typeSelect = document.getElementById("cd-escalation-type");
   if (typeSelect.options.length <= 1) {
@@ -2164,27 +2210,37 @@ async function openClarificationModal(orderId) {
   // Auto-filled/read-only fields — a preview of what the backend will
   // compute authoritatively on save (it never trusts these from the
   // client, so this is just so the person filling it in can see them).
+  // Prefers whatever's currently typed into the row (even if not yet
+  // saved) over the last-saved value, so these show up-to-date before
+  // the row itself has been saved.
   const proc = myProcesses.find(p => p.id === currentProcessId);
   document.getElementById("cd-deposit-type").value = proc ? proc.name : "";
   document.getElementById("cd-exchange").value = "-";
   document.getElementById("cd-era-check").value = "-";
   document.getElementById("cd-team").value = "CBE";
   document.getElementById("cd-edm-batch").value = order.edm || "";
-  document.getElementById("cd-bar-batch").value = order.bar_batch || "";
+  document.getElementById("cd-bar-batch").value = (draft.bar_batch ?? order.bar_batch) || "";
   document.getElementById("cd-poster-login").value = fullName;
-  document.getElementById("cd-amount-posted").value = order.posted_amount ?? "";
+  document.getElementById("cd-amount-posted").value = (draft.posted_amount ?? order.posted_amount) ?? "";
   document.getElementById("cd-batch-description").value = order.description || "";
   document.getElementById("cd-escalation-type").value = "";
-  document.getElementById("cd-clarification-details").value = order.poster_comment || "";
+  document.getElementById("cd-clarification-details").value = (draft.poster_comment ?? order.poster_comment) || "";
 
   const res = await authFetch(`/orders/${orderId}/clarification-detail`);
   if (res.ok) {
     const detail = await res.json();
     if (detail) {
       document.getElementById("cd-escalation-type").value = detail.escalation_type || "";
-      document.getElementById("cd-clarification-details").value = detail.clarification_details || order.poster_comment || "";
+      document.getElementById("cd-clarification-details").value = detail.clarification_details || (draft.poster_comment ?? order.poster_comment) || "";
     }
   }
+
+  // Once the row is actually escalated (locked, sitting with the Team
+  // Lead), the Escalation Type can no longer be changed and there's
+  // nothing left to save here — just viewable.
+  const isLocked = order.escalated === true;
+  document.getElementById("cd-escalation-type").disabled = isLocked;
+  document.getElementById("cd-save-btn").style.display = isLocked ? "none" : "inline-block";
 
   document.getElementById("clarification-modal").style.display = "flex";
 }
