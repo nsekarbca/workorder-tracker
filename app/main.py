@@ -1193,26 +1193,40 @@ def list_production_orders(
 @app.get("/orders/escalations", response_model=List[schemas.WorkOrderOut])
 def list_escalations(
     process_id: int,
+    resolved: bool = False,
     current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
-    Rows currently locked awaiting a Team Lead's resolution — a Team Lead
-    sees only their own team's escalations; a Super Admin sees every
-    escalation in the process. Registered before /orders/{order_id} on
-    purpose: FastAPI matches routes in registration order, so a literal
-    path like this one has to come before a dynamic {order_id}: int path
-    or "escalations" gets swallowed as an attempted (and invalid) order_id.
+    resolved=False (default): rows currently locked awaiting a Team Lead's
+    resolution. resolved=True: the report of past escalations this Team
+    Lead has already resolved (Escalation Category was Clarification,
+    no longer locked, Issue Closed Date stamped) — a history view, so it
+    isn't filtered by submitted like the open queue is.
+    A Team Lead sees only their own team's rows either way; a Super Admin
+    sees every row in the process. Registered before /orders/{order_id}
+    on purpose: FastAPI matches routes in registration order, so a
+    literal path like this one has to come before a dynamic
+    {order_id}: int path or "escalations" gets swallowed as an attempted
+    (and invalid) order_id.
     """
     _require_process_access(current_user, process_id)
-    query = db.query(models.WorkOrder).filter(
-        models.WorkOrder.process_id == process_id,
-        models.WorkOrder.escalated == True,  # noqa: E712
-        models.WorkOrder.submitted == False,  # noqa: E712
-    )
+    query = db.query(models.WorkOrder).filter(models.WorkOrder.process_id == process_id)
+    if resolved:
+        query = query.filter(
+            models.WorkOrder.escalation_category == "Clarification",
+            models.WorkOrder.escalated == False,  # noqa: E712
+            models.WorkOrder.issue_closed_date.isnot(None),
+        )
+    else:
+        query = query.filter(
+            models.WorkOrder.escalated == True,  # noqa: E712
+            models.WorkOrder.submitted == False,  # noqa: E712
+        )
     if current_user.role == "team_lead":
         query = query.filter(models.WorkOrder.team_lead_id == current_user.id)
-    return query.order_by(models.WorkOrder.issue_raised_date.asc()).all()
+    order_col = models.WorkOrder.issue_raised_date
+    return query.order_by(order_col.desc() if resolved else order_col.asc()).all()
 
 
 @app.get("/orders/{order_id}", response_model=schemas.WorkOrderOut)
