@@ -1584,7 +1584,9 @@ def save_clarification_detail(
         raise HTTPException(status_code=404, detail="Order not found")
     _require_clarification_access(current_user, order)
 
-    if payload.escalation_type and payload.escalation_type not in ESCALATION_TYPES:
+    if not payload.escalation_type:
+        raise HTTPException(status_code=400, detail="escalation_type is required")
+    if payload.escalation_type not in ESCALATION_TYPES:
         raise HTTPException(status_code=400, detail=f"escalation_type must be one of {ESCALATION_TYPES}")
 
     process = db.query(models.Process).filter(models.Process.id == order.process_id).first()
