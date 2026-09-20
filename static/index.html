@@ -932,30 +932,67 @@ async function loadEscalations() {
   renderEscalations(currentEscalations);
 }
 
+const ESCALATION_COLUMNS = [
+  ["edm", "EDM"], ["employee_name", "Employee"], ["poster_comment", "Poster Comment"],
+  ["deposit_type", "Deposit Type"], ["exchange", "Exchange"], ["era_check", "ERA Check #"],
+  ["edm_batch_number", "EDM Batch Number"], ["bar_batch_number", "BAR Batch Number"],
+  ["batch_description", "Batch Description"], ["escalation_type", "Escalation Type"],
+  ["clarification_details", "Clarification Details"], ["team", "Team"],
+  ["poster_login", "Poster Login"], ["amount_posted", "Amount Posted"],
+  ["issue_raised_date", "Issue Raised Date"],
+];
+
+function _escalationCellValue(o, key) {
+  const detail = o.clarification_detail || {};
+  if (key === "edm") return o.edm ?? "";
+  if (key === "employee_name") return o.employee_name ?? "";
+  if (key === "poster_comment") return o.poster_comment ?? "";
+  if (key === "issue_raised_date") return o.issue_raised_date ?? "";
+  return detail[key] ?? "";
+}
+
 function renderEscalations(list) {
   const container = document.getElementById("grid-container");
   if (!list.length) {
     container.innerHTML = "<p>No open escalations right now.</p>";
     return;
   }
-  let html = "<table><thead><tr>";
-  html += "<th>EDM</th><th>Employee</th><th>Poster Comment</th><th>Escalation Type</th><th>Clarification Details</th><th>Issue Raised Date</th><th>VENTRA Comment</th><th>Action</th>";
+  let html = `<div style="margin-bottom:10px;"><button class="action-btn" onclick="exportEscalationsCSV()">Export CSV</button></div>`;
+  html += "<table><thead><tr>";
+  ESCALATION_COLUMNS.forEach(([, label]) => html += `<th>${label}</th>`);
+  html += "<th>VENTRA Comment</th><th>Action</th>";
   html += "</tr></thead><tbody>";
   list.forEach(o => {
-    const detail = o.clarification_detail || {};
     html += "<tr>";
-    html += `<td>${o.edm ?? ""}</td>`;
-    html += `<td>${o.employee_name ?? ""}</td>`;
-    html += `<td style="max-width:220px; white-space:normal;">${o.poster_comment ?? ""}</td>`;
-    html += `<td>${detail.escalation_type ?? ""}</td>`;
-    html += `<td style="max-width:220px; white-space:normal;">${detail.clarification_details ?? ""}</td>`;
-    html += `<td>${o.issue_raised_date ?? ""}</td>`;
+    ESCALATION_COLUMNS.forEach(([key]) => {
+      html += `<td style="max-width:220px; white-space:normal;">${_escalationCellValue(o, key)}</td>`;
+    });
     html += `<td><textarea id="resolve-comment-${o.id}" rows="2" style="width:180px; font-family:inherit; padding:4px;"></textarea></td>`;
     html += `<td><button class="action-btn" onclick="resolveEscalation(${o.id}, this)">Resolve</button></td>`;
     html += "</tr>";
   });
   html += "</tbody></table>";
   container.innerHTML = html;
+}
+
+function exportEscalationsCSV() {
+  if (!currentEscalations.length) {
+    alert("Nothing to export.");
+    return;
+  }
+  const headers = ESCALATION_COLUMNS.map(([, label]) => label).concat(["VENTRA Comment"]);
+  const rows = currentEscalations.map(o => {
+    const cells = ESCALATION_COLUMNS.map(([key]) => _escalationCellValue(o, key)).concat([o.ventra_comment ?? ""]);
+    return cells.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",");
+  });
+  const csv = [headers.map(h => `"${h}"`).join(","), ...rows].join("\n");
+  const blob = new Blob([csv], {type: "text/csv"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `escalations_${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 async function resolveEscalation(orderId, btn) {
