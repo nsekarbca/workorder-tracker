@@ -1614,6 +1614,9 @@ def save_clarification_detail(
     db.commit()
     db.refresh(detail)
     return detail
+
+
+def _count_business_days(start: date, end: date) -> int:
     """Counts weekdays (Mon-Fri) strictly after `start` up to and including `end`."""
     if not start or not end or end <= start:
         return 0
