@@ -933,21 +933,15 @@ async function loadEscalations() {
 }
 
 const ESCALATION_COLUMNS = [
-  ["edm", "EDM"], ["employee_name", "Employee"], ["poster_comment", "Poster Comment"],
   ["deposit_type", "Deposit Type"], ["exchange", "Exchange"], ["era_check", "ERA Check #"],
   ["edm_batch_number", "EDM Batch Number"], ["bar_batch_number", "BAR Batch Number"],
   ["batch_description", "Batch Description"], ["escalation_type", "Escalation Type"],
   ["clarification_details", "Clarification Details"], ["team", "Team"],
   ["poster_login", "Poster Login"], ["amount_posted", "Amount Posted"],
-  ["issue_raised_date", "Issue Raised Date"],
 ];
 
 function _escalationCellValue(o, key) {
   const detail = o.clarification_detail || {};
-  if (key === "edm") return o.edm ?? "";
-  if (key === "employee_name") return o.employee_name ?? "";
-  if (key === "poster_comment") return o.poster_comment ?? "";
-  if (key === "issue_raised_date") return o.issue_raised_date ?? "";
   return detail[key] ?? "";
 }
 
@@ -2202,9 +2196,12 @@ function closeClarificationModal() {
 
 async function saveClarificationDetail() {
   if (!clarificationOrderId) return;
-  const payload = {
-    escalation_type: document.getElementById("cd-escalation-type").value || null,
-  };
+  const escalationType = document.getElementById("cd-escalation-type").value;
+  if (!escalationType) {
+    alert("Choose an Escalation Type before saving.");
+    return;
+  }
+  const payload = { escalation_type: escalationType };
   const res = await authFetch(`/orders/${clarificationOrderId}/clarification-detail`, {
     method: "PUT",
     headers: {"Content-Type": "application/json"},
