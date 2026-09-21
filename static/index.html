@@ -946,7 +946,10 @@ async function loadEscalations() {
     return;
   }
   currentEscalations = await res.json();
+  ESCALATION_COLUMNS.forEach(([key]) => { escalationValueFilters[key] = []; });
   renderEscalations(currentEscalations);
+  populateEscalationFilterFieldDropdown();
+  populateEscalationFilterValueOptions();
 }
 
 const ESCALATION_COLUMNS = [
@@ -957,9 +960,75 @@ const ESCALATION_COLUMNS = [
   ["poster_login", "Poster Login"], ["amount_posted", "Amount Posted"],
 ];
 
+let escalationFilterField = ESCALATION_COLUMNS[0][0];
+let escalationValueFilters = {};
+ESCALATION_COLUMNS.forEach(([key]) => { escalationValueFilters[key] = []; });
+
 function _escalationCellValue(o, key) {
   const detail = o.clarification_detail || {};
   return detail[key] ?? "";
+}
+
+function populateEscalationFilterFieldDropdown() {
+  const sel = document.getElementById("esc-filter-field");
+  if (!sel) return;
+  sel.innerHTML = "";
+  ESCALATION_COLUMNS.forEach(([key, label]) => {
+    const o = document.createElement("option");
+    o.value = key;
+    o.textContent = label;
+    sel.appendChild(o);
+  });
+  sel.value = escalationFilterField;
+}
+
+function populateEscalationFilterValueOptions() {
+  const sel = document.getElementById("esc-filter-values");
+  if (!sel) return;
+  const field = escalationFilterField;
+  const distinct = Array.from(new Set(
+    currentEscalations.map(o => _escalationCellValue(o, field)).filter(v => v !== null && v !== undefined && v !== "")
+  )).sort();
+  sel.innerHTML = "";
+  distinct.forEach(v => {
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = v;
+    if ((escalationValueFilters[field] || []).includes(v)) opt.selected = true;
+    sel.appendChild(opt);
+  });
+}
+
+function syncEscalationFilterSelection() {
+  const sel = document.getElementById("esc-filter-values");
+  if (!sel) return;
+  escalationValueFilters[escalationFilterField] = Array.from(sel.selectedOptions).map(o => o.value);
+}
+
+function onEscalationFilterFieldChange() {
+  syncEscalationFilterSelection();
+  escalationFilterField = document.getElementById("esc-filter-field").value;
+  populateEscalationFilterValueOptions();
+  renderEscalations(applyEscalationFilters(currentEscalations));
+}
+
+function onEscalationFilterValuesChange() {
+  syncEscalationFilterSelection();
+  renderEscalations(applyEscalationFilters(currentEscalations));
+}
+
+function clearEscalationFilters() {
+  ESCALATION_COLUMNS.forEach(([key]) => { escalationValueFilters[key] = []; });
+  populateEscalationFilterValueOptions();
+  renderEscalations(applyEscalationFilters(currentEscalations));
+}
+
+function applyEscalationFilters(list) {
+  return list.filter(o => ESCALATION_COLUMNS.every(([key]) => {
+    const selected = escalationValueFilters[key] || [];
+    if (!selected.length) return true;
+    return selected.includes(_escalationCellValue(o, key));
+  }));
 }
 
 function _escalationsTabBar() {
@@ -968,6 +1037,12 @@ function _escalationsTabBar() {
     + `<button class="action-btn" style="${openActive ? "" : "background:#888;"}" onclick="switchEscalationsTab('open')">Open</button>`
     + `<button class="action-btn" style="${openActive ? "background:#888;" : ""}" onclick="switchEscalationsTab('resolved')">Resolved</button>`
     + `<button class="action-btn" onclick="exportEscalationsCSV()">Export CSV</button>`
+    + `</div>`
+    + `<div style="margin-bottom:10px; display:flex; gap:8px; align-items:center;">`
+    + `<label style="font-weight:600;">Filter by:</label>`
+    + `<select id="esc-filter-field" onchange="onEscalationFilterFieldChange()"></select>`
+    + `<select id="esc-filter-values" multiple size="4" style="min-width:180px;" onchange="onEscalationFilterValuesChange()"></select>`
+    + `<button class="action-btn" onclick="clearEscalationFilters()">Clear Filters</button>`
     + `</div>`;
 }
 
@@ -975,7 +1050,11 @@ function renderEscalations(list) {
   const container = document.getElementById("grid-container");
   const resolved = escalationsTab === "resolved";
   if (!list.length) {
-    container.innerHTML = _escalationsTabBar() + `<p>No ${resolved ? "resolved" : "open"} escalations right now.</p>`;
+    const filtered = currentEscalations.length > 0;
+    const msg = filtered
+      ? "No escalations match the current filters."
+      : `No ${resolved ? "resolved" : "open"} escalations right now.`;
+    container.innerHTML = _escalationsTabBar() + `<p>${msg}</p>`;
     return;
   }
   let html = _escalationsTabBar();
@@ -1002,14 +1081,15 @@ function renderEscalations(list) {
 }
 
 function exportEscalationsCSV() {
-  if (!currentEscalations.length) {
+  const list = applyEscalationFilters(currentEscalations);
+  if (!list.length) {
     alert("Nothing to export.");
     return;
   }
   const resolved = escalationsTab === "resolved";
   const headers = ESCALATION_COLUMNS.map(([, label]) => label)
     .concat(resolved ? ["VENTRA Comment", "Issue Closed Date"] : ["VENTRA Comment"]);
-  const rows = currentEscalations.map(o => {
+  const rows = list.map(o => {
     const cells = ESCALATION_COLUMNS.map(([key]) => _escalationCellValue(o, key))
       .concat(resolved ? [o.ventra_comment ?? "", o.issue_closed_date ?? ""] : [o.ventra_comment ?? ""]);
     return cells.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",");
@@ -2062,6 +2142,13 @@ function visibleColumns() {
 }
 
 function renderGrid(orders) {
+  if (!orders.length) {
+    const emptyMessage = role === "colleague"
+      ? "<p style=\"font-size:14px;\">\ud83c\udf89 All caught up! There's no order currently assigned to you \u2014 you'll get one automatically as soon as new inventory comes in.</p>"
+      : "<p style=\"font-size:14px;\">No orders in this process's active queue right now. Import inventory or check back once new orders come in.</p>";
+    document.getElementById("grid-container").innerHTML = emptyMessage;
+    return;
+  }
   const cols = visibleColumns();
   let html = "<table><thead><tr>";
   if (shareMode) html += `<th class="col">Share</th>`;
@@ -2171,13 +2258,7 @@ function renderGrid(orders) {
     html += `</tr>`;
   });
   html += "</tbody></table>";
-  let emptyMessage;
-  if (role === "colleague") {
-    emptyMessage = "<p style=\"font-size:14px;\">\ud83c\udf89 All caught up! There's no order currently assigned to you \u2014 you'll get one automatically as soon as new inventory comes in.</p>";
-  } else {
-    emptyMessage = "<p style=\"font-size:14px;\">No orders in this process's active queue right now. Import inventory or check back once new orders come in.</p>";
-  }
-  document.getElementById("grid-container").innerHTML = html || emptyMessage;
+  document.getElementById("grid-container").innerHTML = html;
 }
 
 // ---------------------------------------------------------------------
