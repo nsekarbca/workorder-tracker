@@ -1406,6 +1406,25 @@ def update_colleague_fields(
                 status_code=400,
                 detail="Fill in the Clarification Details popup (📋 Details) — choose an Escalation Type — before saving",
             )
+        # Re-derive the auto-filled fields from the order as it stands
+        # RIGHT NOW, not as it stood whenever the popup was last saved —
+        # the popup can be (and often is) saved before the row's own
+        # BAR Batch/Posted $/Poster Comment are actually persisted, so
+        # without this the Team Lead's Escalations queue would show
+        # stale/blank values for those even though the colleague's own
+        # popup showed them filled in.
+        process = db.query(models.Process).filter(models.Process.id == order.process_id).first()
+        detail.deposit_type = process.name if process else None
+        detail.exchange = "-"
+        detail.era_check = "-"
+        detail.edm_batch_number = order.edm
+        detail.bar_batch_number = order.bar_batch
+        detail.batch_description = order.description
+        detail.team = "CBE"
+        detail.poster_login = current_user.full_name
+        detail.amount_posted = str(order.posted_amount) if order.posted_amount is not None else None
+        detail.clarification_details = order.poster_comment
+        detail.updated_at = datetime.now(IST)
         order.escalated = True
 
     # Pending $ = Amount - Posted $, recalculated any time either changes.
