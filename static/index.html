@@ -1023,7 +1023,10 @@ function _escalationCellValue(o, key) {
   return detail[key] ?? "";
 }
 
-let escalationFilters = { escalationType: "", dateFrom: "", dateTo: "" };
+let escalationFilters = {
+  escalationType: "", dateFrom: "", dateTo: "",
+  edmBatch: "", barBatch: "", batchDescription: "", posterLogin: "", amountPosted: "",
+};
 
 function _escalationsTabBar() {
   const openActive = escalationsTab === "open";
@@ -1041,6 +1044,11 @@ function _escalationsFilterBar() {
   html += `<label style="font-size:13px;">Escalation Type <select id="esc-filter-type" onchange="applyEscalationFilters()"><option value="">All</option>`;
   ESCALATION_TYPES.forEach(t => html += `<option value="${t}" ${escalationFilters.escalationType === t ? "selected" : ""}>${t}</option>`);
   html += `</select></label>`;
+  html += `<label style="font-size:13px;">EDM Batch Number <input id="esc-filter-edm-batch" value="${escalationFilters.edmBatch}" onchange="applyEscalationFilters()" style="width:110px;"></label>`;
+  html += `<label style="font-size:13px;">BAR Batch Number <input id="esc-filter-bar-batch" value="${escalationFilters.barBatch}" onchange="applyEscalationFilters()" style="width:110px;"></label>`;
+  html += `<label style="font-size:13px;">Batch Description <input id="esc-filter-batch-desc" value="${escalationFilters.batchDescription}" onchange="applyEscalationFilters()" style="width:140px;"></label>`;
+  html += `<label style="font-size:13px;">Poster Login <input id="esc-filter-poster-login" value="${escalationFilters.posterLogin}" onchange="applyEscalationFilters()" style="width:120px;"></label>`;
+  html += `<label style="font-size:13px;">Amount Posted <input id="esc-filter-amount-posted" value="${escalationFilters.amountPosted}" onchange="applyEscalationFilters()" style="width:90px;"></label>`;
   html += `<label style="font-size:13px;">${dateLabel} From <input type="date" id="esc-filter-from" value="${escalationFilters.dateFrom}" onchange="applyEscalationFilters()"></label>`;
   html += `<label style="font-size:13px;">To <input type="date" id="esc-filter-to" value="${escalationFilters.dateTo}" onchange="applyEscalationFilters()"></label>`;
   html += `<button class="action-btn" style="background:#888;" onclick="clearEscalationFilters()">Clear Filters</button>`;
@@ -1050,23 +1058,35 @@ function _escalationsFilterBar() {
 
 function applyEscalationFilters() {
   escalationFilters.escalationType = document.getElementById("esc-filter-type").value;
+  escalationFilters.edmBatch = document.getElementById("esc-filter-edm-batch").value.trim();
+  escalationFilters.barBatch = document.getElementById("esc-filter-bar-batch").value.trim();
+  escalationFilters.batchDescription = document.getElementById("esc-filter-batch-desc").value.trim();
+  escalationFilters.posterLogin = document.getElementById("esc-filter-poster-login").value.trim();
+  escalationFilters.amountPosted = document.getElementById("esc-filter-amount-posted").value.trim();
   escalationFilters.dateFrom = document.getElementById("esc-filter-from").value;
   escalationFilters.dateTo = document.getElementById("esc-filter-to").value;
   renderEscalations(currentEscalations);
 }
 
 function clearEscalationFilters() {
-  escalationFilters = { escalationType: "", dateFrom: "", dateTo: "" };
+  escalationFilters = {
+    escalationType: "", dateFrom: "", dateTo: "",
+    edmBatch: "", barBatch: "", batchDescription: "", posterLogin: "", amountPosted: "",
+  };
   renderEscalations(currentEscalations);
 }
 
 function _filteredEscalations(list) {
   const resolved = escalationsTab === "resolved";
+  const contains = (value, needle) => String(value ?? "").toLowerCase().includes(needle.toLowerCase());
   return list.filter(o => {
-    if (escalationFilters.escalationType) {
-      const detail = o.clarification_detail || {};
-      if (detail.escalation_type !== escalationFilters.escalationType) return false;
-    }
+    const detail = o.clarification_detail || {};
+    if (escalationFilters.escalationType && detail.escalation_type !== escalationFilters.escalationType) return false;
+    if (escalationFilters.edmBatch && !contains(detail.edm_batch_number, escalationFilters.edmBatch)) return false;
+    if (escalationFilters.barBatch && !contains(detail.bar_batch_number, escalationFilters.barBatch)) return false;
+    if (escalationFilters.batchDescription && !contains(detail.batch_description, escalationFilters.batchDescription)) return false;
+    if (escalationFilters.posterLogin && !contains(detail.poster_login, escalationFilters.posterLogin)) return false;
+    if (escalationFilters.amountPosted && !contains(detail.amount_posted, escalationFilters.amountPosted)) return false;
     const dateField = resolved ? o.issue_closed_date : o.issue_raised_date;
     if (escalationFilters.dateFrom && (!dateField || dateField < escalationFilters.dateFrom)) return false;
     if (escalationFilters.dateTo && (!dateField || dateField > escalationFilters.dateTo)) return false;
