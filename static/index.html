@@ -1044,11 +1044,11 @@ function _escalationsFilterBar() {
   html += `<label style="font-size:13px;">Escalation Type <select id="esc-filter-type" onchange="applyEscalationFilters()"><option value="">All</option>`;
   ESCALATION_TYPES.forEach(t => html += `<option value="${t}" ${escalationFilters.escalationType === t ? "selected" : ""}>${t}</option>`);
   html += `</select></label>`;
-  html += `<label style="font-size:13px;">EDM Batch Number <input id="esc-filter-edm-batch" value="${escalationFilters.edmBatch}" onchange="applyEscalationFilters()" style="width:110px;"></label>`;
-  html += `<label style="font-size:13px;">BAR Batch Number <input id="esc-filter-bar-batch" value="${escalationFilters.barBatch}" onchange="applyEscalationFilters()" style="width:110px;"></label>`;
-  html += `<label style="font-size:13px;">Batch Description <input id="esc-filter-batch-desc" value="${escalationFilters.batchDescription}" onchange="applyEscalationFilters()" style="width:140px;"></label>`;
-  html += `<label style="font-size:13px;">Poster Login <input id="esc-filter-poster-login" value="${escalationFilters.posterLogin}" onchange="applyEscalationFilters()" style="width:120px;"></label>`;
-  html += `<label style="font-size:13px;">Amount Posted <input id="esc-filter-amount-posted" value="${escalationFilters.amountPosted}" onchange="applyEscalationFilters()" style="width:90px;"></label>`;
+  html += `<label style="font-size:13px;">EDM Batch Number <input id="esc-filter-edm-batch" value="${escalationFilters.edmBatch || ""}" onchange="applyEscalationFilters()" style="width:110px;"></label>`;
+  html += `<label style="font-size:13px;">BAR Batch Number <input id="esc-filter-bar-batch" value="${escalationFilters.barBatch || ""}" onchange="applyEscalationFilters()" style="width:110px;"></label>`;
+  html += `<label style="font-size:13px;">Batch Description <input id="esc-filter-batch-desc" value="${escalationFilters.batchDescription || ""}" onchange="applyEscalationFilters()" style="width:140px;"></label>`;
+  html += `<label style="font-size:13px;">Poster Login <input id="esc-filter-poster-login" value="${escalationFilters.posterLogin || ""}" onchange="applyEscalationFilters()" style="width:120px;"></label>`;
+  html += `<label style="font-size:13px;">Amount Posted <input id="esc-filter-amount-posted" value="${escalationFilters.amountPosted || ""}" onchange="applyEscalationFilters()" style="width:90px;"></label>`;
   html += `<label style="font-size:13px;">${dateLabel} From <input type="date" id="esc-filter-from" value="${escalationFilters.dateFrom}" onchange="applyEscalationFilters()"></label>`;
   html += `<label style="font-size:13px;">To <input type="date" id="esc-filter-to" value="${escalationFilters.dateTo}" onchange="applyEscalationFilters()"></label>`;
   html += `<button class="action-btn" style="background:#888;" onclick="clearEscalationFilters()">Clear Filters</button>`;
@@ -2195,10 +2195,12 @@ function renderGrid(orders) {
   if (role === "colleague" || isLeadRole()) html += `<th class="col">Action</th>`;
   html += "</tr></thead><tbody>";
 
+  let hasActionable = false;
   orders.forEach(o => {
     const savedCompleted = o.posting_status === "Completed";
     const isEscalated = o.escalated === true;
     const locked = role === "colleague" && (savedCompleted || isEscalated);
+    if (role === "colleague" && !locked) hasActionable = true;
     const tlCanCorrect = isLeadRole() && savedCompleted;
     const effStatus = effectiveValue(o, "posting_status");
     const hasDraft = drafts[o.id] && Object.keys(drafts[o.id]).length > 0;
@@ -2303,7 +2305,17 @@ function renderGrid(orders) {
   } else {
     emptyMessage = "<p style=\"font-size:14px;\">No orders in this process's active queue right now. Import inventory or check back once new orders come in.</p>";
   }
-  document.getElementById("grid-container").innerHTML = orders.length ? html : emptyMessage;
+  if (!orders.length) {
+    document.getElementById("grid-container").innerHTML = emptyMessage;
+  } else if (role === "colleague" && !hasActionable) {
+    // Nothing left to actually work on, even though a Completed-but-
+    // unsubmitted row (or an escalated one) is still shown below for
+    // reference — the person shouldn't have to infer "nothing to do"
+    // from an all-locked table.
+    document.getElementById("grid-container").innerHTML = emptyMessage + html;
+  } else {
+    document.getElementById("grid-container").innerHTML = html;
+  }
 }
 
 // ---------------------------------------------------------------------
