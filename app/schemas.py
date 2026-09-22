@@ -218,6 +218,20 @@ class ClarificationDetailSave(BaseModel):
     escalation_type: Optional[str] = None
 
 
+class EscalationDetailOut(BaseModel):
+    order_id: int
+    category: str
+    data: dict
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class EscalationDetailSave(BaseModel):
+    data: dict = {}  # only the category's manual fields — auto fields are always server-derived
+
+
 class ReassignRequest(BaseModel):
     assigned_to_id: int
 
@@ -320,6 +334,7 @@ class WorkOrderOut(BaseModel):
     submitted_at: Optional[datetime]
     escalated: bool = False
     clarification_detail: Optional[ClarificationDetailOut] = None
+    escalation_detail: Optional[EscalationDetailOut] = None
 
     class Config:
         from_attributes = True

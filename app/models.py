@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Date, DateTime, ForeignKey, Boolean, Table
+from sqlalchemy import Column, Integer, String, Float, Date, DateTime, ForeignKey, Boolean, Table, JSON
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from .database import Base
@@ -161,6 +161,28 @@ class ClarificationDetail(Base):
     updated_at = Column(DateTime, nullable=True)
 
 
+class EscalationDetail(Base):
+    """
+    Structured detail for an escalation category OTHER than Clarification
+    (which has its own dedicated ClarificationDetail table/workflow,
+    including the lock-to-Team-Lead handoff). EOB not found, Invoice
+    Creation, Patient not found, and Need to Delete each have a different
+    field set (see ESCALATION_CATEGORY_FIELDS in main.py), so rather than
+    a wide sparse table with dozens of mostly-null columns, the
+    category-specific values live in a single JSON column. This is pure
+    data capture — saving one of these does NOT lock the row or hand it
+    to the Team Lead the way Clarification does.
+    """
+    __tablename__ = "escalation_details"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("work_orders.id"), nullable=False, unique=True)
+    category = Column(String, nullable=False)
+    data = Column(JSON, nullable=False, default=dict)
+    posted_by_name = Column(String, nullable=False)
+    updated_at = Column(DateTime, nullable=True)
+
+
 class AppSetting(Base):
     """Simple key-value store for admin-configurable settings, e.g. the
     inactivity session timeout. Not tied to any one user."""
@@ -274,5 +296,6 @@ class WorkOrder(Base):
     # Team Lead resolves it, handing the row back to the colleague.
     escalated = Column(Boolean, default=False, nullable=False)
     clarification_detail = relationship("ClarificationDetail", uselist=False, cascade="all, delete-orphan")
+    escalation_detail = relationship("EscalationDetail", uselist=False, cascade="all, delete-orphan")
 
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

@@ -1029,55 +1029,78 @@ def _parse_float(v: Optional[str]) -> Optional[float]:
 def _auto_assign_open_slots(db: Session, process_id: int):
     """
     For every colleague who has access to this process and currently has no
-    open (non-completed) order *in this process*, hand them the oldest
-    unassigned order they're actually eligible for. An order imported by a
-    Team Lead only goes to colleagues whose Reporting Manager matches that
-    same Team Lead's name; an order imported by a Super Admin (team_lead_id
-    is None) is open to any colleague in the process.
+    open (non-completed, non-escalated) order *in this process*, hand them
+    the oldest unassigned order they're actually eligible for. An order
+    imported by a Team Lead only goes to colleagues whose Reporting Manager
+    matches that same Team Lead's name; an order imported by a Super Admin
+    (team_lead_id is None) is open to any colleague in the process.
+
+    Written to run in a small, fixed number of queries regardless of how
+    many colleagues or candidate orders there are — colleagues needing an
+    order, unassigned candidates, and team lead names are each fetched
+    once, then matched in memory. The previous version re-queried the
+    entire unassigned pool and did a fresh per-candidate team-lead lookup
+    for every single colleague, which made a busy queue's Save noticeably
+    slow.
     """
     colleagues = (
         db.query(models.User)
         .filter(models.User.role == "colleague", models.User.processes.any(models.Process.id == process_id))
         .all()
     )
-    for colleague in colleagues:
-        has_open = (
-            db.query(models.WorkOrder)
-            .filter(
-                models.WorkOrder.process_id == process_id,
-                models.WorkOrder.assigned_to_id == colleague.id,
-                models.WorkOrder.posting_status != "Completed",
-                models.WorkOrder.escalated == False,  # noqa: E712
-            )
-            .first()
-        )
-        if has_open:
-            continue
+    if not colleagues:
+        return
 
-        candidates = (
-            db.query(models.WorkOrder)
-            .filter(models.WorkOrder.process_id == process_id, models.WorkOrder.assigned_to_id.is_(None))
-            .order_by(models.WorkOrder.id.asc())
-            .all()
-        )
-        next_order = None
-        for cand in candidates:
+    open_colleague_ids = {
+        row[0] for row in db.query(models.WorkOrder.assigned_to_id).filter(
+            models.WorkOrder.process_id == process_id,
+            models.WorkOrder.assigned_to_id.isnot(None),
+            models.WorkOrder.posting_status != "Completed",
+            models.WorkOrder.escalated == False,  # noqa: E712
+        ).all()
+    }
+    needy = [c for c in colleagues if c.id not in open_colleague_ids]
+    if not needy:
+        return
+
+    candidates = (
+        db.query(models.WorkOrder)
+        .filter(models.WorkOrder.process_id == process_id, models.WorkOrder.assigned_to_id.is_(None))
+        .order_by(models.WorkOrder.id.asc())
+        .all()
+    )
+    if not candidates:
+        return
+
+    team_lead_ids = {c.team_lead_id for c in candidates if c.team_lead_id is not None}
+    team_lead_names = {}
+    if team_lead_ids:
+        team_lead_names = {
+            u.id: u.full_name
+            for u in db.query(models.User).filter(models.User.id.in_(team_lead_ids)).all()
+        }
+
+    remaining = list(candidates)
+    for colleague in needy:
+        match_index = None
+        for i, cand in enumerate(remaining):
             if cand.team_lead_id is None:
-                next_order = cand
+                match_index = i
                 break
-            owner = db.query(models.User).filter(models.User.id == cand.team_lead_id).first()
-            if owner and colleague.reporting_manager == owner.full_name:
-                next_order = cand
+            owner_name = team_lead_names.get(cand.team_lead_id)
+            if owner_name and colleague.reporting_manager == owner_name:
+                match_index = i
                 break
+        if match_index is None:
+            continue
+        next_order = remaining.pop(match_index)
+        next_order.assigned_to_id = colleague.id
+        next_order.assigned_date = datetime.now(IST).date()
+        next_order.employee_id = colleague.employee_id or colleague.username
+        next_order.employee_name = colleague.full_name
+        next_order.posting_status = "In-Process"
+        db.add(next_order)
 
-        if next_order:
-            next_order.assigned_to_id = colleague.id
-            next_order.assigned_date = datetime.now(IST).date()
-            next_order.employee_id = colleague.employee_id or colleague.username
-            next_order.employee_name = colleague.full_name
-            next_order.posting_status = "In-Process"
-            db.add(next_order)
-            db.flush()
     db.commit()
 
 
@@ -1625,6 +1648,149 @@ def save_clarification_detail(
     detail.amount_posted = str(order.posted_amount) if order.posted_amount is not None else None
     detail.escalation_type = payload.escalation_type
     detail.clarification_details = order.poster_comment
+    detail.updated_at = datetime.now(IST)
+
+    db.commit()
+    db.refresh(detail)
+    return detail
+
+
+UTILITY_CATEGORY_OPTIONS = (
+    "Unmatched", "Withhold", "Interest", "MIPS", "W9 Request", "IBIS",
+    "Other Bill", "Credential", "Transaction Limit Increase",
+    "Unmatched Refund", "Withhold Fees", "CA Commission", "Offset Payment",
+)
+
+# Field spec per (non-Clarification) Escalation Category. Each entry is
+# (key, label, kind):
+#   "auto:<attr>"     -> read-only, copied from that WorkOrder attribute
+#   "fixed:<value>"    -> read-only constant
+#   "user"             -> read-only, current user's full name
+#   "poster_comment"   -> read-only, copied from the order's Poster Comment
+#   "manual"           -> free text, typed in by whoever's filling it out
+#   "manual_select"    -> dropdown (Utility Category's options, currently
+#                          the only one) typed in by whoever's filling it out
+# Categories not listed here (e.g. "DUVA Verification") have no extra
+# popup — selecting them behaves like it always did.
+ESCALATION_CATEGORY_FIELDS = {
+    "EOB not found": [
+        ("edm_number", "EDM#", "auto:edm"),
+        ("page_number", "Page #", "manual"),
+        ("division_number", "Division #", "auto:division"),
+        ("payer", "Payer", "manual"),
+        ("check_number", "Check#", "manual"),
+        ("amount", "Amount", "manual"),
+        ("deposit_date", "Deposit date", "auto:deposit_date"),
+        ("poster_comments", "Poster Comments", "poster_comment"),
+    ],
+    "Invoice Creation": [
+        ("division", "Division", "auto:division"),
+        ("utility_category", "Utility Category", "manual_select"),
+        ("edm_batch_number", "EDM Batch#", "manual"),
+        ("bar_batch_number", "Bar Batch #", "auto:bar_batch"),
+        ("deposit_date", "Deposit Date", "auto:deposit_date"),
+        ("page_number", "Page Number", "manual"),
+        ("approx_invoice_count", "Approximate Invoice Count#", "manual"),
+        ("notes", "Notes", "poster_comment"),
+        ("poster_login", "Poster Login", "user"),
+    ],
+    "Patient not found": [
+        ("edm_batch_number", "EDM Batch #", "auto:edm"),
+        ("bar_batch_number", "BAR Batch #", "auto:bar_batch"),
+        ("batch_description", "Batch Description", "auto:description"),
+        ("dos", "DOS", "manual"),
+        ("cb_migration_date", "CB Migration date", "manual"),
+        ("notes", "Notes", "poster_comment"),
+        ("team", "Team", "fixed:EDM"),
+        ("poster_login", "Poster Login", "user"),
+    ],
+    "Need to Delete": [
+        ("edm_batch_number", "EDM Batch #", "auto:edm"),
+        ("status", "Status", "auto:status"),
+        ("created", "Created", "auto:created"),
+        ("images", "Images", "auto:image_count"),
+        ("docs", "Docs", "auto:doc_count"),
+        ("def_doc_type", "Def Doc Type", "auto:def_doc_type"),
+        ("amount", "Amount", "auto:amount"),
+        ("last_edited_by", "Last Edited By", "auto:last_edited_by"),
+        ("description", "Description", "auto:description"),
+        ("division", "Division", "auto:division"),
+        ("bar_batch_number", "Bar Batch#", "auto:bar_batch"),
+        ("notes", "Notes", "poster_comment"),
+    ],
+}
+
+
+def _compute_escalation_auto_fields(category: str, order: models.WorkOrder, current_user: models.User) -> dict:
+    result = {}
+    for key, _label, kind in ESCALATION_CATEGORY_FIELDS.get(category, []):
+        if kind.startswith("auto:"):
+            val = getattr(order, kind.split(":", 1)[1], None)
+            result[key] = str(val) if val is not None else None
+        elif kind.startswith("fixed:"):
+            result[key] = kind.split(":", 1)[1]
+        elif kind == "user":
+            result[key] = current_user.full_name
+        elif kind == "poster_comment":
+            result[key] = order.poster_comment
+    return result
+
+
+@app.get("/orders/{order_id}/escalation-detail", response_model=Optional[schemas.EscalationDetailOut])
+def get_escalation_detail(
+    order_id: int,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    _require_clarification_access(current_user, order)
+    return db.query(models.EscalationDetail).filter(models.EscalationDetail.order_id == order_id).first()
+
+
+@app.put("/orders/{order_id}/escalation-detail", response_model=schemas.EscalationDetailOut)
+def save_escalation_detail(
+    order_id: int,
+    payload: schemas.EscalationDetailSave,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Creates or updates the category-specific detail popup for whichever
+    Escalation Category is currently set on the order (EOB not found,
+    Invoice Creation, Patient not found, Need to Delete). Only the
+    category's "manual"/"manual_select" fields come from payload.data —
+    every auto/fixed/user field is recomputed here from the order/current
+    user, same principle as the Clarification popup.
+    """
+    order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    _require_clarification_access(current_user, order)
+
+    category = order.escalation_category
+    fields = ESCALATION_CATEGORY_FIELDS.get(category)
+    if not fields:
+        raise HTTPException(status_code=400, detail=f"No detail form defined for escalation category '{category}'")
+
+    merged = _compute_escalation_auto_fields(category, order, current_user)
+    manual_keys = {key for key, _label, kind in fields if kind in ("manual", "manual_select")}
+    for key in manual_keys:
+        if key in payload.data:
+            merged[key] = payload.data[key]
+
+    if "utility_category" in manual_keys and merged.get("utility_category"):
+        if merged["utility_category"] not in UTILITY_CATEGORY_OPTIONS:
+            raise HTTPException(status_code=400, detail=f"utility_category must be one of {UTILITY_CATEGORY_OPTIONS}")
+
+    detail = db.query(models.EscalationDetail).filter(models.EscalationDetail.order_id == order_id).first()
+    if not detail:
+        detail = models.EscalationDetail(order_id=order_id, category=category)
+        db.add(detail)
+    detail.category = category
+    detail.data = merged
+    detail.posted_by_name = current_user.full_name
     detail.updated_at = datetime.now(IST)
 
     db.commit()
