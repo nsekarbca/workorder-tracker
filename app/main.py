@@ -1393,8 +1393,12 @@ def update_colleague_fields(
     # to the Team Lead: it locks for the colleague (still visible, read-
     # only) and, once committed, frees their one-open-order slot so they
     # get handed new work instead of sitting idle waiting on a resolution.
-    # Requires the Clarification Details popup to have actually been
-    # completed (Escalation Type chosen) — otherwise nothing to hand off.
+    # Requires that category's detail popup to have actually been
+    # completed first — otherwise nothing to hand off. Applies to every
+    # escalation category that has a defined detail form (Clarification,
+    # plus EOB not found / Invoice Creation / Patient not found / Need to
+    # Delete via ESCALATION_CATEGORY_FIELDS); a category with no form
+    # (e.g. DUVA Verification) just saves normally, same as always.
     if order.posting_status == "Clarification" and order.escalation_category == "Clarification":
         detail = (
             db.query(models.ClarificationDetail)
@@ -1424,6 +1428,54 @@ def update_colleague_fields(
         detail.poster_login = current_user.full_name
         detail.amount_posted = str(order.posted_amount) if order.posted_amount is not None else None
         detail.clarification_details = order.poster_comment
+        detail.updated_at = datetime.now(IST)
+        order.escalated = True
+    elif order.posting_status == "Clarification" and order.escalation_category in ESCALATION_CATEGORY_FIELDS:
+        category = order.escalation_category
+        detail = (
+            db.query(models.EscalationDetail)
+            .filter(models.EscalationDetail.order_id == order.id)
+            .first()
+        )
+        if not detail or detail.category != category:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Fill in the {category} details popup (📋 Details) before saving",
+            )
+        # Same re-derive-at-actual-save-time fix as Clarification above:
+        # keep whatever was manually typed into the popup, but recompute
+        # every auto/fixed/user field fresh from the order as it stands
+        # right now.
+        manual_keys = {k for k, _l, kind in ESCALATION_CATEGORY_FIELDS[category] if kind in ("manual", "manual_select")}
+        manual_values = {k: detail.data.get(k) for k in manual_keys}
+        merged = _compute_escalation_auto_fields(category, order, current_user)
+        merged.update(manual_values)
+        detail.data = merged
+        detail.posted_by_name = current_user.full_name
+        detail.updated_at = datetime.now(IST)
+        order.escalated = True
+    elif (
+        order.posting_status == "Clarification"
+        and order.escalation_category in ESCALATION_CATEGORY_FIELDS
+    ):
+        category = order.escalation_category
+        detail = (
+            db.query(models.EscalationDetail)
+            .filter(models.EscalationDetail.order_id == order.id)
+            .first()
+        )
+        if not detail:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Fill in the {category} details popup (📋 Details) before saving",
+            )
+        # Same reasoning as the Clarification branch above: refresh the
+        # auto/fixed/user/poster-comment fields from the order as it
+        # stands right now, keeping whatever manual fields were typed in.
+        fresh_auto = _compute_escalation_auto_fields(category, order, current_user)
+        merged = dict(detail.data or {})
+        merged.update(fresh_auto)
+        detail.data = merged
         detail.updated_at = datetime.now(IST)
         order.escalated = True
 
