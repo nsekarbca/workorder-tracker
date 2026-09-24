@@ -1003,7 +1003,7 @@ async function showEscalationsView() {
 
 function switchEscalationsTab(tab) {
   escalationsTab = tab;
-  escalationFilters = { escalationType: "", dateFrom: "", dateTo: "" };
+  escalationFilters = { category: "", escalationType: "", search: "", dateFrom: "", dateTo: "" };
   loadEscalations();
 }
 
@@ -1021,7 +1021,11 @@ async function loadEscalations() {
   renderEscalations(currentEscalations);
 }
 
-const ESCALATION_COLUMNS = [
+// Mirrors the Clarification popup's fields, for building a generic
+// label:value summary — same idea as ESCALATION_CATEGORY_FIELDS but for
+// the one category with its own dedicated table (ClarificationDetail)
+// instead of the generic JSON-backed EscalationDetail.
+const CLARIFICATION_DETAIL_FIELDS = [
   ["deposit_type", "Deposit Type"], ["exchange", "Exchange"], ["era_check", "ERA Check #"],
   ["edm_batch_number", "EDM Batch Number"], ["bar_batch_number", "BAR Batch Number"],
   ["batch_description", "Batch Description"], ["escalation_type", "Escalation Type"],
@@ -1029,15 +1033,33 @@ const ESCALATION_COLUMNS = [
   ["poster_login", "Poster Login"], ["amount_posted", "Amount Posted"],
 ];
 
-function _escalationCellValue(o, key) {
-  const detail = o.clarification_detail || {};
-  return detail[key] ?? "";
+// Every escalation category that has a defined detail form, Clarification
+// included — used to populate the Category filter and to know which
+// field spec/table to read from when rendering a row's details.
+const ALL_ESCALATION_CATEGORIES = ["Clarification", ...Object.keys(ESCALATION_CATEGORY_FIELDS)];
+
+function _escalationDetailPairs(o) {
+  if (o.escalation_category === "Clarification") {
+    const d = o.clarification_detail || {};
+    return CLARIFICATION_DETAIL_FIELDS.map(([key, label]) => [label, d[key]]);
+  }
+  const spec = ESCALATION_CATEGORY_FIELDS[o.escalation_category];
+  if (!spec) return [];
+  const d = (o.escalation_detail && o.escalation_detail.data) || {};
+  return spec.map(([key, label]) => [label, d[key]]);
 }
 
-let escalationFilters = {
-  escalationType: "", dateFrom: "", dateTo: "",
-  edmBatch: "", barBatch: "", batchDescription: "", posterLogin: "", amountPosted: "",
-};
+function _escalationDetailSummaryHTML(o) {
+  const pairs = _escalationDetailPairs(o).filter(([, v]) => v !== null && v !== undefined && v !== "");
+  if (!pairs.length) return "<span style=\"color:#999;\">—</span>";
+  return pairs.map(([label, v]) => `<div><b>${label}:</b> ${v}</div>`).join("");
+}
+
+function _escalationSearchText(o) {
+  return _escalationDetailPairs(o).map(([, v]) => v ?? "").join(" ").toLowerCase();
+}
+
+let escalationFilters = { category: "", escalationType: "", search: "", dateFrom: "", dateTo: "" };
 
 function _escalationsTabBar() {
   const openActive = escalationsTab === "open";
@@ -1052,14 +1074,13 @@ function _escalationsFilterBar() {
   const resolved = escalationsTab === "resolved";
   const dateLabel = resolved ? "Issue Closed" : "Issue Raised";
   let html = `<div style="margin-bottom:10px; display:flex; gap:14px; align-items:center; flex-wrap:wrap; background:white; padding:8px 12px; border-radius:6px;">`;
+  html += `<label style="font-size:13px;">Category <select id="esc-filter-category" onchange="applyEscalationFilters()"><option value="">All</option>`;
+  ALL_ESCALATION_CATEGORIES.forEach(c => html += `<option value="${c}" ${escalationFilters.category === c ? "selected" : ""}>${c}</option>`);
+  html += `</select></label>`;
   html += `<label style="font-size:13px;">Escalation Type <select id="esc-filter-type" onchange="applyEscalationFilters()"><option value="">All</option>`;
   ESCALATION_TYPES.forEach(t => html += `<option value="${t}" ${escalationFilters.escalationType === t ? "selected" : ""}>${t}</option>`);
   html += `</select></label>`;
-  html += `<label style="font-size:13px;">EDM Batch Number <input id="esc-filter-edm-batch" value="${escalationFilters.edmBatch || ""}" onchange="applyEscalationFilters()" style="width:110px;"></label>`;
-  html += `<label style="font-size:13px;">BAR Batch Number <input id="esc-filter-bar-batch" value="${escalationFilters.barBatch || ""}" onchange="applyEscalationFilters()" style="width:110px;"></label>`;
-  html += `<label style="font-size:13px;">Batch Description <input id="esc-filter-batch-desc" value="${escalationFilters.batchDescription || ""}" onchange="applyEscalationFilters()" style="width:140px;"></label>`;
-  html += `<label style="font-size:13px;">Poster Login <input id="esc-filter-poster-login" value="${escalationFilters.posterLogin || ""}" onchange="applyEscalationFilters()" style="width:120px;"></label>`;
-  html += `<label style="font-size:13px;">Amount Posted <input id="esc-filter-amount-posted" value="${escalationFilters.amountPosted || ""}" onchange="applyEscalationFilters()" style="width:90px;"></label>`;
+  html += `<label style="font-size:13px;">Search <input id="esc-filter-search" value="${escalationFilters.search || ""}" onchange="applyEscalationFilters()" placeholder="EDM, BAR batch, payer, amount..." style="width:220px;"></label>`;
   html += `<label style="font-size:13px;">${dateLabel} From <input type="date" id="esc-filter-from" value="${escalationFilters.dateFrom}" onchange="applyEscalationFilters()"></label>`;
   html += `<label style="font-size:13px;">To <input type="date" id="esc-filter-to" value="${escalationFilters.dateTo}" onchange="applyEscalationFilters()"></label>`;
   html += `<button class="action-btn" style="background:#888;" onclick="clearEscalationFilters()">Clear Filters</button>`;
@@ -1068,36 +1089,28 @@ function _escalationsFilterBar() {
 }
 
 function applyEscalationFilters() {
+  escalationFilters.category = document.getElementById("esc-filter-category").value;
   escalationFilters.escalationType = document.getElementById("esc-filter-type").value;
-  escalationFilters.edmBatch = document.getElementById("esc-filter-edm-batch").value.trim();
-  escalationFilters.barBatch = document.getElementById("esc-filter-bar-batch").value.trim();
-  escalationFilters.batchDescription = document.getElementById("esc-filter-batch-desc").value.trim();
-  escalationFilters.posterLogin = document.getElementById("esc-filter-poster-login").value.trim();
-  escalationFilters.amountPosted = document.getElementById("esc-filter-amount-posted").value.trim();
+  escalationFilters.search = document.getElementById("esc-filter-search").value.trim();
   escalationFilters.dateFrom = document.getElementById("esc-filter-from").value;
   escalationFilters.dateTo = document.getElementById("esc-filter-to").value;
   renderEscalations(currentEscalations);
 }
 
 function clearEscalationFilters() {
-  escalationFilters = {
-    escalationType: "", dateFrom: "", dateTo: "",
-    edmBatch: "", barBatch: "", batchDescription: "", posterLogin: "", amountPosted: "",
-  };
+  escalationFilters = { category: "", escalationType: "", search: "", dateFrom: "", dateTo: "" };
   renderEscalations(currentEscalations);
 }
 
 function _filteredEscalations(list) {
   const resolved = escalationsTab === "resolved";
-  const contains = (value, needle) => String(value ?? "").toLowerCase().includes(needle.toLowerCase());
   return list.filter(o => {
-    const detail = o.clarification_detail || {};
-    if (escalationFilters.escalationType && detail.escalation_type !== escalationFilters.escalationType) return false;
-    if (escalationFilters.edmBatch && !contains(detail.edm_batch_number, escalationFilters.edmBatch)) return false;
-    if (escalationFilters.barBatch && !contains(detail.bar_batch_number, escalationFilters.barBatch)) return false;
-    if (escalationFilters.batchDescription && !contains(detail.batch_description, escalationFilters.batchDescription)) return false;
-    if (escalationFilters.posterLogin && !contains(detail.poster_login, escalationFilters.posterLogin)) return false;
-    if (escalationFilters.amountPosted && !contains(detail.amount_posted, escalationFilters.amountPosted)) return false;
+    if (escalationFilters.category && o.escalation_category !== escalationFilters.category) return false;
+    if (escalationFilters.escalationType) {
+      const d = o.clarification_detail || {};
+      if (d.escalation_type !== escalationFilters.escalationType) return false;
+    }
+    if (escalationFilters.search && !_escalationSearchText(o).includes(escalationFilters.search.toLowerCase())) return false;
     const dateField = resolved ? o.issue_closed_date : o.issue_raised_date;
     if (escalationFilters.dateFrom && (!dateField || dateField < escalationFilters.dateFrom)) return false;
     if (escalationFilters.dateTo && (!dateField || dateField > escalationFilters.dateTo)) return false;
@@ -1115,15 +1128,13 @@ function renderEscalations(list) {
     container.innerHTML = html;
     return;
   }
-  html += "<table><thead><tr>";
-  ESCALATION_COLUMNS.forEach(([, label]) => html += `<th>${label}</th>`);
+  html += "<table><thead><tr><th>Category</th><th>Details</th>";
   html += resolved ? "<th>VENTRA Comment</th><th>Issue Closed Date</th>" : "<th>VENTRA Comment</th><th>Action</th>";
   html += "</tr></thead><tbody>";
   filtered.forEach(o => {
     html += "<tr>";
-    ESCALATION_COLUMNS.forEach(([key]) => {
-      html += `<td style="max-width:220px; white-space:normal;">${_escalationCellValue(o, key)}</td>`;
-    });
+    html += `<td>${o.escalation_category ?? ""}</td>`;
+    html += `<td style="max-width:320px; white-space:normal; font-size:12px;">${_escalationDetailSummaryHTML(o)}</td>`;
     if (resolved) {
       html += `<td style="max-width:220px; white-space:normal;">${o.ventra_comment ?? ""}</td>`;
       html += `<td>${o.issue_closed_date ?? ""}</td>`;
@@ -1144,11 +1155,14 @@ function exportEscalationsCSV() {
     return;
   }
   const resolved = escalationsTab === "resolved";
-  const headers = ESCALATION_COLUMNS.map(([, label]) => label)
-    .concat(resolved ? ["VENTRA Comment", "Issue Closed Date"] : ["VENTRA Comment"]);
+  const headers = ["Category", "Details", "VENTRA Comment"].concat(resolved ? ["Issue Closed Date"] : []);
   const rows = filtered.map(o => {
-    const cells = ESCALATION_COLUMNS.map(([key]) => _escalationCellValue(o, key))
-      .concat(resolved ? [o.ventra_comment ?? "", o.issue_closed_date ?? ""] : [o.ventra_comment ?? ""]);
+    const detailsText = _escalationDetailPairs(o)
+      .filter(([, v]) => v !== null && v !== undefined && v !== "")
+      .map(([label, v]) => `${label}: ${v}`)
+      .join("; ");
+    const cells = [o.escalation_category ?? "", detailsText, o.ventra_comment ?? ""]
+      .concat(resolved ? [o.issue_closed_date ?? ""] : []);
     return cells.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",");
   });
   const csv = [headers.map(h => `"${h}"`).join(","), ...rows].join("\n");
