@@ -473,14 +473,14 @@ const ESCALATION_CATEGORY_FIELDS = {
     ["division_number", "Division #", "auto:division"],
     ["payer", "Payer", "manual"],
     ["check_number", "Check#", "manual"],
-    ["amount", "Amount", "manual"],
+    ["amount", "Amount", "manual_currency"],
     ["deposit_date", "Deposit date", "auto:deposit_date"],
     ["poster_comments", "Poster Comments", "poster_comment"],
   ],
   "Invoice Creation": [
     ["division", "Division", "auto:division"],
     ["utility_category", "Utility Category", "manual_select"],
-    ["edm_batch_number", "EDM Batch#", "manual"],
+    ["edm_batch_number", "EDM Batch#", "auto:edm"],
     ["bar_batch_number", "Bar Batch #", "auto:bar_batch"],
     ["deposit_date", "Deposit Date", "auto:deposit_date"],
     ["page_number", "Page Number", "manual"],
@@ -492,8 +492,8 @@ const ESCALATION_CATEGORY_FIELDS = {
     ["edm_batch_number", "EDM Batch #", "auto:edm"],
     ["bar_batch_number", "BAR Batch #", "auto:bar_batch"],
     ["batch_description", "Batch Description", "auto:description"],
-    ["dos", "DOS", "manual"],
-    ["cb_migration_date", "CB Migration date", "manual"],
+    ["dos", "DOS", "manual_date"],
+    ["cb_migration_date", "CB Migration date", "manual_date"],
     ["notes", "Notes", "poster_comment"],
     ["team", "Team", "fixed:EDM"],
     ["poster_login", "Poster Login", "user"],
@@ -2448,14 +2448,23 @@ async function saveClarificationDetail() {
 let escalationDetailOrderId = null;
 let escalationDetailCategory = null;
 
-function _escalationFieldAutoValue(order, kind) {
+function _escalationFieldAutoValue(order, kind, draft) {
+  draft = draft || {};
   if (kind.startsWith("auto:")) {
-    const val = order[kind.slice(5)];
+    const attr = kind.slice(5);
+    // The order attribute names line up with the row's own editable
+    // field names for the ones that can actually be mid-edit (bar_batch,
+    // posted_amount, description isn't editable so no draft needed there
+    // but doesn't hurt to check) — prefer whatever's currently typed
+    // into the row over the last-saved value, same fix as the
+    // Clarification popup: this popup is very often used before the
+    // row's own Save has ever been clicked.
+    const val = (draft[attr] !== undefined ? draft[attr] : order[attr]);
     return (val === null || val === undefined) ? "" : String(val);
   }
   if (kind.startsWith("fixed:")) return kind.slice(6);
   if (kind === "user") return fullName;
-  if (kind === "poster_comment") return order.poster_comment || "";
+  if (kind === "poster_comment") return (draft.poster_comment ?? order.poster_comment) || "";
   return "";
 }
 
@@ -2466,6 +2475,7 @@ async function openEscalationCategoryModal(orderId, category) {
   escalationDetailCategory = category;
   const order = currentOrders.find(o => o.id === orderId);
   if (!order) return;
+  const draft = drafts[orderId] || {};
 
   document.getElementById("ecd-heading").textContent = `${category} — Details`;
   const container = document.getElementById("ecd-fields");
@@ -2473,12 +2483,16 @@ async function openEscalationCategoryModal(orderId, category) {
   fields.forEach(([key, label, kind]) => {
     if (kind === "manual") {
       html += `<label>${label} <input id="ecd-field-${key}" data-key="${key}"></label>`;
+    } else if (kind === "manual_date") {
+      html += `<label>${label} <input type="date" id="ecd-field-${key}" data-key="${key}"></label>`;
+    } else if (kind === "manual_currency") {
+      html += `<label>${label} <input id="ecd-field-${key}" data-key="${key}" inputmode="decimal" placeholder="$0.00"></label>`;
     } else if (kind === "manual_select") {
       html += `<label>${label} <select id="ecd-field-${key}" data-key="${key}"><option value="">—</option>`;
       UTILITY_CATEGORY_OPTIONS.forEach(opt => html += `<option value="${opt}">${opt}</option>`);
       html += `</select></label>`;
     } else {
-      const autoVal = _escalationFieldAutoValue(order, kind);
+      const autoVal = _escalationFieldAutoValue(order, kind, draft);
       html += `<label>${label} <input id="ecd-field-${key}" data-key="${key}" value="${autoVal}" disabled></label>`;
     }
   });
@@ -2490,7 +2504,7 @@ async function openEscalationCategoryModal(orderId, category) {
     const detail = await res.json();
     if (detail && detail.category === category) {
       fields.forEach(([key, , kind]) => {
-        if (kind === "manual" || kind === "manual_select") {
+        if (kind === "manual" || kind === "manual_date" || kind === "manual_currency" || kind === "manual_select") {
           const el = document.getElementById(`ecd-field-${key}`);
           if (el && detail.data && detail.data[key] != null) el.value = detail.data[key];
         }
@@ -2512,15 +2526,18 @@ async function saveEscalationCategoryDetail() {
   const fields = ESCALATION_CATEGORY_FIELDS[escalationDetailCategory] || [];
   const data = {};
   fields.forEach(([key, , kind]) => {
-    if (kind === "manual" || kind === "manual_select") {
+    if (kind === "manual" || kind === "manual_date" || kind === "manual_select") {
       const el = document.getElementById(`ecd-field-${key}`);
       if (el) data[key] = el.value;
+    } else if (kind === "manual_currency") {
+      const el = document.getElementById(`ecd-field-${key}`);
+      if (el) data[key] = el.value ? parseCurrency(el.value) : "";
     }
   });
   const res = await authFetch(`/orders/${escalationDetailOrderId}/escalation-detail`, {
     method: "PUT",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({data})
+    body: JSON.stringify({category: escalationDetailCategory, data})
   });
   if (!res.ok) {
     alert("Couldn't save escalation details: " + (await res.text()));
