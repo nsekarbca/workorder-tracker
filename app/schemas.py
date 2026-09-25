@@ -229,6 +229,9 @@ class EscalationDetailOut(BaseModel):
 
 
 class EscalationDetailSave(BaseModel):
+    category: str  # which category's form this is — sent explicitly since the
+    # row's own escalation_category is often still an unsaved draft in the
+    # browser at the point the popup is used, not yet persisted to the order
     data: dict = {}  # only the category's manual fields — auto fields are always server-derived
 
 

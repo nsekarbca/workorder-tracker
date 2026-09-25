@@ -1446,7 +1446,7 @@ def update_colleague_fields(
         # keep whatever was manually typed into the popup, but recompute
         # every auto/fixed/user field fresh from the order as it stands
         # right now.
-        manual_keys = {k for k, _l, kind in ESCALATION_CATEGORY_FIELDS[category] if kind in ("manual", "manual_select")}
+        manual_keys = {k for k, _l, kind in ESCALATION_CATEGORY_FIELDS[category] if kind in ("manual", "manual_date", "manual_currency", "manual_select")}
         manual_values = {k: detail.data.get(k) for k in manual_keys}
         merged = _compute_escalation_auto_fields(category, order, current_user)
         merged.update(manual_values)
@@ -1734,11 +1734,13 @@ UTILITY_CATEGORY_OPTIONS = (
 
 # Field spec per (non-Clarification) Escalation Category. Each entry is
 # (key, label, kind):
-#   "auto:<attr>"     -> read-only, copied from that WorkOrder attribute
+#   "auto:<attr>"      -> read-only, copied from that WorkOrder attribute
 #   "fixed:<value>"    -> read-only constant
 #   "user"             -> read-only, current user's full name
 #   "poster_comment"   -> read-only, copied from the order's Poster Comment
 #   "manual"           -> free text, typed in by whoever's filling it out
+#   "manual_date"      -> a date, typed in via a date picker
+#   "manual_currency"  -> a dollar amount, typed in with $ formatting
 #   "manual_select"    -> dropdown (Utility Category's options, currently
 #                          the only one) typed in by whoever's filling it out
 # Categories not listed here (e.g. "DUVA Verification") have no extra
@@ -1750,14 +1752,14 @@ ESCALATION_CATEGORY_FIELDS = {
         ("division_number", "Division #", "auto:division"),
         ("payer", "Payer", "manual"),
         ("check_number", "Check#", "manual"),
-        ("amount", "Amount", "manual"),
+        ("amount", "Amount", "manual_currency"),
         ("deposit_date", "Deposit date", "auto:deposit_date"),
         ("poster_comments", "Poster Comments", "poster_comment"),
     ],
     "Invoice Creation": [
         ("division", "Division", "auto:division"),
         ("utility_category", "Utility Category", "manual_select"),
-        ("edm_batch_number", "EDM Batch#", "manual"),
+        ("edm_batch_number", "EDM Batch#", "auto:edm"),
         ("bar_batch_number", "Bar Batch #", "auto:bar_batch"),
         ("deposit_date", "Deposit Date", "auto:deposit_date"),
         ("page_number", "Page Number", "manual"),
@@ -1769,8 +1771,8 @@ ESCALATION_CATEGORY_FIELDS = {
         ("edm_batch_number", "EDM Batch #", "auto:edm"),
         ("bar_batch_number", "BAR Batch #", "auto:bar_batch"),
         ("batch_description", "Batch Description", "auto:description"),
-        ("dos", "DOS", "manual"),
-        ("cb_migration_date", "CB Migration date", "manual"),
+        ("dos", "DOS", "manual_date"),
+        ("cb_migration_date", "CB Migration date", "manual_date"),
         ("notes", "Notes", "poster_comment"),
         ("team", "Team", "fixed:EDM"),
         ("poster_login", "Poster Login", "user"),
@@ -1829,24 +1831,30 @@ def save_escalation_detail(
 ):
     """
     Creates or updates the category-specific detail popup for whichever
-    Escalation Category is currently set on the order (EOB not found,
-    Invoice Creation, Patient not found, Need to Delete). Only the
-    category's "manual"/"manual_select" fields come from payload.data —
-    every auto/fixed/user field is recomputed here from the order/current
-    user, same principle as the Clarification popup.
+    Escalation Category is currently selected on the row (EOB not found,
+    Invoice Creation, Patient not found, Need to Delete). The category
+    comes from payload.category, not order.escalation_category — the row
+    is very often not saved yet at the point this popup is used (the
+    colleague picks a category, which opens the popup, before ever
+    clicking the row's own Save), so the order's escalation_category can
+    still be None in the database. Only the category's "manual"/
+    "manual_date"/"manual_currency"/"manual_select" fields come from
+    payload.data — every auto/fixed/user field is recomputed here from
+    the order/current user, same principle as the Clarification popup.
     """
     order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     _require_clarification_access(current_user, order)
 
-    category = order.escalation_category
+    category = payload.category
     fields = ESCALATION_CATEGORY_FIELDS.get(category)
     if not fields:
         raise HTTPException(status_code=400, detail=f"No detail form defined for escalation category '{category}'")
 
     merged = _compute_escalation_auto_fields(category, order, current_user)
-    manual_keys = {key for key, _label, kind in fields if kind in ("manual", "manual_select")}
+    manual_kinds = ("manual", "manual_date", "manual_currency", "manual_select")
+    manual_keys = {key for key, _label, kind in fields if kind in manual_kinds}
     for key in manual_keys:
         if key in payload.data:
             merged[key] = payload.data[key]
