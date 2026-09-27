@@ -435,6 +435,7 @@ const COLUMNS = [
   {k:"issue_closed_date", label:"Issue Closed Date", group:"col"},
   {k:"posted_date", label:"Posted Date", group:"col"},
   {k:"tat_days", label:"TAT", group:"tat"},
+  {k:"time_taken", label:"Time Taken", group:"col"},
 ];
 
 const TL_FIELDS = [];
@@ -559,6 +560,74 @@ function renderTATCell(o) {
     return `<td style="color:#888; font-style:italic;" title="Running count since Received Date \u2014 not final until Completed">${elapsed}</td>`;
   }
   return `<td></td>`;
+}
+
+// timer_started_at is stored as a naive IST wall-clock timestamp (no
+// offset in the string) — parse it as IST explicitly rather than letting
+// the browser misread it as its own local time.
+function _parseISTDatetimeMs(isoString) {
+  if (!isoString) return null;
+  let s = isoString;
+  if (!/Z$|[+-]\d\d:\d\d$/.test(s)) s += "+05:30";
+  const ms = new Date(s).getTime();
+  return isNaN(ms) ? null : ms;
+}
+
+function _timeTakenSeconds(o) {
+  let secs = o.time_taken_seconds || 0;
+  if (o.timer_status === "running" && o.timer_started_at) {
+    const startMs = _parseISTDatetimeMs(o.timer_started_at);
+    if (startMs) secs += Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+  }
+  return secs;
+}
+
+function _formatDuration(totalSeconds) {
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = Math.floor(totalSeconds % 60);
+  return [h, m, s].map(n => String(n).padStart(2, "0")).join(":");
+}
+
+function renderTimeTakenCell(o, locked) {
+  const display = _formatDuration(_timeTakenSeconds(o));
+  if (role !== "colleague" || locked) {
+    return `<td>${display}</td>`;
+  }
+  if (o.timer_status === "running") {
+    return `<td><span class="ttk-live" data-order-id="${o.id}" data-started="${o.timer_started_at || ""}" data-base="${o.time_taken_seconds || 0}">${display}</span> <button class="action-btn" style="padding:2px 8px; font-size:11px;" onclick="pauseTimer(${o.id})">\u23f8 Pause</button></td>`;
+  }
+  if (o.timer_status === "paused") {
+    return `<td>${display} <button class="action-btn" style="padding:2px 8px; font-size:11px;" onclick="resumeTimer(${o.id})">\u25b6 Resume</button></td>`;
+  }
+  return `<td>${display}</td>`;
+}
+
+setInterval(() => {
+  document.querySelectorAll(".ttk-live").forEach(span => {
+    const startMs = _parseISTDatetimeMs(span.dataset.started);
+    let secs = parseInt(span.dataset.base) || 0;
+    if (startMs) secs += Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+    span.textContent = _formatDuration(secs);
+  });
+}, 1000);
+
+async function pauseTimer(orderId) {
+  const res = await authFetch(`/orders/${orderId}/timer/pause`, {method: "PATCH"});
+  if (!res.ok) {
+    alert("Couldn't pause: " + (await res.text()));
+    return;
+  }
+  loadOrders();
+}
+
+async function resumeTimer(orderId) {
+  const res = await authFetch(`/orders/${orderId}/timer/resume`, {method: "PATCH"});
+  if (!res.ok) {
+    alert("Couldn't resume: " + (await res.text()));
+    return;
+  }
+  loadOrders();
 }
 
 let currentOrders = [];
@@ -2285,6 +2354,11 @@ function renderGrid(orders) {
 
       if (c.k === "tat_days") {
         html += renderTATCell(o);
+        return;
+      }
+
+      if (c.k === "time_taken") {
+        html += renderTimeTakenCell(o, locked);
         return;
       }
 
