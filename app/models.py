@@ -298,4 +298,14 @@ class WorkOrder(Base):
     clarification_detail = relationship("ClarificationDetail", uselist=False, cascade="all, delete-orphan")
     escalation_detail = relationship("EscalationDetail", uselist=False, cascade="all, delete-orphan")
 
+    # "Time Taken" tracking — active working time only, not wall-clock
+    # time since assignment. Starts "running" the moment an order is
+    # (auto- or re-)assigned; time_taken_seconds accumulates each time the
+    # colleague pauses, the row completes, or it gets locked by an
+    # escalation. timer_started_at is the wall-clock moment the current
+    # running session began (None while paused/stopped).
+    timer_status = Column(String, nullable=False, default="running")  # "running" | "paused" | "stopped"
+    timer_started_at = Column(DateTime, nullable=True)
+    time_taken_seconds = Column(Integer, nullable=False, default=0)
+
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

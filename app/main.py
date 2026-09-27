@@ -91,6 +91,30 @@ def _require_process_access(user: models.User, process_id: int):
         raise HTTPException(status_code=403, detail="You don't have access to this process")
 
 
+def _finalize_timer(order: models.WorkOrder, new_status: str):
+    """
+    Rolls the current running session's elapsed time into
+    time_taken_seconds and stops the clock. Used whenever a row leaves
+    active colleague control — Pause, Complete (new_status='stopped'),
+    or getting locked by an escalation (new_status='paused', so it
+    resumes cleanly once handed back). No-op if the timer isn't running.
+    """
+    if order.timer_status == "running" and order.timer_started_at:
+        now = datetime.now(IST).replace(tzinfo=None)
+        elapsed = (now - order.timer_started_at).total_seconds()
+        if elapsed > 0:
+            order.time_taken_seconds = (order.time_taken_seconds or 0) + int(elapsed)
+    order.timer_status = new_status
+    order.timer_started_at = None
+
+
+def _start_timer(order: models.WorkOrder):
+    """Called whenever an order is freshly (re)assigned — resets the clock to zero and starts it running."""
+    order.timer_status = "running"
+    order.timer_started_at = datetime.now(IST).replace(tzinfo=None)
+    order.time_taken_seconds = 0
+
+
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
@@ -110,6 +134,9 @@ def login(
         raise HTTPException(status_code=403, detail="You don't have access to that process")
     token = auth.create_access_token({"sub": user.username})
     processes = db.query(models.Process).all() if user.role == "super_admin" else user.processes
+    if user.role == "colleague":
+        for p in processes:
+            _auto_assign_open_slots(db, p.id)
     return {
         "access_token": token,
         "token_type": "bearer",
@@ -835,6 +862,7 @@ def reassign_order(
     order.employee_id = new_colleague.employee_id or new_colleague.username
     order.employee_name = new_colleague.full_name
     order.last_edited_by = current_user.username
+    _start_timer(order)
     db.commit()
     db.refresh(order)
     return order
@@ -1099,6 +1127,7 @@ def _auto_assign_open_slots(db: Session, process_id: int):
         next_order.employee_id = colleague.employee_id or colleague.username
         next_order.employee_name = colleague.full_name
         next_order.posting_status = "In-Process"
+        _start_timer(next_order)
         db.add(next_order)
 
     db.commit()
@@ -1381,6 +1410,11 @@ def update_colleague_fields(
     if order.posting_status == "Completed" and not order.posted_date:
         order.posted_date = datetime.now(IST).date()
 
+    # Completing an order freezes its "Time Taken" — stop the clock and
+    # roll in whatever time was still running.
+    if order.posting_status == "Completed" and order.timer_status == "running":
+        _finalize_timer(order, "stopped")
+
     # Resolving a Clarification (moving to any other status) auto-stamps
     # Issue Closed Date, mirroring how Issue Raised Date auto-stamps on the
     # way in. Escalation Category and Issue Raised Date are deliberately
@@ -1430,6 +1464,8 @@ def update_colleague_fields(
         detail.clarification_details = order.poster_comment
         detail.updated_at = datetime.now(IST)
         order.escalated = True
+        if order.timer_status == "running":
+            _finalize_timer(order, "paused")
     elif order.posting_status == "Clarification" and order.escalation_category in ESCALATION_CATEGORY_FIELDS:
         category = order.escalation_category
         detail = (
@@ -1454,30 +1490,8 @@ def update_colleague_fields(
         detail.posted_by_name = current_user.full_name
         detail.updated_at = datetime.now(IST)
         order.escalated = True
-    elif (
-        order.posting_status == "Clarification"
-        and order.escalation_category in ESCALATION_CATEGORY_FIELDS
-    ):
-        category = order.escalation_category
-        detail = (
-            db.query(models.EscalationDetail)
-            .filter(models.EscalationDetail.order_id == order.id)
-            .first()
-        )
-        if not detail:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Fill in the {category} details popup (📋 Details) before saving",
-            )
-        # Same reasoning as the Clarification branch above: refresh the
-        # auto/fixed/user/poster-comment fields from the order as it
-        # stands right now, keeping whatever manual fields were typed in.
-        fresh_auto = _compute_escalation_auto_fields(category, order, current_user)
-        merged = dict(detail.data or {})
-        merged.update(fresh_auto)
-        detail.data = merged
-        detail.updated_at = datetime.now(IST)
-        order.escalated = True
+        if order.timer_status == "running":
+            _finalize_timer(order, "paused")
 
     # Pending $ = Amount - Posted $, recalculated any time either changes.
     if order.amount is not None:
@@ -1551,6 +1565,49 @@ def submit_end_of_day(
         order.submitted_at = now
     db.commit()
     return {"submitted": len(orders)}
+
+
+@app.patch("/orders/{order_id}/timer/pause", response_model=schemas.WorkOrderOut)
+def pause_timer(
+    order_id: int,
+    current_user: models.User = Depends(auth.require_role("colleague")),
+    db: Session = Depends(get_db),
+):
+    order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.assigned_to_id != current_user.id:
+        raise HTTPException(status_code=403, detail="This order is not assigned to you")
+    if order.escalated or order.posting_status == "Completed":
+        raise HTTPException(status_code=400, detail="This order is locked and its timer can't be changed")
+    if order.timer_status != "running":
+        raise HTTPException(status_code=400, detail="Timer isn't running")
+    _finalize_timer(order, "paused")
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+@app.patch("/orders/{order_id}/timer/resume", response_model=schemas.WorkOrderOut)
+def resume_timer(
+    order_id: int,
+    current_user: models.User = Depends(auth.require_role("colleague")),
+    db: Session = Depends(get_db),
+):
+    order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.assigned_to_id != current_user.id:
+        raise HTTPException(status_code=403, detail="This order is not assigned to you")
+    if order.escalated or order.posting_status == "Completed":
+        raise HTTPException(status_code=400, detail="This order is locked and its timer can't be changed")
+    if order.timer_status != "paused":
+        raise HTTPException(status_code=400, detail="Timer isn't paused")
+    order.timer_status = "running"
+    order.timer_started_at = datetime.now(IST).replace(tzinfo=None)
+    db.commit()
+    db.refresh(order)
+    return order
 
 
 @app.patch("/orders/{order_id}/team-lead-correction", response_model=schemas.WorkOrderOut)
@@ -1629,6 +1686,9 @@ def resolve_escalation(
     order.issue_closed_date = datetime.now(IST).date()
     order.escalated = False
     order.last_edited_by = current_user.username
+    if order.timer_status == "paused":
+        order.timer_status = "running"
+        order.timer_started_at = datetime.now(IST).replace(tzinfo=None)
     db.commit()
     db.refresh(order)
     return order
