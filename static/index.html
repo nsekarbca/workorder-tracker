@@ -1219,13 +1219,14 @@ function renderEscalations(list) {
     container.innerHTML = html;
     return;
   }
-  html += "<table><thead><tr><th>Category</th><th>Details</th>";
+  html += "<table><thead><tr><th>Category</th>";
+  DETAIL_COLUMNS.forEach(([, label]) => html += `<th>${label}</th>`);
   html += resolved ? "<th>VENTRA Comment</th><th>Issue Closed Date</th>" : "<th>VENTRA Comment</th><th>Action</th>";
   html += "</tr></thead><tbody>";
   filtered.forEach(o => {
     html += "<tr>";
     html += `<td>${o.escalation_category ?? ""}</td>`;
-    html += `<td style="max-width:320px; white-space:normal; font-size:12px;">${_escalationDetailSummaryHTML(o)}</td>`;
+    DETAIL_COLUMNS.forEach(([key]) => html += `<td>${_detailFieldValue(o, key)}</td>`);
     if (resolved) {
       html += `<td style="max-width:220px; white-space:normal;">${o.ventra_comment ?? ""}</td>`;
       html += `<td>${o.issue_closed_date ?? ""}</td>`;
@@ -1246,13 +1247,12 @@ function exportEscalationsCSV() {
     return;
   }
   const resolved = escalationsTab === "resolved";
-  const headers = ["Category", "Details", "VENTRA Comment"].concat(resolved ? ["Issue Closed Date"] : []);
+  const headers = ["Category"].concat(DETAIL_COLUMNS.map(([, label]) => label)).concat(["VENTRA Comment"])
+    .concat(resolved ? ["Issue Closed Date"] : []);
   const rows = filtered.map(o => {
-    const detailsText = _escalationDetailPairs(o)
-      .filter(([, v]) => v !== null && v !== undefined && v !== "")
-      .map(([label, v]) => `${label}: ${v}`)
-      .join("; ");
-    const cells = [o.escalation_category ?? "", detailsText, o.ventra_comment ?? ""]
+    const cells = [o.escalation_category ?? ""]
+      .concat(DETAIL_COLUMNS.map(([key]) => _detailFieldValue(o, key)))
+      .concat([o.ventra_comment ?? ""])
       .concat(resolved ? [o.issue_closed_date ?? ""] : []);
     return cells.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",");
   });
@@ -1811,7 +1811,6 @@ function clearProductionFilters() {
 function renderProductionGrid(orders) {
   let html = "<table><thead><tr>";
   COLUMNS.forEach(c => html += `<th class="${c.group}">${c.label}</th>`);
-  DETAIL_COLUMNS.forEach(([, label]) => html += `<th class="col">${label}</th>`);
   html += `<th class="col">Submitted At</th>`;
   html += "</tr></thead><tbody>";
   orders.forEach(o => {
@@ -1824,7 +1823,6 @@ function renderProductionGrid(orders) {
       const val = o[c.k] ?? "";
       html += `<td>${c.currency ? formatCurrency(val) : val}</td>`;
     });
-    DETAIL_COLUMNS.forEach(([key]) => html += `<td>${_detailFieldValue(o, key)}</td>`);
     html += `<td>${formatIST(o.submitted_at)}</td>`;
     html += "</tr>";
   });
@@ -1841,13 +1839,12 @@ function exportProductionCSV() {
     alert("Nothing to export \u2014 load a date range first.");
     return;
   }
-  const headers = COLUMNS.map(c => c.label).concat(DETAIL_COLUMNS.map(([, label]) => label)).concat(["Submitted At"]);
+  const headers = COLUMNS.map(c => c.label).concat(["Submitted At"]);
   const rows = currentProduction.map(o => {
     const cells = COLUMNS.map(c => {
       if (c.k === "time_taken") return _formatDuration(_timeTakenSeconds(o));
       return o[c.k] ?? "";
-    }).concat(DETAIL_COLUMNS.map(([key]) => _detailFieldValue(o, key)))
-      .concat([formatIST(o.submitted_at)]);
+    }).concat([formatIST(o.submitted_at)]);
     return cells.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",");
   });
   const csv = [headers.join(","), ...rows].join("\r\n");
