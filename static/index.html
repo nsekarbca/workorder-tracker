@@ -1072,8 +1072,40 @@ async function showEscalationsView() {
 
 function switchEscalationsTab(tab) {
   escalationsTab = tab;
-  escalationFilters = { category: "", escalationType: "", search: "", dateFrom: "", dateTo: "" };
+  const keepCategory = escalationFilters.category;
+  escalationFilters = { category: keepCategory, escalationType: "", search: "", dateFrom: "", dateTo: "" };
   loadEscalations();
+}
+
+// Separate screen per escalation category: "" = All (combined view),
+// otherwise only that category's rows with only that category's columns.
+function switchEscalationsCategory(cat) {
+  escalationFilters = { category: cat, escalationType: "", search: "", dateFrom: "", dateTo: "" };
+  renderEscalations(currentEscalations);
+}
+
+// Columns shown for the current screen: the category's own fields, or the
+// union of every category's fields on the All screen.
+function _escColumns() {
+  const cat = escalationFilters.category;
+  if (cat === "Clarification") return CLARIFICATION_DETAIL_FIELDS.map(([k, l]) => [k, l]);
+  if (cat && ESCALATION_CATEGORY_FIELDS[cat]) return ESCALATION_CATEGORY_FIELDS[cat].map(([k, l]) => [k, l]);
+  return DETAIL_COLUMNS;
+}
+
+function _escalationsCategoryBar() {
+  const active = escalationFilters.category;
+  const btn = (cat, label) => {
+    const n = cat ? currentEscalations.filter(o => o.escalation_category === cat).length : currentEscalations.length;
+    const on = active === cat;
+    const safe = cat.replace(/'/g, "\\'");
+    return `<button class="action-btn" style="${on ? "" : "background:#888;"}" onclick="switchEscalationsCategory('${safe}')">${label} (${n})</button>`;
+  };
+  let html = `<div style="margin-bottom:10px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">`;
+  html += btn("", "All");
+  ALL_ESCALATION_CATEGORIES.forEach(c => html += btn(c, c));
+  html += `</div>`;
+  return html;
 }
 
 async function loadEscalations() {
@@ -1165,12 +1197,11 @@ function _escalationsFilterBar() {
   const resolved = escalationsTab === "resolved";
   const dateLabel = resolved ? "Issue Closed" : "Issue Raised";
   let html = `<div style="margin-bottom:10px; display:flex; gap:14px; align-items:center; flex-wrap:wrap; background:white; padding:8px 12px; border-radius:6px;">`;
-  html += `<label style="font-size:13px;">Category <select id="esc-filter-category" onchange="applyEscalationFilters()"><option value="">All</option>`;
-  ALL_ESCALATION_CATEGORIES.forEach(c => html += `<option value="${c}" ${escalationFilters.category === c ? "selected" : ""}>${c}</option>`);
-  html += `</select></label>`;
-  html += `<label style="font-size:13px;">Escalation Type <select id="esc-filter-type" onchange="applyEscalationFilters()"><option value="">All</option>`;
-  ESCALATION_TYPES.forEach(t => html += `<option value="${t}" ${escalationFilters.escalationType === t ? "selected" : ""}>${t}</option>`);
-  html += `</select></label>`;
+  if (!escalationFilters.category || escalationFilters.category === "Clarification") {
+    html += `<label style="font-size:13px;">Escalation Type <select id="esc-filter-type" onchange="applyEscalationFilters()"><option value="">All</option>`;
+    ESCALATION_TYPES.forEach(t => html += `<option value="${t}" ${escalationFilters.escalationType === t ? "selected" : ""}>${t}</option>`);
+    html += `</select></label>`;
+  }
   html += `<label style="font-size:13px;">Search <input id="esc-filter-search" value="${escalationFilters.search || ""}" onchange="applyEscalationFilters()" placeholder="EDM, BAR batch, payer, amount..." style="width:220px;"></label>`;
   html += `<label style="font-size:13px;">${dateLabel} From <input type="date" id="esc-filter-from" value="${escalationFilters.dateFrom}" onchange="applyEscalationFilters()"></label>`;
   html += `<label style="font-size:13px;">To <input type="date" id="esc-filter-to" value="${escalationFilters.dateTo}" onchange="applyEscalationFilters()"></label>`;
@@ -1180,8 +1211,8 @@ function _escalationsFilterBar() {
 }
 
 function applyEscalationFilters() {
-  escalationFilters.category = document.getElementById("esc-filter-category").value;
-  escalationFilters.escalationType = document.getElementById("esc-filter-type").value;
+  const typeEl = document.getElementById("esc-filter-type");
+  escalationFilters.escalationType = typeEl ? typeEl.value : "";
   escalationFilters.search = document.getElementById("esc-filter-search").value.trim();
   escalationFilters.dateFrom = document.getElementById("esc-filter-from").value;
   escalationFilters.dateTo = document.getElementById("esc-filter-to").value;
@@ -1213,20 +1244,23 @@ function renderEscalations(list) {
   const container = document.getElementById("grid-container");
   const resolved = escalationsTab === "resolved";
   const filtered = _filteredEscalations(list);
-  let html = _escalationsTabBar() + _escalationsFilterBar();
+  const cols = _escColumns();
+  const showCat = !escalationFilters.category;
+  let html = _escalationsCategoryBar() + _escalationsTabBar() + _escalationsFilterBar();
   if (!filtered.length) {
-    html += `<p>No ${resolved ? "resolved" : "open"} escalations match.</p>`;
+    const catLabel = escalationFilters.category ? ` ${escalationFilters.category}` : "";
+    html += `<p>No ${resolved ? "resolved" : "open"}${catLabel} escalations match.</p>`;
     container.innerHTML = html;
     return;
   }
-  html += "<table><thead><tr><th>Category</th>";
-  DETAIL_COLUMNS.forEach(([, label]) => html += `<th>${label}</th>`);
+  html += "<table><thead><tr>" + (showCat ? "<th>Category</th>" : "");
+  cols.forEach(([, label]) => html += `<th>${label}</th>`);
   html += resolved ? "<th>VENTRA Comment</th><th>Issue Closed Date</th>" : "<th>VENTRA Comment</th><th>Action</th>";
   html += "</tr></thead><tbody>";
   filtered.forEach(o => {
     html += "<tr>";
-    html += `<td>${o.escalation_category ?? ""}</td>`;
-    DETAIL_COLUMNS.forEach(([key]) => html += `<td>${_detailFieldValue(o, key)}</td>`);
+    if (showCat) html += `<td>${o.escalation_category ?? ""}</td>`;
+    cols.forEach(([key]) => html += `<td>${_detailFieldValue(o, key)}</td>`);
     if (resolved) {
       html += `<td style="max-width:220px; white-space:normal;">${o.ventra_comment ?? ""}</td>`;
       html += `<td>${o.issue_closed_date ?? ""}</td>`;
@@ -1247,11 +1281,13 @@ function exportEscalationsCSV() {
     return;
   }
   const resolved = escalationsTab === "resolved";
-  const headers = ["Category"].concat(DETAIL_COLUMNS.map(([, label]) => label)).concat(["VENTRA Comment"])
+  const cols = _escColumns();
+  const showCat = !escalationFilters.category;
+  const headers = (showCat ? ["Category"] : []).concat(cols.map(([, label]) => label)).concat(["VENTRA Comment"])
     .concat(resolved ? ["Issue Closed Date"] : []);
   const rows = filtered.map(o => {
-    const cells = [o.escalation_category ?? ""]
-      .concat(DETAIL_COLUMNS.map(([key]) => _detailFieldValue(o, key)))
+    const cells = (showCat ? [o.escalation_category ?? ""] : [])
+      .concat(cols.map(([key]) => _detailFieldValue(o, key)))
       .concat([o.ventra_comment ?? ""])
       .concat(resolved ? [o.issue_closed_date ?? ""] : []);
     return cells.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",");
@@ -1261,7 +1297,8 @@ function exportEscalationsCSV() {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `escalations_${escalationsTab}_${new Date().toISOString().slice(0, 10)}.csv`;
+  const catSlug = escalationFilters.category ? "_" + escalationFilters.category.toLowerCase().replace(/[^a-z0-9]+/g, "-") : "";
+  a.download = `escalations${catSlug}_${escalationsTab}_${new Date().toISOString().slice(0, 10)}.csv`;
   a.click();
   URL.revokeObjectURL(url);
 }
