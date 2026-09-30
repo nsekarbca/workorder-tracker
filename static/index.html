@@ -1107,6 +1107,28 @@ const CLARIFICATION_DETAIL_FIELDS = [
 // field spec/table to read from when rendering a row's details.
 const ALL_ESCALATION_CATEGORIES = ["Clarification", ...Object.keys(ESCALATION_CATEGORY_FIELDS)];
 
+// Union of every escalation category's detail fields, deduped by key —
+// used to give Production its own individual column per field (rather
+// than the combined "Details" summary the Escalations queue uses),
+// since Production is a flat report/export screen.
+const DETAIL_COLUMNS = (() => {
+  const seen = new Map();
+  CLARIFICATION_DETAIL_FIELDS.forEach(([key, label]) => { if (!seen.has(key)) seen.set(key, label); });
+  Object.values(ESCALATION_CATEGORY_FIELDS).forEach(spec => {
+    spec.forEach(([key, label]) => { if (!seen.has(key)) seen.set(key, label); });
+  });
+  return Array.from(seen.entries());
+})();
+
+function _detailFieldValue(o, key) {
+  if (o.escalation_category === "Clarification") {
+    const v = o.clarification_detail && o.clarification_detail[key];
+    return (v === null || v === undefined) ? "" : v;
+  }
+  const v = o.escalation_detail && o.escalation_detail.data && o.escalation_detail.data[key];
+  return (v === null || v === undefined) ? "" : v;
+}
+
 function _escalationDetailPairs(o) {
   if (o.escalation_category === "Clarification") {
     const d = o.clarification_detail || {};
@@ -1619,6 +1641,17 @@ async function clearAllData() {
   loadOrders();
 }
 
+async function clearOneOrder(orderId) {
+  const sure = confirm("Permanently delete this one order? This cannot be undone.");
+  if (!sure) return;
+  const res = await authFetch(`/orders/${orderId}`, {method: "DELETE"});
+  if (!res.ok) {
+    alert("Delete failed: " + (await res.text()));
+    return;
+  }
+  loadOrders();
+}
+
 async function submitEndOfDay() {
   const sure = confirm("Submit all your Completed orders in this process to Production? Once submitted, they can no longer be corrected by you or your Team Lead.");
   if (!sure) return;
@@ -1778,14 +1811,20 @@ function clearProductionFilters() {
 function renderProductionGrid(orders) {
   let html = "<table><thead><tr>";
   COLUMNS.forEach(c => html += `<th class="${c.group}">${c.label}</th>`);
+  DETAIL_COLUMNS.forEach(([, label]) => html += `<th class="col">${label}</th>`);
   html += `<th class="col">Submitted At</th>`;
   html += "</tr></thead><tbody>";
   orders.forEach(o => {
     html += "<tr>";
     COLUMNS.forEach(c => {
+      if (c.k === "time_taken") {
+        html += `<td>${_formatDuration(_timeTakenSeconds(o))}</td>`;
+        return;
+      }
       const val = o[c.k] ?? "";
       html += `<td>${c.currency ? formatCurrency(val) : val}</td>`;
     });
+    DETAIL_COLUMNS.forEach(([key]) => html += `<td>${_detailFieldValue(o, key)}</td>`);
     html += `<td>${formatIST(o.submitted_at)}</td>`;
     html += "</tr>";
   });
@@ -1802,15 +1841,15 @@ function exportProductionCSV() {
     alert("Nothing to export \u2014 load a date range first.");
     return;
   }
-  const headers = COLUMNS.map(c => c.label).concat(["Submitted At"]);
-  const keys = COLUMNS.map(c => c.k).concat(["submitted_at"]);
-  const rows = currentProduction.map(o =>
-    keys.map(k => {
-      let v = (k === "submitted_at") ? formatIST(o[k]) : (o[k] ?? "");
-      v = String(v).replace(/"/g, '""');
-      return `"${v}"`;
-    }).join(",")
-  );
+  const headers = COLUMNS.map(c => c.label).concat(DETAIL_COLUMNS.map(([, label]) => label)).concat(["Submitted At"]);
+  const rows = currentProduction.map(o => {
+    const cells = COLUMNS.map(c => {
+      if (c.k === "time_taken") return _formatDuration(_timeTakenSeconds(o));
+      return o[c.k] ?? "";
+    }).concat(DETAIL_COLUMNS.map(([key]) => _detailFieldValue(o, key)))
+      .concat([formatIST(o.submitted_at)]);
+    return cells.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",");
+  });
   const csv = [headers.join(","), ...rows].join("\r\n");
   const blob = new Blob([csv], {type: "text/csv;charset=utf-8;"});
   const url = URL.createObjectURL(blob);
@@ -2386,7 +2425,7 @@ function renderGrid(orders) {
       }
     } else if (isLeadRole()) {
       if (tlCanCorrect) {
-        html += `<td><button class="action-btn" onclick="saveRow(${o.id}, this)" ${hasDraft ? "" : "disabled"}>Save</button></td>`;
+        html += `<td><button class="action-btn" onclick="saveRow(${o.id}, this)" ${hasDraft ? "" : "disabled"}>Save</button> <button class="action-btn" style="background:var(--red); padding:4px 8px; font-size:11px;" onclick="clearOneOrder(${o.id})">\ud83d\uddd1</button></td>`;
       } else {
         html += `<td><select onchange="reassignOrder(${o.id}, this.value)">`;
         html += `<option value="">Reassign\u2026</option>`;
@@ -2394,7 +2433,7 @@ function renderGrid(orders) {
           const isCurrent = c.id === o.assigned_to_id;
           html += `<option value="${c.id}" ${isCurrent ? "selected" : ""}>${c.full_name}${isCurrent ? " (current)" : ""}</option>`;
         });
-        html += `</select></td>`;
+        html += `</select> <button class="action-btn" style="background:var(--red); padding:4px 8px; font-size:11px;" onclick="clearOneOrder(${o.id})">\ud83d\uddd1</button></td>`;
       }
     }
     html += `</tr>`;
@@ -2476,10 +2515,10 @@ async function openClarificationModal(orderId) {
     }
   }
 
-  // Once the row is actually escalated (locked, sitting with the Team
-  // Lead), the Escalation Type can no longer be changed and there's
-  // nothing left to save here — just viewable.
-  const isLocked = order.escalated === true;
+  // Once the row is locked — either actually escalated (sitting with the
+  // Team Lead) or already Completed — the Escalation Type can no longer
+  // be changed and there's nothing left to save here, just viewable.
+  const isLocked = order.escalated === true || order.posting_status === "Completed";
   document.getElementById("cd-escalation-type").disabled = isLocked;
   document.getElementById("cd-save-btn").style.display = isLocked ? "none" : "inline-block";
 
@@ -2552,17 +2591,18 @@ async function openEscalationCategoryModal(orderId, category) {
   const draft = drafts[orderId] || {};
 
   document.getElementById("ecd-heading").textContent = `${category} — Details`;
+  const isLocked = order.escalated === true || order.posting_status === "Completed";
   const container = document.getElementById("ecd-fields");
   let html = "";
   fields.forEach(([key, label, kind]) => {
     if (kind === "manual") {
-      html += `<label>${label} <input id="ecd-field-${key}" data-key="${key}"></label>`;
+      html += `<label>${label} <input id="ecd-field-${key}" data-key="${key}" ${isLocked ? "disabled" : ""}></label>`;
     } else if (kind === "manual_date") {
-      html += `<label>${label} <input type="date" id="ecd-field-${key}" data-key="${key}"></label>`;
+      html += `<label>${label} <input type="date" id="ecd-field-${key}" data-key="${key}" ${isLocked ? "disabled" : ""}></label>`;
     } else if (kind === "manual_currency") {
-      html += `<label>${label} <input id="ecd-field-${key}" data-key="${key}" inputmode="decimal" placeholder="$0.00"></label>`;
+      html += `<label>${label} <input id="ecd-field-${key}" data-key="${key}" inputmode="decimal" placeholder="$0.00" ${isLocked ? "disabled" : ""}></label>`;
     } else if (kind === "manual_select") {
-      html += `<label>${label} <select id="ecd-field-${key}" data-key="${key}"><option value="">—</option>`;
+      html += `<label>${label} <select id="ecd-field-${key}" data-key="${key}" ${isLocked ? "disabled" : ""}><option value="">—</option>`;
       UTILITY_CATEGORY_OPTIONS.forEach(opt => html += `<option value="${opt}">${opt}</option>`);
       html += `</select></label>`;
     } else {
@@ -2571,6 +2611,7 @@ async function openEscalationCategoryModal(orderId, category) {
     }
   });
   container.innerHTML = html;
+  document.getElementById("ecd-save-btn").style.display = isLocked ? "none" : "inline-block";
 
   // Load any previously-saved manual values for this order/category.
   const res = await authFetch(`/orders/${orderId}/escalation-detail`);
