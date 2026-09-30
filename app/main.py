@@ -944,12 +944,31 @@ def delete_all_orders(
     """
     Deletes every work order in this process — used to clear test/imported
     data for a fresh run. Does NOT touch user accounts, and does not affect
-    other processes' data.
+    other processes' data. Registered before /orders/{order_id} on purpose:
+    a literal path has to come before a dynamic {order_id}: int path, or
+    "all" gets swallowed as an attempted (and invalid) order_id — same
+    routing gotcha as /orders/escalations earlier.
     """
     _require_process_access(current_user, process_id)
     deleted_count = db.query(models.WorkOrder).filter(models.WorkOrder.process_id == process_id).delete()
     db.commit()
     return {"deleted": deleted_count}
+
+
+@app.delete("/orders/{order_id}")
+def delete_one_order(
+    order_id: int,
+    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Deletes a single order — for cleaning up a bad test/import row without wiping the whole queue."""
+    order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    _require_process_access(current_user, order.process_id)
+    db.delete(order)
+    db.commit()
+    return {"deleted": 1}
 
 
 # ---------------------------------------------------------------------------
