@@ -1271,7 +1271,7 @@ def list_escalations(
     """
     resolved=False (default): rows currently locked awaiting a Team Lead's
     resolution. resolved=True: the report of past escalations this Team
-    Lead has already resolved (Escalation Category was Clarification,
+    Lead has already resolved (any escalation category with a detail form,
     no longer locked, Issue Closed Date stamped) — a history view, so it
     isn't filtered by submitted like the open queue is.
     A Team Lead sees only their own team's rows either way; a Super Admin
@@ -1285,7 +1285,7 @@ def list_escalations(
     query = db.query(models.WorkOrder).filter(models.WorkOrder.process_id == process_id)
     if resolved:
         query = query.filter(
-            models.WorkOrder.escalation_category == "Clarification",
+            models.WorkOrder.escalation_category.in_(("Clarification", *ESCALATION_CATEGORY_FIELDS.keys())),
             models.WorkOrder.escalated == False,  # noqa: E712
             models.WorkOrder.issue_closed_date.isnot(None),
         )
