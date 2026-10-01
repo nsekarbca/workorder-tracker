@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
-from sqlalchemy import or_
+from sqlalchemy import or_, and_, false as sa_false, func
 import csv
 import io
 import base64
@@ -89,6 +89,36 @@ def _user_has_process(user: models.User, process_id: int) -> bool:
 def _require_process_access(user: models.User, process_id: int):
     if not _user_has_process(user, process_id):
         raise HTTPException(status_code=403, detail="You don't have access to this process")
+
+
+def _team_colleague_ids(db: Session, team_lead: models.User) -> list:
+    """Ids of the colleagues who report to this Team Lead (matched on Reporting Manager)."""
+    return [
+        u.id for u in db.query(models.User.id).filter(
+            models.User.role == "colleague",
+            models.User.reporting_manager == team_lead.full_name,
+        ).all()
+    ]
+
+
+def _team_orders_condition(db: Session, user: models.User, include_unowned: bool = False):
+    """
+    SQL condition limiting work orders to those a Team Lead may see data for:
+    orders assigned to one of THEIR colleagues, plus not-yet-assigned orders
+    that are theirs (team_lead_id = them; with include_unowned also the
+    shared queue of orders no Team Lead owns yet). Super Admin: no limit
+    (returns None). Other Team Leads' colleagues' orders never match.
+    """
+    if user.role != "team_lead":
+        return None
+    ids = _team_colleague_ids(db, user)
+    owned = [models.WorkOrder.team_lead_id == user.id]
+    if include_unowned:
+        owned.append(models.WorkOrder.team_lead_id.is_(None))
+    return or_(
+        models.WorkOrder.assigned_to_id.in_(ids) if ids else sa_false(),
+        and_(models.WorkOrder.assigned_to_id.is_(None), or_(*owned)),
+    )
 
 
 def _finalize_timer(order: models.WorkOrder, new_status: str):
@@ -796,14 +826,18 @@ def list_colleagues(
     current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
     db: Session = Depends(get_db),
 ):
-    """Colleagues who have access to this process — populates the Reassign dropdown."""
+    """
+    Colleagues who have access to this process — populates the Reassign
+    dropdown. A Team Lead only ever gets their OWN colleagues (those whose
+    Reporting Manager is them); a Super Admin gets everyone.
+    """
     _require_process_access(current_user, process_id)
-    return (
-        db.query(models.User)
-        .filter(models.User.role == "colleague", models.User.processes.any(models.Process.id == process_id))
-        .order_by(models.User.full_name.asc())
-        .all()
+    q = db.query(models.User).filter(
+        models.User.role == "colleague", models.User.processes.any(models.Process.id == process_id)
     )
+    if current_user.role == "team_lead":
+        q = q.filter(models.User.reporting_manager == current_user.full_name)
+    return q.order_by(models.User.full_name.asc()).all()
 
 
 @app.post("/orders/run-assignment")
@@ -845,15 +879,21 @@ def reassign_order(
     if order.posting_status == "Completed":
         raise HTTPException(status_code=403, detail="Completed orders can't be reassigned this way")
 
-    new_colleague = (
-        db.query(models.User)
-        .filter(
-            models.User.id == payload.assigned_to_id,
-            models.User.role == "colleague",
-            models.User.processes.any(models.Process.id == order.process_id),
-        )
-        .first()
+    if current_user.role == "team_lead":
+        # Only orders in this Team Lead's own queue (theirs, or not yet owned
+        # by any Team Lead) can be reassigned...
+        if order.team_lead_id not in (None, current_user.id):
+            raise HTTPException(status_code=403, detail="This order belongs to another Team Lead")
+
+    new_colleague_q = db.query(models.User).filter(
+        models.User.id == payload.assigned_to_id,
+        models.User.role == "colleague",
+        models.User.processes.any(models.Process.id == order.process_id),
     )
+    if current_user.role == "team_lead":
+        # ...and only to colleagues who report to them.
+        new_colleague_q = new_colleague_q.filter(models.User.reporting_manager == current_user.full_name)
+    new_colleague = new_colleague_q.first()
     if not new_colleague:
         raise HTTPException(status_code=400, detail="Not a valid colleague for this process")
 
@@ -1204,8 +1244,9 @@ def list_production_orders(
     db: Session = Depends(get_db),
 ):
     """
-    Everything already submitted to Production, within one process. Team
-    Lead sees everyone's; a colleague only ever sees their own — enforced
+    Everything already submitted to Production, within one process. A Team
+    Lead sees their own colleagues' (never another Team Lead's); a Super
+    Admin sees everyone's; a colleague only ever sees their own — enforced
     server-side regardless of what filters are passed, not just hidden in
     the UI. All filters are optional and combine with AND. start_date/end_date
     filter by Posted Date (inclusive) — the day the work was actually completed.
@@ -1217,6 +1258,9 @@ def list_production_orders(
     )
     if current_user.role == "colleague":
         query = query.filter(models.WorkOrder.assigned_to_id == current_user.id)
+    elif current_user.role == "team_lead":
+        # A Team Lead only sees production data for THEIR OWN colleagues.
+        query = query.filter(_team_orders_condition(db, current_user))
 
     if start_date:
         query = query.filter(models.WorkOrder.posted_date >= start_date)
@@ -1555,6 +1599,84 @@ def update_colleague_fields(
         _auto_assign_open_slots(db, order.process_id)
 
     return order
+
+
+# ---------------------------------------------------------------------------
+# Team Lead Orders Dashboard (date-wise: received / pending / in-process /
+# clarification / completed)
+# ---------------------------------------------------------------------------
+
+@app.get("/dashboard/orders", response_model=List[schemas.OrdersDashboardRow])
+def orders_dashboard(
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    process_id: Optional[int] = None,
+    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    One row per date. The first five numbers count the orders RECEIVED on
+    that date (Received Date) by their CURRENT status:
+        pending       = not yet assigned/started (no posting status)
+        in_process    = In-Process
+        clarification = Clarification
+        completed     = Completed
+    so received = pending + in_process + clarification + completed.
+    completed_on_date counts orders marked Completed ON that date (Posted
+    Date). Orders already submitted to Production are included. A Team Lead
+    only counts their own team's orders (their colleagues' orders, plus
+    unassigned orders in their queue); a Super Admin counts everything.
+    """
+    if process_id is not None:
+        _require_process_access(current_user, process_id)
+
+    def scoped(q):
+        if process_id is not None:
+            q = q.filter(models.WorkOrder.process_id == process_id)
+        elif current_user.role == "team_lead":
+            my_process_ids = [p.id for p in current_user.processes]
+            q = q.filter(models.WorkOrder.process_id.in_(my_process_ids) if my_process_ids else sa_false())
+        cond = _team_orders_condition(db, current_user, include_unowned=True)
+        if cond is not None:
+            q = q.filter(cond)
+        return q
+
+    status_expr = func.coalesce(func.nullif(models.WorkOrder.posting_status, ""), "Pending")
+
+    rec = scoped(db.query(
+        models.WorkOrder.received_date, status_expr, func.count(models.WorkOrder.id)
+    ).filter(models.WorkOrder.received_date.isnot(None)))
+    if start_date:
+        rec = rec.filter(models.WorkOrder.received_date >= start_date)
+    if end_date:
+        rec = rec.filter(models.WorkOrder.received_date <= end_date)
+    rec = rec.group_by(models.WorkOrder.received_date, status_expr).all()
+
+    done = scoped(db.query(
+        models.WorkOrder.posted_date, func.count(models.WorkOrder.id)
+    ).filter(models.WorkOrder.posting_status == "Completed", models.WorkOrder.posted_date.isnot(None)))
+    if start_date:
+        done = done.filter(models.WorkOrder.posted_date >= start_date)
+    if end_date:
+        done = done.filter(models.WorkOrder.posted_date <= end_date)
+    done = done.group_by(models.WorkOrder.posted_date).all()
+
+    days = {}
+    def day(d):
+        return days.setdefault(d, {
+            "work_date": d, "received": 0, "pending": 0, "in_process": 0,
+            "clarification": 0, "completed": 0, "completed_on_date": 0,
+        })
+    key_for = {"Pending": "pending", "In-Process": "in_process", "Clarification": "clarification", "Completed": "completed"}
+    for d, st, n in rec:
+        row = day(d)
+        row["received"] += n
+        # Any unexpected status text is shown as pending rather than lost.
+        row[key_for.get(st, "pending")] += n
+    for d, n in done:
+        day(d)["completed_on_date"] += n
+
+    return sorted(days.values(), key=lambda r: r["work_date"], reverse=True)
 
 
 # ---------------------------------------------------------------------------

@@ -380,3 +380,19 @@ class BatchStatUpdate(BaseModel):
     hours_worked: Optional[float] = None
     accounts_audited: Optional[int] = None
     errors: Optional[int] = None
+
+
+# Team Lead "Orders Dashboard" — one row per date.
+# received / pending / in_process / clarification / completed all count the
+# orders RECEIVED on that date, by their current status (so they add up:
+# received = pending + in_process + clarification + completed).
+# completed_on_date counts orders marked Completed on that date (Posted
+# Date), whichever day they were received.
+class OrdersDashboardRow(BaseModel):
+    work_date: date
+    received: int
+    pending: int
+    in_process: int
+    clarification: int
+    completed: int
+    completed_on_date: int
