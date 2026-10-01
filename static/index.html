@@ -595,10 +595,10 @@ function renderTimeTakenCell(o, locked) {
     return `<td>${display}</td>`;
   }
   if (o.timer_status === "running") {
-    return `<td><span class="ttk-live" data-order-id="${o.id}" data-started="${o.timer_started_at || ""}" data-base="${o.time_taken_seconds || 0}">${display}</span> <button class="action-btn" style="padding:2px 8px; font-size:11px;" onclick="pauseTimer(${o.id})">\u23f8 Pause</button></td>`;
+    return `<td><span class="ttk-live" data-order-id="${o.id}" data-started="${o.timer_started_at || ""}" data-base="${o.time_taken_seconds || 0}">${display}</span> <button class="action-btn" tabindex="-1" style="padding:2px 8px; font-size:11px;" onclick="pauseTimer(${o.id})">\u23f8 Pause</button></td>`;
   }
   if (o.timer_status === "paused") {
-    return `<td>${display} <button class="action-btn" style="padding:2px 8px; font-size:11px;" onclick="resumeTimer(${o.id})">\u25b6 Resume</button></td>`;
+    return `<td>${display} <button class="action-btn" tabindex="-1" style="padding:2px 8px; font-size:11px;" onclick="resumeTimer(${o.id})">\u25b6 Resume</button></td>`;
   }
   return `<td>${display}</td>`;
 }
@@ -1708,14 +1708,39 @@ const DATE_FIELD_PARAMS = {
   assigned: ["assigned_start", "assigned_end"],
   created: ["created_start", "created_end"],
 };
-const VALUE_FILTER_FIELDS = ["employee_name", "def_doc_type", "division", "escalation_category", "posting_status"];
-const FILTER_FIELD_OPTIONS = [
-  {value: "employee_name", label: "Employee Name", teamLeadOnly: true},
-  {value: "def_doc_type", label: "Def Doc Type"},
-  {value: "division", label: "Division"},
-  {value: "escalation_category", label: "Escalation Category"},
-  {value: "posting_status", label: "Posting Status"},
-];
+// Filter By offers EVERY Production column header. The five fields the
+// backend already filters are also sent as query params; every field is
+// (re)applied client-side so all headers behave the same way.
+const SERVER_FILTER_FIELDS = ["employee_name", "def_doc_type", "division", "escalation_category", "posting_status"];
+const VALUE_FILTER_FIELDS = COLUMNS.map(c => c.k);
+const FILTER_FIELD_OPTIONS = COLUMNS.map(c => ({value: c.k, label: c.label, teamLeadOnly: c.k === "employee_name"}));
+function emptyValueFilters() { return Object.fromEntries(COLUMNS.map(c => [c.k, []])); }
+
+// The text a cell shows in Production — used both for the Filter By value
+// list and for matching rows, so what you pick is what you see.
+function _prodCellText(o, k) {
+  if (k === "time_taken") return _formatDuration(_timeTakenSeconds(o));
+  const col = COLUMNS.find(c => c.k === k);
+  const v = o[k];
+  if (v === null || v === undefined || v === "") return "";
+  return (col && col.currency) ? formatCurrency(v) : String(v);
+}
+
+function _applyClientValueFilters(list) {
+  const active = VALUE_FILTER_FIELDS.filter(f => (valueFilters[f] || []).length);
+  if (!active.length) return list;
+  return list.filter(o => active.every(f => valueFilters[f].includes(_prodCellText(o, f))));
+}
+
+// Marks fields that currently have a selection, e.g. "Division (2)".
+function refreshFilterFieldLabels() {
+  const sel = document.getElementById("prod-filter-field");
+  Array.from(sel.options).forEach(opt => {
+    const base = (FILTER_FIELD_OPTIONS.find(f => f.value === opt.value) || {}).label || opt.textContent;
+    const n = (valueFilters[opt.value] || []).length;
+    opt.textContent = n ? `${base} (${n})` : base;
+  });
+}
 
 function populateFilterFieldDropdown() {
   const sel = document.getElementById("prod-filter-field");
@@ -1730,7 +1755,7 @@ function populateFilterFieldDropdown() {
 }
 
 let dateFilters = {posted:{from:"",to:""}, received:{from:"",to:""}, assigned:{from:"",to:""}, created:{from:"",to:""}};
-let valueFilters = {employee_name:[], def_doc_type:[], division:[], escalation_category:[], posting_status:[]};
+let valueFilters = emptyValueFilters();
 let productionAllForOptions = [];
 
 async function showProductionView() {
@@ -1745,10 +1770,11 @@ async function showProductionView() {
   document.getElementById("production-bar").style.display = "flex";
 
   dateFilters = {posted:{from:"",to:""}, received:{from:"",to:""}, assigned:{from:"",to:""}, created:{from:"",to:""}};
-  valueFilters = {employee_name:[], def_doc_type:[], division:[], escalation_category:[], posting_status:[]};
+  valueFilters = emptyValueFilters();
   document.getElementById("prod-date-field").value = "posted";
   populateFilterFieldDropdown();
   document.getElementById("prod-filter-field").value = isLeadRole() ? "employee_name" : "def_doc_type";
+  document.getElementById("prod-filter-field").dataset.prev = document.getElementById("prod-filter-field").value;
   document.getElementById("prod-date-from").value = "";
   document.getElementById("prod-date-to").value = "";
 
@@ -1783,6 +1809,7 @@ function onDateFieldChange() {
 function onFilterFieldChange() {
   syncCurrentFilterSelection();
   populateFilterValueOptions();
+  refreshFilterFieldLabels();
 }
 
 function syncCurrentFilterSelection() {
@@ -1795,8 +1822,8 @@ function syncCurrentFilterSelection() {
 function populateFilterValueOptions() {
   const field = document.getElementById("prod-filter-field").value;
   const distinct = Array.from(new Set(
-    productionAllForOptions.map(o => o[field]).filter(v => v !== null && v !== undefined && v !== "")
-  )).sort();
+    productionAllForOptions.map(o => _prodCellText(o, field)).filter(v => v !== "")
+  )).sort((a, b) => a.localeCompare(b, undefined, {numeric: true}));
   const sel = document.getElementById("prod-filter-values");
   sel.innerHTML = "";
   distinct.forEach(v => {
@@ -1822,7 +1849,7 @@ async function loadProduction() {
     if (from) params.set(fromParam, from);
     if (to) params.set(toParam, to);
   }
-  for (const field of VALUE_FILTER_FIELDS) {
+  for (const field of SERVER_FILTER_FIELDS) {
     const values = valueFilters[field] || [];
     if (values.length) params.set(field, values.join(","));
   }
@@ -1832,16 +1859,18 @@ async function loadProduction() {
     alert("Failed to load Production data: " + (await res.text()));
     return;
   }
-  currentProduction = await res.json();
+  currentProduction = _applyClientValueFilters(await res.json());
+  refreshFilterFieldLabels();
   renderProductionGrid(currentProduction);
 }
 
 function clearProductionFilters() {
   dateFilters = {posted:{from:"",to:""}, received:{from:"",to:""}, assigned:{from:"",to:""}, created:{from:"",to:""}};
-  valueFilters = {employee_name:[], def_doc_type:[], division:[], escalation_category:[], posting_status:[]};
+  valueFilters = emptyValueFilters();
   document.getElementById("prod-date-from").value = "";
   document.getElementById("prod-date-to").value = "";
   populateFilterValueOptions();
+  refreshFilterFieldLabels();
   loadProduction();
 }
 
@@ -2372,7 +2401,7 @@ function renderGrid(orders) {
     const effStatus = effectiveValue(o, "posting_status");
     const hasDraft = drafts[o.id] && Object.keys(drafts[o.id]).length > 0;
 
-    html += `<tr${isEscalated ? ' class="row-escalated"' : ""}>`;
+    html += `<tr data-row-id="${o.id}"${isEscalated ? ' class="row-escalated"' : ""}>`;
     if (shareMode) {
       const shareable = o.team_lead_id === myUserId && !savedCompleted;
       html += `<td>${shareable ? `<input type="checkbox" onchange="toggleShareRow(${o.id}, this.checked)" ${selectedForShare.has(o.id) ? "checked" : ""}>` : ""}</td>`;
@@ -2381,8 +2410,12 @@ function renderGrid(orders) {
       const editableBase = (isLeadRole() && (TL_FIELDS.includes(c.k) || (tlCanCorrect && TL_CORRECTION_FIELDS.includes(c.k)))) ||
                             (role === "colleague" && COL_FIELDS.includes(c.k));
       let editable = editableBase && !locked;
+      // Escalation Category / Issue Raised Date only apply while a
+      // Clarification is open. Poster Comment is also editable once the
+      // (unsaved) status is Completed, so a closing note can be typed
+      // before Save.
       if (role === "colleague" && editable && CLARIFICATION_ONLY_FIELDS.includes(c.k) && effStatus !== "Clarification") {
-        editable = false;
+        if (!(c.k === "poster_comment" && effStatus === "Completed")) editable = false;
       }
       const rawVal = effectiveValue(o, c.k) ?? "";
 
@@ -2490,7 +2523,63 @@ function renderGrid(orders) {
   } else {
     document.getElementById("grid-container").innerHTML = html;
   }
+  _applyPendingFocus();
 }
+
+// ---------------------------------------------------------------------
+// Colleague keyboard order within a row:
+//   Posted $ -> BAR Batch -> Trans Count -> Posting Status -> Poster
+//   Comment -> (Escalation Category + Details, only when Posting Status is
+//   Clarification) -> Save.
+// The grid re-renders after every edit (which drops focus), so Tab is
+// handled explicitly: blur the field (committing its change), then put
+// focus on the next control once the re-render is done. Timer buttons are
+// tabindex=-1 so they never sit between a field and Save.
+// ---------------------------------------------------------------------
+let pendingFocus = null;
+
+function _rowFocusables(tr) {
+  return Array.from(tr.querySelectorAll(
+    "input.cell-edit, select.cell-edit, textarea.cell-edit, a.clarification-link, button.action-btn"
+  )).filter(el => el.dataset.field !== "issue_raised_date"   // auto-stamped on save; not a tab stop
+    && el.tabIndex >= 0 && (!el.disabled || (el.tagName === "BUTTON" && /^saveRow/.test(el.getAttribute("onclick") || ""))));
+}
+
+function _focusKey(el) {
+  if (el.dataset && el.dataset.field) return el.dataset.field;
+  if (el.classList.contains("clarification-link")) return "__details";
+  return "__save";
+}
+
+function _applyPendingFocus() {
+  if (!pendingFocus) return;
+  const { rowId, key } = pendingFocus;
+  pendingFocus = null;
+  const tr = document.querySelector(`#grid-container tr[data-row-id="${rowId}"]`);
+  if (!tr) return;
+  let el = null;
+  if (key === "__details") el = tr.querySelector("a.clarification-link");
+  else if (key === "__save") el = tr.querySelector('button[onclick^="saveRow"]');
+  else el = tr.querySelector(`[data-field="${key}"]`);
+  if (el && !el.disabled) el.focus();
+}
+
+document.addEventListener("keydown", e => {
+  if (e.key !== "Tab" || e.ctrlKey || e.altKey || e.metaKey) return;
+  if (role !== "colleague" || viewMode !== "active") return;
+  const el = e.target;
+  const tr = el && el.closest ? el.closest("#grid-container tr[data-row-id]") : null;
+  if (!tr) return;
+  const list = _rowFocusables(tr);
+  const i = list.indexOf(el);
+  if (i === -1) return;
+  const j = e.shiftKey ? i - 1 : i + 1;
+  if (j < 0 || j >= list.length) return; // leave the row: normal browser Tab
+  e.preventDefault();
+  pendingFocus = { rowId: tr.dataset.rowId, key: _focusKey(list[j]) };
+  el.blur();                    // fires "change" -> updateDraft -> renderGrid (which applies focus)
+  _applyPendingFocus();         // no re-render happened (value unchanged)
+});
 
 // ---------------------------------------------------------------------
 // Clarification Details popup (Escalation Category = "Clarification")
@@ -2701,7 +2790,22 @@ function updateDraft(input) {
   let value = input.value;
   if (value === "") value = null;
   if (!drafts[id]) drafts[id] = {};
+  const orderForDraft = currentOrders.find(o => o.id === id);
+  const prevStatus = (field === "posting_status" && orderForDraft)
+    ? effectiveValue(orderForDraft, "posting_status") : null;
   drafts[id][field] = value;
+
+  // Colleague moves the row OFF Clarification before saving (e.g. to
+  // Completed): the Escalation Category and Poster Comment typed/picked
+  // for the clarification no longer apply, so clear them. Only the
+  // unsaved draft is touched — Issue Raised Date and any already-saved
+  // category stay as history for TAT and the Resolved report.
+  if (role === "colleague" && field === "posting_status" && prevStatus === "Clarification" && value !== "Clarification") {
+    delete drafts[id]["escalation_category"];
+    delete drafts[id]["issue_raised_date"];
+    drafts[id]["poster_comment"] = null;
+  }
+  const refocusSelect = (input.tagName === "SELECT" && document.activeElement === input && !pendingFocus);
 
   if (field === "posted_amount") {
     const order = currentOrders.find(o => o.id === id);
@@ -2714,6 +2818,10 @@ function updateDraft(input) {
   }
 
   renderGrid(currentOrders);
+  if (refocusSelect) {
+    const again = document.querySelector(`select[data-id="${id}"][data-field="${field}"]`);
+    if (again) again.focus();
+  }
 }
 
 async function saveRow(orderId, btn) {
@@ -2762,6 +2870,7 @@ async function saveRow(orderId, btn) {
 
   if (finalStatus !== "Clarification") {
     const blocked = CLARIFICATION_ONLY_FIELDS.filter(f =>
+      !(f === "poster_comment" && finalStatus === "Completed") &&
       f in draft && draft[f] !== null && draft[f] !== ""
     );
     if (blocked.length) {
