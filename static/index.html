@@ -1065,7 +1065,7 @@ function _isoLocalDate(d) {
   return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}`;
 }
 
-function _fmtPct(v) { return (v === null || v === undefined) ? "\u2014" : `${v}%`; }
+function _fmtPct(v) { return (v === null || v === undefined) ? "\u2014" : `${Number(v).toFixed(2)}%`; }
 
 async function showBatchDashboardView() {
   viewMode = "batch";
@@ -1141,6 +1141,17 @@ function renderBatchGrid() {
           `<th class="col"># of Accounts Audited</th><th class="col"># of Errors</th><th class="col">Quality %</th><th class="col">Action</th></tr></thead><tbody>`;
   rows.forEach((r, i) => {
     const idx = currentBatchRows.indexOf(r);
+    if (r.is_summary) {
+      // "Overall" row: only added when the colleague worked 2+ processes that date.
+      const cell = v => `<td><strong>${v ?? ""}</strong></td>`;
+      html += `<tr style="background:#eef3fb;"><td><strong>${_esc(r.work_date)}</strong></td>`;
+      if (lead) html += cell(_esc(r.employee_name));
+      html += cell(_esc(r.process_name)) + cell(r.batches_worked) + cell(r.total_trans_count) + cell(r.hours_worked) +
+        `<td title="Transactions of the processes with a daily target and hours entered \u00f7 their combined expected output"><strong>${_fmtPct(r.production_pct)}</strong></td>` +
+        cell(r.accounts_audited) + cell(r.errors) +
+        `<td title="Based on the rows that have both Accounts Audited and Errors entered"><strong>${_fmtPct(r.quality_pct)}</strong></td><td></td></tr>`;
+      return;
+    }
     const prodTip = r.daily_target
       ? `Transactions \u00f7 (daily target ${r.daily_target} \u00d7 hours \u00f7 8)`
       : "No daily target set for this process (Super Admin sets it under Admin)";
@@ -1198,8 +1209,7 @@ async function saveBatchRow(idx, btn) {
     btn.disabled = false; btn.textContent = "Save";
     return;
   }
-  currentBatchRows[idx] = await res.json();
-  renderBatchGrid();
+  await loadBatchDashboard();   // reload so any Overall row is recalculated too
 }
 
 function exportBatchCSV() {
@@ -1211,7 +1221,8 @@ function exportBatchCSV() {
     "Production %", "# of Accounts Audited", "# of Errors", "Quality %"]);
   const lines = rows.map(r => ["" + r.work_date].concat(lead ? [r.employee_name] : []).concat([
     r.process_name, r.batches_worked, r.total_trans_count, r.hours_worked ?? "",
-    r.production_pct ?? "", r.accounts_audited ?? "", r.errors ?? "", r.quality_pct ?? ""])
+    r.production_pct === null ? "" : Number(r.production_pct).toFixed(2), r.accounts_audited ?? "", r.errors ?? "",
+    r.quality_pct === null ? "" : Number(r.quality_pct).toFixed(2)])
     .map(v => `"${String(v).replace(/"/g, '""')}"`).join(","));
   const csv = [headers.join(",")].concat(lines).join("\r\n");
   const blob = new Blob([csv], {type: "text/csv;charset=utf-8;"});
