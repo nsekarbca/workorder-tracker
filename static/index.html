@@ -172,6 +172,7 @@
       <div id="nav-menu" class="nav-menu" style="display:none;">
         <button class="nav-menu-item" onclick="navTo('home')">🏠 Home</button>
         <button class="nav-menu-item" onclick="navTo('active')">📋 Active Queue</button>
+        <button class="nav-menu-item" id="nav-batch-btn" style="display:none;" onclick="navTo('batch')">📊 Batch Dashboard</button>
         <button class="nav-menu-item" id="nav-production-btn" style="display:none;" onclick="navTo('production')">📦 Production</button>
         <button class="nav-menu-item" id="nav-escalations-btn" style="display:none;" onclick="navTo('escalations')">🚨 Escalations</button>
         <button class="nav-menu-item" id="nav-admin-btn" style="display:none;" onclick="navTo('admin')">⚙️ Admin</button>
@@ -224,6 +225,21 @@
           <button class="action-btn" onclick="clearProductionFilters()">Clear Filters</button>
           <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
         </div>
+      </div>
+      <div id="batch-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px;">
+        <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
+          <h3 style="margin:0;">📊 Batch Count Dashboard</h3>
+          <label>From <input type="date" id="batch-date-from"></label>
+          <label>To <input type="date" id="batch-date-to"></label>
+          <label>Process <select id="batch-process"></select></label>
+          <label id="batch-employee-label" style="display:none;">Employee <select id="batch-employee" onchange="renderBatchGrid()"></select></label>
+        </div>
+        <div style="display:flex; gap:10px;">
+          <button class="action-btn" onclick="loadBatchDashboard()">Load</button>
+          <button class="action-btn" onclick="exportBatchCSV()">Export CSV</button>
+          <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
+        </div>
+        <div style="font-size:12px; color:#666;" id="batch-hint"></div>
       </div>
       <div id="share-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px; background:white; padding:12px; border-radius:8px;">
         <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
@@ -975,6 +991,7 @@ function showApp() {
     document.getElementById("production-btn").style.display = "inline-block";
     document.getElementById("nav-production-btn").style.display = "block";
     document.getElementById("nav-escalations-btn").style.display = "block";
+    document.getElementById("nav-batch-btn").style.display = "block";
     document.getElementById("import-file").addEventListener("change", importCSV);
     if (currentProcessId) loadColleagueList();
     if (role === "team_lead") {
@@ -990,6 +1007,7 @@ function showApp() {
     document.getElementById("submit-day-btn").style.display = "inline-block";
     document.getElementById("production-btn").style.display = "inline-block";
     document.getElementById("nav-production-btn").style.display = "block";
+    document.getElementById("nav-batch-btn").style.display = "block";
   }
   if (role === "super_admin") {
     document.getElementById("admin-btn").style.display = "inline-block";
@@ -1020,10 +1038,189 @@ function navTo(dest) {
   document.getElementById("nav-menu").style.display = "none";
   if (dest === "home") showHomeView();
   else if (dest === "active") showActiveView();
+  else if (dest === "batch") showBatchDashboardView();
   else if (dest === "production") showProductionView();
   else if (dest === "escalations") showEscalationsView();
   else if (dest === "admin") showAdminView();
   else if (dest === "switch") showProcessSwitcher();
+}
+
+
+// ---------------------------------------------------------------------
+// Batch Count Dashboard — date-wise, per colleague / process.
+//   Auto-filled from completed orders: Process Name, # of Batches Worked,
+//   Total Transaction Counts. Production % and Quality % are calculated
+//   by the server. Manual: Total Hours Worked (colleague);
+//   # of Accounts Audited and # of Errors (Team Lead / Super Admin).
+// ---------------------------------------------------------------------
+
+let currentBatchRows = [];
+
+function _esc(v) {
+  return String(v ?? "").replace(/[&<>"']/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
+}
+
+function _isoLocalDate(d) {
+  const z = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}`;
+}
+
+function _fmtPct(v) { return (v === null || v === undefined) ? "\u2014" : `${v}%`; }
+
+async function showBatchDashboardView() {
+  viewMode = "batch";
+  document.getElementById("toolbar").style.display = "none";
+  document.getElementById("production-bar").style.display = "none";
+  document.getElementById("admin-panel").style.display = "none";
+  document.getElementById("dashboard-panel").style.display = "none";
+  document.getElementById("under-construction-banner").style.display = "none";
+  shareMode = false;
+  selectedForShare.clear();
+  document.getElementById("share-bar").style.display = "none";
+  document.getElementById("batch-bar").style.display = "flex";
+
+  const today = new Date();
+  const from = new Date(); from.setDate(today.getDate() - 13);
+  document.getElementById("batch-date-from").value = _isoLocalDate(from);
+  document.getElementById("batch-date-to").value = _isoLocalDate(today);
+
+  const procSel = document.getElementById("batch-process");
+  procSel.innerHTML = `<option value="">All processes</option>` +
+    myProcesses.map(p => `<option value="${p.id}">${_esc(p.name)}</option>`).join("");
+
+  document.getElementById("batch-employee-label").style.display = isLeadRole() ? "inline-block" : "none";
+  document.getElementById("batch-hint").textContent = isLeadRole()
+    ? "Enter # of Accounts Audited and # of Errors for each row, then Save. Hours Worked is entered by the colleague."
+    : "Enter your Total Hours Worked for each row, then Save. Audit figures are entered by your Team Lead.";
+  await loadBatchDashboard();
+}
+
+async function loadBatchDashboard() {
+  const params = new URLSearchParams();
+  const f = document.getElementById("batch-date-from").value;
+  const t = document.getElementById("batch-date-to").value;
+  const pr = document.getElementById("batch-process").value;
+  if (f) params.set("start_date", f);
+  if (t) params.set("end_date", t);
+  if (pr) params.set("process_id", pr);
+  const res = await authFetch("/batch-dashboard?" + params.toString());
+  if (!res.ok) {
+    alert("Couldn't load the Batch Dashboard: " + (await res.text()));
+    return;
+  }
+  currentBatchRows = await res.json();
+
+  if (isLeadRole()) {
+    const sel = document.getElementById("batch-employee");
+    const keep = sel.value;
+    const names = Array.from(new Set(currentBatchRows.map(r => r.employee_name))).sort();
+    sel.innerHTML = `<option value="">All</option>` + names.map(n => `<option value="${_esc(n)}">${_esc(n)}</option>`).join("");
+    if (names.includes(keep)) sel.value = keep;
+  }
+  renderBatchGrid();
+}
+
+function _batchVisibleRows() {
+  if (!isLeadRole()) return currentBatchRows;
+  const emp = document.getElementById("batch-employee").value;
+  return emp ? currentBatchRows.filter(r => r.employee_name === emp) : currentBatchRows;
+}
+
+function renderBatchGrid() {
+  const rows = _batchVisibleRows();
+  const lead = isLeadRole();
+  if (!rows.length) {
+    document.getElementById("grid-container").innerHTML =
+      "<p>No completed work found for this date range. A row appears for each date you mark an order Completed.</p>";
+    return;
+  }
+  let html = "<table><thead><tr><th class=\"col\">Date</th>";
+  if (lead) html += `<th class="col">Employee Name</th>`;
+  html += `<th class="col">Process Name</th><th class="col"># of Batches Worked</th><th class="col">Total Transaction Counts</th>` +
+          `<th class="col">Total Hours Worked</th><th class="col">Production %</th>` +
+          `<th class="col"># of Accounts Audited</th><th class="col"># of Errors</th><th class="col">Quality %</th><th class="col">Action</th></tr></thead><tbody>`;
+  rows.forEach((r, i) => {
+    const idx = currentBatchRows.indexOf(r);
+    const prodTip = r.daily_target
+      ? `Transactions \u00f7 (daily target ${r.daily_target} \u00d7 hours \u00f7 8)`
+      : "No daily target set for this process (Super Admin sets it under Admin)";
+    html += `<tr data-batch-idx="${idx}"><td>${_esc(r.work_date)}</td>`;
+    if (lead) html += `<td>${_esc(r.employee_name)}</td>`;
+    html += `<td>${_esc(r.process_name)}</td><td>${r.batches_worked}</td><td>${r.total_trans_count}</td>`;
+    if (lead) {
+      html += `<td>${r.hours_worked ?? ""}</td>`;
+    } else {
+      html += `<td><input type="number" min="0" max="24" step="0.25" data-bf="hours_worked" value="${r.hours_worked ?? ""}" style="width:80px;" oninput="batchRowDirty(this)"></td>`;
+    }
+    html += `<td title="${_esc(prodTip)}">${_fmtPct(r.production_pct)}</td>`;
+    if (lead) {
+      html += `<td><input type="number" min="0" step="1" data-bf="accounts_audited" value="${r.accounts_audited ?? ""}" style="width:80px;" oninput="batchRowDirty(this)"></td>`;
+      html += `<td><input type="number" min="0" step="1" data-bf="errors" value="${r.errors ?? ""}" style="width:80px;" oninput="batchRowDirty(this)"></td>`;
+    } else {
+      html += `<td>${r.accounts_audited ?? ""}</td><td>${r.errors ?? ""}</td>`;
+    }
+    html += `<td title="(Accounts Audited \u2212 Errors) \u00f7 Accounts Audited">${_fmtPct(r.quality_pct)}</td>`;
+    html += `<td><button class="action-btn" disabled onclick="saveBatchRow(${idx}, this)">Save</button></td></tr>`;
+  });
+  html += "</tbody></table>";
+  document.getElementById("grid-container").innerHTML = html;
+}
+
+function batchRowDirty(input) {
+  const btn = input.closest("tr").querySelector("button.action-btn");
+  if (btn) btn.disabled = false;
+}
+
+async function saveBatchRow(idx, btn) {
+  const r = currentBatchRows[idx];
+  const tr = btn.closest("tr");
+  const val = f => { const el = tr.querySelector(`[data-bf="${f}"]`); return el ? el.value.trim() : undefined; };
+  const body = { process_id: r.process_id, work_date: r.work_date };
+  if (isLeadRole()) {
+    body.user_id = r.user_id;
+    const a = val("accounts_audited"), e = val("errors");
+    body.accounts_audited = a === "" ? null : parseInt(a, 10);
+    body.errors = e === "" ? null : parseInt(e, 10);
+  } else {
+    const h = val("hours_worked");
+    body.hours_worked = h === "" ? null : parseFloat(h);
+  }
+  btn.disabled = true; btn.textContent = "Saving\u2026";
+  const res = await authFetch("/batch-dashboard", {
+    method: "PUT",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let msg = await res.text();
+    try { msg = JSON.parse(msg).detail || msg; } catch (_) {}
+    alert("Save failed: " + msg);
+    btn.disabled = false; btn.textContent = "Save";
+    return;
+  }
+  currentBatchRows[idx] = await res.json();
+  renderBatchGrid();
+}
+
+function exportBatchCSV() {
+  const rows = _batchVisibleRows();
+  if (!rows.length) { alert("Nothing to export \u2014 load a date range first."); return; }
+  const lead = isLeadRole();
+  const headers = ["Date"].concat(lead ? ["Employee Name"] : []).concat([
+    "Process Name", "# of Batches Worked", "Total Transaction Counts", "Total Hours Worked",
+    "Production %", "# of Accounts Audited", "# of Errors", "Quality %"]);
+  const lines = rows.map(r => ["" + r.work_date].concat(lead ? [r.employee_name] : []).concat([
+    r.process_name, r.batches_worked, r.total_trans_count, r.hours_worked ?? "",
+    r.production_pct ?? "", r.accounts_audited ?? "", r.errors ?? "", r.quality_pct ?? ""])
+    .map(v => `"${String(v).replace(/"/g, '""')}"`).join(","));
+  const csv = [headers.join(",")].concat(lines).join("\r\n");
+  const blob = new Blob([csv], {type: "text/csv;charset=utf-8;"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `batch_dashboard_${document.getElementById("batch-date-from").value || "all"}_to_${document.getElementById("batch-date-to").value || "all"}.csv`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 // ---------------------------------------------------------------------
@@ -1034,6 +1231,7 @@ function showHomeView() {
   viewMode = "home";
   document.getElementById("toolbar").style.display = "none";
   document.getElementById("production-bar").style.display = "none";
+  document.getElementById("batch-bar").style.display = "none";
   shareMode = false;
   selectedForShare.clear();
   document.getElementById("share-bar").style.display = "none";
@@ -1060,6 +1258,7 @@ async function showEscalationsView() {
   viewMode = "escalations";
   document.getElementById("toolbar").style.display = "none";
   document.getElementById("production-bar").style.display = "none";
+  document.getElementById("batch-bar").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
   shareMode = false;
@@ -1344,6 +1543,7 @@ async function showAdminView() {
   viewMode = "admin";
   document.getElementById("toolbar").style.display = "none";
   document.getElementById("production-bar").style.display = "none";
+  document.getElementById("batch-bar").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
   shareMode = false;
@@ -1768,6 +1968,7 @@ async function showProductionView() {
   selectedForShare.clear();
   document.getElementById("share-bar").style.display = "none";
   document.getElementById("production-bar").style.display = "flex";
+  document.getElementById("batch-bar").style.display = "none";
 
   dateFilters = {posted:{from:"",to:""}, received:{from:"",to:""}, assigned:{from:"",to:""}, created:{from:"",to:""}};
   valueFilters = emptyValueFilters();
@@ -1788,6 +1989,7 @@ function showActiveView() {
   viewMode = "active";
   document.getElementById("toolbar").style.display = "flex";
   document.getElementById("production-bar").style.display = "none";
+  document.getElementById("batch-bar").style.display = "none";
   document.getElementById("admin-panel").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
@@ -1973,6 +2175,7 @@ async function loadOrders() {
   document.getElementById("admin-panel").style.display = "none";
   document.getElementById("toolbar").style.display = "flex";
   document.getElementById("production-bar").style.display = "none";
+  document.getElementById("batch-bar").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
   viewMode = "active";
