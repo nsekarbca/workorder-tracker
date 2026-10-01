@@ -217,7 +217,12 @@
             <select id="prod-filter-field" onchange="onFilterFieldChange()"></select>
           </label>
           <select id="prod-filter-values" multiple size="5" style="min-width:200px;"></select>
-          <span style="font-size:12px; color:#666;">Ctrl/Cmd-click to select multiple</span>
+          <div style="display:flex; flex-direction:column; gap:4px;">
+            <textarea id="prod-filter-manual" rows="2" placeholder="Or type / paste value(s), e.g. 1030, 1036" autocomplete="off"
+                      style="min-width:260px; resize:vertical; font-family:inherit; font-size:13px;"
+                      onkeydown="if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); loadProduction(); }"></textarea>
+            <span style="font-size:12px; color:#666;">Ctrl/Cmd-click to select multiple &middot; typing matches any part of the value &middot; separate several with commas or new lines (Enter = Load, Shift+Enter = new line)</span>
+          </div>
         </div>
         <div style="display:flex; gap:10px;">
           <button class="action-btn" onclick="loadProduction()">Load</button>
@@ -1938,9 +1943,14 @@ function _prodCellText(o, k) {
 }
 
 function _applyClientValueFilters(list) {
-  const active = VALUE_FILTER_FIELDS.filter(f => (valueFilters[f] || []).length);
+  const active = VALUE_FILTER_FIELDS.filter(f => (valueFilters[f] || []).length || _manualTerms(f).length);
   if (!active.length) return list;
-  return list.filter(o => active.every(f => valueFilters[f].includes(_prodCellText(o, f))));
+  return list.filter(o => active.every(f => {
+    const text = _prodCellText(o, f);
+    if ((valueFilters[f] || []).includes(text)) return true;
+    const low = text.toLowerCase();
+    return _manualTerms(f).some(t => low.includes(t));
+  }));
 }
 
 // Marks fields that currently have a selection, e.g. "Division (2)".
@@ -1948,7 +1958,7 @@ function refreshFilterFieldLabels() {
   const sel = document.getElementById("prod-filter-field");
   Array.from(sel.options).forEach(opt => {
     const base = (FILTER_FIELD_OPTIONS.find(f => f.value === opt.value) || {}).label || opt.textContent;
-    const n = (valueFilters[opt.value] || []).length;
+    const n = (valueFilters[opt.value] || []).length + _manualTerms(opt.value).length;
     opt.textContent = n ? `${base} (${n})` : base;
   });
 }
@@ -1967,6 +1977,13 @@ function populateFilterFieldDropdown() {
 
 let dateFilters = {posted:{from:"",to:""}, received:{from:"",to:""}, assigned:{from:"",to:""}, created:{from:"",to:""}};
 let valueFilters = emptyValueFilters();
+// Typed (manual) filter text per field, e.g. {edm: "1030, 1036"}. A row passes
+// a field if it matches a ticked list value OR contains any typed term.
+let manualFilters = {};
+
+function _manualTerms(field) {
+  return (manualFilters[field] || "").split(/[,\n;]+/).map(t => t.trim().toLowerCase()).filter(Boolean);
+}
 let productionAllForOptions = [];
 
 async function showProductionView() {
@@ -1983,6 +2000,8 @@ async function showProductionView() {
 
   dateFilters = {posted:{from:"",to:""}, received:{from:"",to:""}, assigned:{from:"",to:""}, created:{from:"",to:""}};
   valueFilters = emptyValueFilters();
+  manualFilters = {};
+  document.getElementById("prod-filter-manual").value = "";
   document.getElementById("prod-date-field").value = "posted";
   populateFilterFieldDropdown();
   document.getElementById("prod-filter-field").value = isLeadRole() ? "employee_name" : "def_doc_type";
@@ -2022,6 +2041,7 @@ function onDateFieldChange() {
 function onFilterFieldChange() {
   syncCurrentFilterSelection();
   populateFilterValueOptions();
+  document.getElementById("prod-filter-manual").value = manualFilters[document.getElementById("prod-filter-field").value] || "";
   refreshFilterFieldLabels();
 }
 
@@ -2029,6 +2049,7 @@ function syncCurrentFilterSelection() {
   const field = document.getElementById("prod-filter-field").dataset.prev || document.getElementById("prod-filter-field").value;
   const sel = document.getElementById("prod-filter-values");
   valueFilters[field] = Array.from(sel.selectedOptions).map(o => o.value);
+  manualFilters[field] = document.getElementById("prod-filter-manual").value;
   document.getElementById("prod-filter-field").dataset.prev = document.getElementById("prod-filter-field").value;
 }
 
@@ -2063,6 +2084,7 @@ async function loadProduction() {
     if (to) params.set(toParam, to);
   }
   for (const field of SERVER_FILTER_FIELDS) {
+    if (_manualTerms(field).length) continue;   // typed text is matched client-side (list OR typed)
     const values = valueFilters[field] || [];
     if (values.length) params.set(field, values.join(","));
   }
@@ -2080,6 +2102,8 @@ async function loadProduction() {
 function clearProductionFilters() {
   dateFilters = {posted:{from:"",to:""}, received:{from:"",to:""}, assigned:{from:"",to:""}, created:{from:"",to:""}};
   valueFilters = emptyValueFilters();
+  manualFilters = {};
+  document.getElementById("prod-filter-manual").value = "";
   document.getElementById("prod-date-from").value = "";
   document.getElementById("prod-date-to").value = "";
   populateFilterValueOptions();
