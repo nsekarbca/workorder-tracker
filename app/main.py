@@ -1404,10 +1404,13 @@ def update_colleague_fields(
     CLARIFICATION_ONLY_FIELDS = [
         "poster_comment", "escalation_category", "issue_raised_date",
     ]
+    # Poster Comment is the one exception: it stays editable on the save
+    # that marks the row Completed (a closing note).
     if final_status != "Clarification":
         attempted = [
             f for f in CLARIFICATION_ONLY_FIELDS
-            if f in payload_data and payload_data[f] not in (None, "")
+            if not (f == "poster_comment" and final_status == "Completed")
+            and f in payload_data and payload_data[f] not in (None, "")
         ]
         if attempted:
             raise HTTPException(
