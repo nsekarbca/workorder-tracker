@@ -365,6 +365,9 @@ class BatchDashboardRow(BaseModel):
     accounts_audited: Optional[int] = None
     errors: Optional[int] = None
     quality_pct: Optional[float] = None
+    # True for the "Overall" row added when a colleague worked more than one
+    # process on the same date (process_id is 0 on those rows).
+    is_summary: bool = False
 
 
 # Only the fields actually sent are changed. Colleagues may send

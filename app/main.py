@@ -1640,14 +1640,14 @@ def batch_dashboard(
         errs = st.errors if st else None
         target = proc.daily_target if proc else None
 
-        production_pct = None
-        if target and hours and hours > 0:
-            production_pct = round(g["trans"] / (target * hours / STANDARD_SHIFT_HOURS) * 100, 1)
+        # Expected output for the hours worked; None if it can't be worked out.
+        expected = (target * hours / STANDARD_SHIFT_HOURS) if (target and hours and hours > 0) else None
+        production_pct = round(g["trans"] / expected * 100, 2) if expected else None
 
         # Quality % = share of audited accounts that were error-free.
         quality_pct = None
         if audited and audited > 0 and errs is not None:
-            quality_pct = round((audited - errs) / audited * 100, 1)
+            quality_pct = round((audited - errs) / audited * 100, 2)
 
         rows.append({
             "user_id": uid,
@@ -1663,11 +1663,61 @@ def batch_dashboard(
             "accounts_audited": audited,
             "errors": errs,
             "quality_pct": quality_pct,
+            "is_summary": False,
+            "_expected": expected,
         })
 
-    rows.sort(key=lambda r: (r["work_date"], r["employee_name"], r["process_name"]), reverse=False)
-    rows.reverse()  # newest date first
-    return rows
+    # Newest date first, then employee, then process.
+    rows.sort(key=lambda r: (-r["work_date"].toordinal(), r["employee_name"], r["process_name"]))
+
+    # Where one colleague worked more than one process on the same date, add
+    # an "Overall" row straight after that group.
+    out = []
+    i = 0
+    while i < len(rows):
+        j = i
+        while j < len(rows) and rows[j]["user_id"] == rows[i]["user_id"] and rows[j]["work_date"] == rows[i]["work_date"]:
+            j += 1
+        group = rows[i:j]
+        out.extend(group)
+        if len(group) > 1:
+            hrs = [r["hours_worked"] for r in group if r["hours_worked"] is not None]
+            aud = [r["accounts_audited"] for r in group if r["accounts_audited"] is not None]
+            err = [r["errors"] for r in group if r["errors"] is not None]
+            # Overall Production % = transactions of the processes that can be
+            # measured (daily target AND hours entered) vs their combined
+            # expected output.
+            measured = [r for r in group if r["_expected"]]
+            prod = None
+            if measured:
+                prod = round(sum(r["total_trans_count"] for r in measured) / sum(r["_expected"] for r in measured) * 100, 2)
+            # Overall Quality % uses only rows with both audit figures entered.
+            complete = [r for r in group if r["accounts_audited"] and r["errors"] is not None]
+            qual = None
+            if complete:
+                a_sum = sum(r["accounts_audited"] for r in complete)
+                e_sum = sum(r["errors"] for r in complete)
+                qual = round((a_sum - e_sum) / a_sum * 100, 2)
+            out.append({
+                "user_id": group[0]["user_id"],
+                "employee_name": group[0]["employee_name"],
+                "process_id": 0,
+                "process_name": f"Overall ({len(group)} processes)",
+                "work_date": group[0]["work_date"],
+                "batches_worked": sum(r["batches_worked"] for r in group),
+                "total_trans_count": sum(r["total_trans_count"] for r in group),
+                "daily_target": None,
+                "hours_worked": round(sum(hrs), 2) if hrs else None,
+                "production_pct": prod,
+                "accounts_audited": sum(aud) if aud else None,
+                "errors": sum(err) if err else None,
+                "quality_pct": qual,
+                "is_summary": True,
+            })
+        i = j
+    for r in out:
+        r.pop("_expected", None)
+    return out
 
 
 @app.put("/batch-dashboard", response_model=schemas.BatchDashboardRow)
