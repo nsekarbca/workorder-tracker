@@ -172,6 +172,7 @@
       <div id="nav-menu" class="nav-menu" style="display:none;">
         <button class="nav-menu-item" onclick="navTo('home')">🏠 Home</button>
         <button class="nav-menu-item" onclick="navTo('active')">📋 Active Queue</button>
+        <button class="nav-menu-item" id="nav-orders-dash-btn" style="display:none;" onclick="navTo('orders-dash')">📈 Orders Dashboard</button>
         <button class="nav-menu-item" id="nav-batch-btn" style="display:none;" onclick="navTo('batch')">📊 Batch Dashboard</button>
         <button class="nav-menu-item" id="nav-production-btn" style="display:none;" onclick="navTo('production')">📦 Production</button>
         <button class="nav-menu-item" id="nav-escalations-btn" style="display:none;" onclick="navTo('escalations')">🚨 Escalations</button>
@@ -230,6 +231,22 @@
           <button class="action-btn" onclick="clearProductionFilters()">Clear Filters</button>
           <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
         </div>
+      </div>
+      <div id="orders-dash-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px;">
+        <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
+          <h3 style="margin:0;">📈 Orders Dashboard</h3>
+          <label>From <input type="date" id="od-date-from"></label>
+          <label>To <input type="date" id="od-date-to"></label>
+          <label>Process <select id="od-process"></select></label>
+        </div>
+        <div style="display:flex; gap:10px;">
+          <button class="action-btn" onclick="loadOrdersDashboard()">Load</button>
+          <button class="action-btn" onclick="exportOrdersDashboardCSV()">Export CSV</button>
+          <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
+        </div>
+        <div style="font-size:12px; color:#666;">Each date counts the orders <strong>received</strong> that day by their current status
+          (Received = Pending + In-Process + Clarification + Completed). <strong>Pending</strong> = received but not yet assigned/started.
+          <strong>Completed on this date</strong> counts orders finished that day, whenever they were received.</div>
       </div>
       <div id="batch-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px;">
         <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
@@ -996,6 +1013,7 @@ function showApp() {
     document.getElementById("production-btn").style.display = "inline-block";
     document.getElementById("nav-production-btn").style.display = "block";
     document.getElementById("nav-escalations-btn").style.display = "block";
+    document.getElementById("nav-orders-dash-btn").style.display = "block";
     document.getElementById("nav-batch-btn").style.display = "block";
     document.getElementById("import-file").addEventListener("change", importCSV);
     if (currentProcessId) loadColleagueList();
@@ -1044,12 +1062,102 @@ function navTo(dest) {
   if (dest === "home") showHomeView();
   else if (dest === "active") showActiveView();
   else if (dest === "batch") showBatchDashboardView();
+  else if (dest === "orders-dash") showOrdersDashboardView();
   else if (dest === "production") showProductionView();
   else if (dest === "escalations") showEscalationsView();
   else if (dest === "admin") showAdminView();
   else if (dest === "switch") showProcessSwitcher();
 }
 
+
+
+// ---------------------------------------------------------------------
+// Team Lead Orders Dashboard — date-wise Received / Pending / In-Process /
+// Clarification / Completed (server: GET /dashboard/orders, own team only).
+// ---------------------------------------------------------------------
+
+let currentOrdersDash = [];
+
+async function showOrdersDashboardView() {
+  viewMode = "orders-dash";
+  document.getElementById("toolbar").style.display = "none";
+  document.getElementById("production-bar").style.display = "none";
+  document.getElementById("batch-bar").style.display = "none";
+  document.getElementById("admin-panel").style.display = "none";
+  document.getElementById("dashboard-panel").style.display = "none";
+  document.getElementById("under-construction-banner").style.display = "none";
+  shareMode = false;
+  selectedForShare.clear();
+  document.getElementById("share-bar").style.display = "none";
+  document.getElementById("orders-dash-bar").style.display = "flex";
+
+  const today = new Date();
+  const from = new Date(); from.setDate(today.getDate() - 13);
+  document.getElementById("od-date-from").value = _isoLocalDate(from);
+  document.getElementById("od-date-to").value = _isoLocalDate(today);
+  document.getElementById("od-process").innerHTML = `<option value="">All my processes</option>` +
+    myProcesses.map(p => `<option value="${p.id}">${_esc(p.name)}</option>`).join("");
+  await loadOrdersDashboard();
+}
+
+async function loadOrdersDashboard() {
+  const params = new URLSearchParams();
+  const f = document.getElementById("od-date-from").value;
+  const t = document.getElementById("od-date-to").value;
+  const pr = document.getElementById("od-process").value;
+  if (f) params.set("start_date", f);
+  if (t) params.set("end_date", t);
+  if (pr) params.set("process_id", pr);
+  const res = await authFetch("/dashboard/orders?" + params.toString());
+  if (!res.ok) {
+    alert("Couldn't load the Orders Dashboard: " + (await res.text()));
+    return;
+  }
+  currentOrdersDash = await res.json();
+  renderOrdersDashboard();
+}
+
+function _ordersDashTotals(rows) {
+  const t = {received: 0, pending: 0, in_process: 0, clarification: 0, completed: 0, completed_on_date: 0};
+  rows.forEach(r => Object.keys(t).forEach(k => t[k] += r[k] || 0));
+  return t;
+}
+
+function renderOrdersDashboard() {
+  const rows = currentOrdersDash;
+  if (!rows.length) {
+    document.getElementById("grid-container").innerHTML = "<p>No orders found for this date range.</p>";
+    return;
+  }
+  const th = l => `<th class="col">${l}</th>`;
+  let html = "<table><thead><tr>" + ["Date", "Orders Received", "Pending", "In-Process", "Clarification", "Completed", "Completed on this date"].map(th).join("") + "</tr></thead><tbody>";
+  rows.forEach(r => {
+    html += `<tr><td>${_esc(r.work_date)}</td><td>${r.received}</td><td>${r.pending}</td><td>${r.in_process}</td>` +
+            `<td>${r.clarification}</td><td>${r.completed}</td><td>${r.completed_on_date}</td></tr>`;
+  });
+  const t = _ordersDashTotals(rows);
+  html += `<tr style="background:#eef3fb; font-weight:bold;"><td>Total</td><td>${t.received}</td><td>${t.pending}</td><td>${t.in_process}</td>` +
+          `<td>${t.clarification}</td><td>${t.completed}</td><td>${t.completed_on_date}</td></tr>`;
+  html += "</tbody></table>";
+  document.getElementById("grid-container").innerHTML = html;
+}
+
+function exportOrdersDashboardCSV() {
+  if (!currentOrdersDash.length) { alert("Nothing to export \u2014 load a date range first."); return; }
+  const headers = ["Date", "Orders Received", "Pending", "In-Process", "Clarification", "Completed", "Completed on this date"];
+  const t = _ordersDashTotals(currentOrdersDash);
+  const lines = currentOrdersDash.map(r => [r.work_date, r.received, r.pending, r.in_process, r.clarification, r.completed, r.completed_on_date])
+    .concat([["Total", t.received, t.pending, t.in_process, t.clarification, t.completed, t.completed_on_date]])
+    .map(row => row.map(v => `"${String(v).replace(/"/g, '""')}"`).join(","));
+  const csv = [headers.join(",")].concat(lines).join("\r\n");
+  const blob = new Blob([csv], {type: "text/csv;charset=utf-8;"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `orders_dashboard_${document.getElementById("od-date-from").value || "all"}_to_${document.getElementById("od-date-to").value || "all"}.csv`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
 
 // ---------------------------------------------------------------------
 // Batch Count Dashboard — date-wise, per colleague / process.
@@ -1083,6 +1191,7 @@ async function showBatchDashboardView() {
   selectedForShare.clear();
   document.getElementById("share-bar").style.display = "none";
   document.getElementById("batch-bar").style.display = "flex";
+  document.getElementById("orders-dash-bar").style.display = "none";
 
   const today = new Date();
   const from = new Date(); from.setDate(today.getDate() - 13);
@@ -1248,6 +1357,7 @@ function showHomeView() {
   document.getElementById("toolbar").style.display = "none";
   document.getElementById("production-bar").style.display = "none";
   document.getElementById("batch-bar").style.display = "none";
+  document.getElementById("orders-dash-bar").style.display = "none";
   shareMode = false;
   selectedForShare.clear();
   document.getElementById("share-bar").style.display = "none";
@@ -1275,6 +1385,7 @@ async function showEscalationsView() {
   document.getElementById("toolbar").style.display = "none";
   document.getElementById("production-bar").style.display = "none";
   document.getElementById("batch-bar").style.display = "none";
+  document.getElementById("orders-dash-bar").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
   shareMode = false;
@@ -1560,6 +1671,7 @@ async function showAdminView() {
   document.getElementById("toolbar").style.display = "none";
   document.getElementById("production-bar").style.display = "none";
   document.getElementById("batch-bar").style.display = "none";
+  document.getElementById("orders-dash-bar").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
   shareMode = false;
@@ -1997,6 +2109,7 @@ async function showProductionView() {
   document.getElementById("share-bar").style.display = "none";
   document.getElementById("production-bar").style.display = "flex";
   document.getElementById("batch-bar").style.display = "none";
+  document.getElementById("orders-dash-bar").style.display = "none";
 
   dateFilters = {posted:{from:"",to:""}, received:{from:"",to:""}, assigned:{from:"",to:""}, created:{from:"",to:""}};
   valueFilters = emptyValueFilters();
@@ -2020,6 +2133,7 @@ function showActiveView() {
   document.getElementById("toolbar").style.display = "flex";
   document.getElementById("production-bar").style.display = "none";
   document.getElementById("batch-bar").style.display = "none";
+  document.getElementById("orders-dash-bar").style.display = "none";
   document.getElementById("admin-panel").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
@@ -2211,6 +2325,7 @@ async function loadOrders() {
   document.getElementById("toolbar").style.display = "flex";
   document.getElementById("production-bar").style.display = "none";
   document.getElementById("batch-bar").style.display = "none";
+  document.getElementById("orders-dash-bar").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
   viewMode = "active";
