@@ -1557,6 +1557,200 @@ def update_colleague_fields(
     return order
 
 
+# ---------------------------------------------------------------------------
+# Batch Count Dashboard (date-wise, per colleague / process)
+# ---------------------------------------------------------------------------
+
+# Production % compares transactions against the process's DAILY target
+# scaled to the hours actually worked: expected = daily_target * hours / this.
+STANDARD_SHIFT_HOURS = 8.0
+
+
+def _batch_visible_colleagues(db: Session, current_user: models.User):
+    """Colleagues whose dashboard rows this user may see."""
+    q = db.query(models.User).filter(models.User.role == "colleague")
+    if current_user.role == "colleague":
+        return q.filter(models.User.id == current_user.id).all()
+    if current_user.role == "team_lead":
+        return q.filter(models.User.reporting_manager == current_user.full_name).all()
+    return q.all()  # super_admin
+
+
+@app.get("/batch-dashboard", response_model=List[schemas.BatchDashboardRow])
+def batch_dashboard(
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    process_id: Optional[int] = None,
+    user_id: Optional[int] = None,
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    One row per colleague / process / date on which at least one order was
+    marked Completed (by Posted Date). Colleagues only ever get their own
+    rows; a Team Lead gets the colleagues who report to them; a Super Admin
+    gets everyone — all enforced here, not just in the UI.
+    """
+    if process_id is not None:
+        _require_process_access(current_user, process_id)
+
+    colleagues = {u.id: u for u in _batch_visible_colleagues(db, current_user)}
+    if user_id is not None:
+        colleagues = {k: v for k, v in colleagues.items() if k == user_id}
+    if not colleagues:
+        return []
+
+    query = db.query(models.WorkOrder).filter(
+        models.WorkOrder.posting_status == "Completed",
+        models.WorkOrder.posted_date.isnot(None),
+        models.WorkOrder.assigned_to_id.in_(list(colleagues.keys())),
+    )
+    if process_id is not None:
+        query = query.filter(models.WorkOrder.process_id == process_id)
+    if start_date:
+        query = query.filter(models.WorkOrder.posted_date >= start_date)
+    if end_date:
+        query = query.filter(models.WorkOrder.posted_date <= end_date)
+
+    groups = {}
+    for o in query.all():
+        if o.process_id is None:
+            continue
+        key = (o.assigned_to_id, o.process_id, o.posted_date)
+        g = groups.setdefault(key, {"batches": 0, "trans": 0})
+        g["batches"] += 1
+        g["trans"] += o.trans_count or 0
+    if not groups:
+        return []
+
+    processes = {p.id: p for p in db.query(models.Process).all()}
+    stats = {
+        (st.user_id, st.process_id, st.work_date): st
+        for st in db.query(models.DailyBatchStat).filter(
+            models.DailyBatchStat.user_id.in_(list(colleagues.keys()))
+        ).all()
+    }
+
+    rows = []
+    for (uid, pid, d), g in groups.items():
+        proc = processes.get(pid)
+        st = stats.get((uid, pid, d))
+        hours = st.hours_worked if st else None
+        audited = st.accounts_audited if st else None
+        errs = st.errors if st else None
+        target = proc.daily_target if proc else None
+
+        production_pct = None
+        if target and hours and hours > 0:
+            production_pct = round(g["trans"] / (target * hours / STANDARD_SHIFT_HOURS) * 100, 1)
+
+        # Quality % = share of audited accounts that were error-free.
+        quality_pct = None
+        if audited and audited > 0 and errs is not None:
+            quality_pct = round((audited - errs) / audited * 100, 1)
+
+        rows.append({
+            "user_id": uid,
+            "employee_name": colleagues[uid].full_name,
+            "process_id": pid,
+            "process_name": proc.name if proc else "",
+            "work_date": d,
+            "batches_worked": g["batches"],
+            "total_trans_count": g["trans"],
+            "daily_target": target,
+            "hours_worked": hours,
+            "production_pct": production_pct,
+            "accounts_audited": audited,
+            "errors": errs,
+            "quality_pct": quality_pct,
+        })
+
+    rows.sort(key=lambda r: (r["work_date"], r["employee_name"], r["process_name"]), reverse=False)
+    rows.reverse()  # newest date first
+    return rows
+
+
+@app.put("/batch-dashboard", response_model=schemas.BatchDashboardRow)
+def save_batch_stat(
+    payload: schemas.BatchStatUpdate,
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    Saves the manual inputs for one colleague / process / date.
+    Colleague -> Total Hours Worked on their own rows only.
+    Team Lead / Super Admin -> # of Accounts Audited and # of Errors, for
+    colleagues in their team (Super Admin: anyone).
+    """
+    data = payload.dict(exclude_unset=True)
+    colleague_fields = {"hours_worked"}
+    lead_fields = {"accounts_audited", "errors"}
+    sent = set(data.keys()) & (colleague_fields | lead_fields)
+    if not sent:
+        raise HTTPException(status_code=400, detail="Nothing to save")
+
+    if current_user.role == "colleague":
+        if sent & lead_fields:
+            raise HTTPException(status_code=403, detail="Accounts Audited and Errors are entered by your Team Lead")
+        target_user_id = current_user.id
+    else:
+        if sent & colleague_fields:
+            raise HTTPException(status_code=403, detail="Total Hours Worked is entered by the colleague")
+        if payload.user_id is None:
+            raise HTTPException(status_code=400, detail="user_id is required")
+        allowed = {u.id for u in _batch_visible_colleagues(db, current_user)}
+        if payload.user_id not in allowed:
+            raise HTTPException(status_code=403, detail="This colleague is not on your team")
+        target_user_id = payload.user_id
+
+    _require_process_access(current_user, payload.process_id)
+
+    # The row only exists on the dashboard if the colleague completed work
+    # that day in that process.
+    has_work = db.query(models.WorkOrder.id).filter(
+        models.WorkOrder.assigned_to_id == target_user_id,
+        models.WorkOrder.process_id == payload.process_id,
+        models.WorkOrder.posting_status == "Completed",
+        models.WorkOrder.posted_date == payload.work_date,
+    ).first()
+    if not has_work:
+        raise HTTPException(status_code=404, detail="No completed work for that colleague, process and date")
+
+    if "hours_worked" in sent and data["hours_worked"] is not None:
+        if data["hours_worked"] < 0 or data["hours_worked"] > 24:
+            raise HTTPException(status_code=400, detail="Total Hours Worked must be between 0 and 24")
+    for f in lead_fields & sent:
+        if data[f] is not None and data[f] < 0:
+            raise HTTPException(status_code=400, detail="Accounts Audited and Errors can't be negative")
+
+    st = db.query(models.DailyBatchStat).filter(
+        models.DailyBatchStat.user_id == target_user_id,
+        models.DailyBatchStat.process_id == payload.process_id,
+        models.DailyBatchStat.work_date == payload.work_date,
+    ).first()
+    if not st:
+        st = models.DailyBatchStat(
+            user_id=target_user_id, process_id=payload.process_id, work_date=payload.work_date,
+        )
+        db.add(st)
+    for f in sent:
+        setattr(st, f, data[f])
+
+    if st.accounts_audited is not None and st.errors is not None and st.errors > st.accounts_audited:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="# of Errors can't be more than # of Accounts Audited")
+
+    st.updated_by = current_user.username
+    db.commit()
+
+    rows = batch_dashboard(
+        start_date=payload.work_date, end_date=payload.work_date,
+        process_id=payload.process_id, user_id=target_user_id,
+        current_user=current_user, db=db,
+    )
+    return rows[0]
+
+
 @app.post("/orders/submit-day")
 def submit_end_of_day(
     process_id: int,

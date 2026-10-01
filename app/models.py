@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Date, DateTime, ForeignKey, Boolean, Table, JSON
+from sqlalchemy import Column, Integer, String, Float, Date, DateTime, ForeignKey, Boolean, Table, JSON, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from .database import Base
@@ -308,4 +308,32 @@ class WorkOrder(Base):
     timer_started_at = Column(DateTime, nullable=True)
     time_taken_seconds = Column(Integer, nullable=False, default=0)
 
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class DailyBatchStat(Base):
+    """
+    Manual inputs for the Batch Count Dashboard, one row per colleague per
+    process per work date. Everything else on that dashboard (processes
+    worked, # of batches, total transaction count, Production %, Quality %)
+    is calculated live from work_orders and never stored, so it can't drift.
+
+    hours_worked is typed by the colleague; accounts_audited and errors are
+    typed by their Team Lead.
+    """
+    __tablename__ = "daily_batch_stats"
+    __table_args__ = (
+        UniqueConstraint("user_id", "process_id", "work_date", name="uq_daily_batch_stat"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    process_id = Column(Integer, ForeignKey("processes.id"), nullable=False)
+    work_date = Column(Date, nullable=False, index=True)
+
+    hours_worked = Column(Float, nullable=True)        # colleague
+    accounts_audited = Column(Integer, nullable=True)  # team lead
+    errors = Column(Integer, nullable=True)            # team lead
+
+    updated_by = Column(String, nullable=True)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

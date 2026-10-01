@@ -348,3 +348,32 @@ class WorkOrderOut(BaseModel):
 
 class EscalationResolve(BaseModel):
     ventra_comment: str
+
+
+# Batch Count Dashboard — one calculated row per colleague / process / date.
+class BatchDashboardRow(BaseModel):
+    user_id: int
+    employee_name: str
+    process_id: int
+    process_name: str
+    work_date: date
+    batches_worked: int
+    total_trans_count: int
+    daily_target: Optional[int] = None
+    hours_worked: Optional[float] = None
+    production_pct: Optional[float] = None
+    accounts_audited: Optional[int] = None
+    errors: Optional[int] = None
+    quality_pct: Optional[float] = None
+
+
+# Only the fields actually sent are changed. Colleagues may send
+# hours_worked only; Team Leads / Super Admins may send accounts_audited
+# and errors only (enforced in the endpoint).
+class BatchStatUpdate(BaseModel):
+    user_id: Optional[int] = None  # ignored for colleagues (always themselves)
+    process_id: int
+    work_date: date
+    hours_worked: Optional[float] = None
+    accounts_audited: Optional[int] = None
+    errors: Optional[int] = None
