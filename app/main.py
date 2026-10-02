@@ -1606,12 +1606,92 @@ def update_colleague_fields(
 # clarification / completed)
 # ---------------------------------------------------------------------------
 
+def _tl_membership(db: Session):
+    """
+    Which Team Lead each colleague belongs to (Reporting Manager = Team Lead's
+    full name). Returns (team_leads, members, orphans):
+      team_leads  {team_lead_id: full_name}
+      members     {team_lead_id: [colleague ids]}
+      orphans     [colleague ids whose Reporting Manager matches no Team Lead]
+    """
+    tls = {u.id: u.full_name for u in db.query(models.User.id, models.User.full_name).filter(models.User.role == "team_lead").all()}
+    name_to_id = {name: tid for tid, name in tls.items()}
+    members = {tid: [] for tid in tls}
+    orphans = []
+    for cid, mgr in db.query(models.User.id, models.User.reporting_manager).filter(models.User.role == "colleague").all():
+        tid = name_to_id.get(mgr)
+        (members[tid] if tid else orphans).append(cid)
+    return tls, members, orphans
+
+
+def _order_team_lead_id(order_assigned_to_id, order_team_lead_id, colleague_tl: dict, tl_ids: set) -> int:
+    """The single Team Lead an order counts under (0 = none): its assigned
+    colleague's Team Lead, or for unassigned orders the Team Lead who owns it."""
+    if order_assigned_to_id is not None:
+        return colleague_tl.get(order_assigned_to_id, 0)
+    return order_team_lead_id if order_team_lead_id in tl_ids else 0
+
+
+def _tl_condition(db: Session, team_lead_id: int):
+    """SQL condition: orders that count under one Team Lead (0 = no Team Lead)."""
+    tls, members, orphans = _tl_membership(db)
+    W = models.WorkOrder
+    if team_lead_id == 0:
+        return or_(
+            W.assigned_to_id.in_(orphans) if orphans else sa_false(),
+            and_(W.assigned_to_id.is_(None), or_(W.team_lead_id.is_(None), ~W.team_lead_id.in_(list(tls.keys())) if tls else sa_false())),
+        )
+    ids = members.get(team_lead_id, [])
+    return or_(
+        W.assigned_to_id.in_(ids) if ids else sa_false(),
+        and_(W.assigned_to_id.is_(None), W.team_lead_id == team_lead_id),
+    )
+
+
+def _orders_dash_scope(db: Session, user: models.User, process_id: Optional[int], team_lead_id: Optional[int] = None):
+    """
+    Returns a function that narrows a WorkOrder query to what this user may
+    see on the Orders Dashboard:
+      * Team Lead  -> their own team only (colleagues' orders + their unassigned queue)
+      * Admin / Super Admin -> every team and every process; optionally one
+        Team Lead via team_lead_id
+      * Team Lead -> only the processes they have access to
+    """
+    all_access = user.role in ("admin", "super_admin")
+    if process_id is not None and not all_access:
+        _require_process_access(user, process_id)
+    cond = _team_orders_condition(db, user, include_unowned=True)   # None for admin / super_admin
+    tl_cond = _tl_condition(db, team_lead_id) if (team_lead_id is not None and user.role in ("admin", "super_admin")) else None
+    my_process_ids = [p.id for p in user.processes]
+
+    def scoped(q):
+        if process_id is not None:
+            q = q.filter(models.WorkOrder.process_id == process_id)
+        elif not all_access:
+            q = q.filter(models.WorkOrder.process_id.in_(my_process_ids) if my_process_ids else sa_false())
+        if cond is not None:
+            q = q.filter(cond)
+        if tl_cond is not None:
+            q = q.filter(tl_cond)
+        return q
+    return scoped
+
+
+_DASH_STATUS_KEY = {"Pending": "pending", "In-Process": "in_process", "Clarification": "clarification", "Completed": "completed"}
+
+
+def _dash_status_expr():
+    # No posting status yet (not assigned / started) is shown as "Pending".
+    return func.coalesce(func.nullif(models.WorkOrder.posting_status, ""), "Pending")
+
+
 @app.get("/dashboard/orders", response_model=List[schemas.OrdersDashboardRow])
 def orders_dashboard(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     process_id: Optional[int] = None,
-    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
+    team_lead_id: Optional[int] = None,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -1624,24 +1704,11 @@ def orders_dashboard(
     so received = pending + in_process + clarification + completed.
     completed_on_date counts orders marked Completed ON that date (Posted
     Date). Orders already submitted to Production are included. A Team Lead
-    only counts their own team's orders (their colleagues' orders, plus
-    unassigned orders in their queue); a Super Admin counts everything.
+    only counts their own team's orders; Admin and Super Admin count every
+    team (team_lead_id narrows to one Team Lead).
     """
-    if process_id is not None:
-        _require_process_access(current_user, process_id)
-
-    def scoped(q):
-        if process_id is not None:
-            q = q.filter(models.WorkOrder.process_id == process_id)
-        elif current_user.role == "team_lead":
-            my_process_ids = [p.id for p in current_user.processes]
-            q = q.filter(models.WorkOrder.process_id.in_(my_process_ids) if my_process_ids else sa_false())
-        cond = _team_orders_condition(db, current_user, include_unowned=True)
-        if cond is not None:
-            q = q.filter(cond)
-        return q
-
-    status_expr = func.coalesce(func.nullif(models.WorkOrder.posting_status, ""), "Pending")
+    scoped = _orders_dash_scope(db, current_user, process_id, team_lead_id)
+    status_expr = _dash_status_expr()
 
     rec = scoped(db.query(
         models.WorkOrder.received_date, status_expr, func.count(models.WorkOrder.id)
@@ -1667,16 +1734,140 @@ def orders_dashboard(
             "work_date": d, "received": 0, "pending": 0, "in_process": 0,
             "clarification": 0, "completed": 0, "completed_on_date": 0,
         })
-    key_for = {"Pending": "pending", "In-Process": "in_process", "Clarification": "clarification", "Completed": "completed"}
     for d, st, n in rec:
         row = day(d)
         row["received"] += n
         # Any unexpected status text is shown as pending rather than lost.
-        row[key_for.get(st, "pending")] += n
+        row[_DASH_STATUS_KEY.get(st, "pending")] += n
     for d, n in done:
         day(d)["completed_on_date"] += n
 
     return sorted(days.values(), key=lambda r: r["work_date"], reverse=True)
+
+
+@app.get("/dashboard/orders/by-team-lead", response_model=List[schemas.OrdersDashboardTLRow])
+def orders_dashboard_by_team_lead(
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    process_id: Optional[int] = None,
+    current_user: models.User = Depends(auth.require_role("admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    The same counts as /dashboard/orders but one row per Team Lead over the
+    whole date range (Admin / Super Admin only). An order counts under its
+    assigned colleague's Team Lead; an unassigned order under the Team Lead
+    who owns it; anything else under "No Team Lead" (id 0). Every order
+    lands in exactly one row, so the rows add up to the overall totals.
+    """
+    scoped = _orders_dash_scope(db, current_user, process_id)
+    tls, members, orphans = _tl_membership(db)
+    colleague_tl = {cid: tid for tid, ids in members.items() for cid in ids}
+    tl_ids = set(tls.keys())
+    W = models.WorkOrder
+    status_expr = _dash_status_expr()
+
+    rec = scoped(db.query(W.assigned_to_id, W.team_lead_id, status_expr, func.count(W.id)).filter(W.received_date.isnot(None)))
+    if start_date:
+        rec = rec.filter(W.received_date >= start_date)
+    if end_date:
+        rec = rec.filter(W.received_date <= end_date)
+    rec = rec.group_by(W.assigned_to_id, W.team_lead_id, status_expr).all()
+
+    done = scoped(db.query(W.assigned_to_id, W.team_lead_id, func.count(W.id)).filter(
+        W.posting_status == "Completed", W.posted_date.isnot(None)))
+    if start_date:
+        done = done.filter(W.posted_date >= start_date)
+    if end_date:
+        done = done.filter(W.posted_date <= end_date)
+    done = done.group_by(W.assigned_to_id, W.team_lead_id).all()
+
+    rows = {}
+    def row_for(tid):
+        return rows.setdefault(tid, {
+            "team_lead_id": tid,
+            "team_lead_name": tls.get(tid, "No Team Lead (unassigned queue)"),
+            "received": 0, "pending": 0, "in_process": 0, "clarification": 0, "completed": 0, "completed_on_date": 0,
+        })
+    for assigned, owner, st, n in rec:
+        r = row_for(_order_team_lead_id(assigned, owner, colleague_tl, tl_ids))
+        r["received"] += n
+        r[_DASH_STATUS_KEY.get(st, "pending")] += n
+    for assigned, owner, n in done:
+        row_for(_order_team_lead_id(assigned, owner, colleague_tl, tl_ids))["completed_on_date"] += n
+
+    return sorted(rows.values(), key=lambda r: (r["team_lead_id"] == 0, r["team_lead_name"].lower()))
+
+
+DASH_METRICS = {"received", "pending", "in_process", "clarification", "completed", "completed_on_date"}
+DASH_DETAIL_LIMIT = 5000
+
+
+@app.get("/dashboard/orders/details", response_model=List[schemas.OrdersDashboardDetail])
+def orders_dashboard_details(
+    metric: str,
+    on_date: Optional[date] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    process_id: Optional[int] = None,
+    team_lead_id: Optional[int] = None,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    The raw orders behind a dashboard number — click a count, get exactly
+    those orders. metric is one of received / pending / in_process /
+    clarification / completed (orders RECEIVED in the date window, by status)
+    or completed_on_date (orders marked Completed in the window, by Posted
+    Date). on_date = a single day (a date row); otherwise start_date/end_date.
+    Same visibility rules as the dashboard itself. At most 5,000 rows.
+    """
+    if metric not in DASH_METRICS:
+        raise HTTPException(status_code=400, detail="Unknown metric")
+    scoped = _orders_dash_scope(db, current_user, process_id, team_lead_id)
+    W = models.WorkOrder
+    q = scoped(db.query(W))
+
+    if metric == "completed_on_date":
+        date_col = W.posted_date
+        q = q.filter(W.posting_status == "Completed", W.posted_date.isnot(None))
+    else:
+        date_col = W.received_date
+        q = q.filter(W.received_date.isnot(None))
+        if metric == "pending":
+            # No posting status yet — plus any unexpected status text, which
+            # the dashboard counts as pending too (see _DASH_STATUS_KEY use).
+            q = q.filter(or_(
+                W.posting_status.is_(None), W.posting_status == "",
+                ~W.posting_status.in_(["In-Process", "Clarification", "Completed"]),
+            ))
+        elif metric == "in_process":
+            q = q.filter(W.posting_status == "In-Process")
+        elif metric == "clarification":
+            q = q.filter(W.posting_status == "Clarification")
+        elif metric == "completed":
+            q = q.filter(W.posting_status == "Completed")
+
+    if on_date:
+        q = q.filter(date_col == on_date)
+    else:
+        if start_date:
+            q = q.filter(date_col >= start_date)
+        if end_date:
+            q = q.filter(date_col <= end_date)
+
+    orders = q.order_by(date_col.desc(), W.id.asc()).limit(DASH_DETAIL_LIMIT).all()
+
+    tls, members, orphans = _tl_membership(db)
+    colleague_tl = {cid: tid for tid, ids in members.items() for cid in ids}
+    tl_ids = set(tls.keys())
+    out = []
+    for o in orders:
+        item = schemas.OrdersDashboardDetail.model_validate(o)
+        tid = _order_team_lead_id(o.assigned_to_id, o.team_lead_id, colleague_tl, tl_ids)
+        item.team_lead_name = tls.get(tid, "No Team Lead")
+        out.append(item)
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -396,3 +396,21 @@ class OrdersDashboardRow(BaseModel):
     clarification: int
     completed: int
     completed_on_date: int
+
+
+# Same five counts as OrdersDashboardRow, grouped by Team Lead instead of date
+# (Admin / Super Admin only). team_lead_id 0 = orders with no Team Lead.
+class OrdersDashboardTLRow(BaseModel):
+    team_lead_id: int
+    team_lead_name: str
+    received: int
+    pending: int
+    in_process: int
+    clarification: int
+    completed: int
+    completed_on_date: int
+
+
+# Raw-data drill-down: a normal order plus the Team Lead it belongs to.
+class OrdersDashboardDetail(WorkOrderOut):
+    team_lead_name: Optional[str] = None
