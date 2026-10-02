@@ -94,6 +94,42 @@
   #admin-panel label { display: block; font-size: 12px; margin-top: 8px; color: #444; }
   #admin-panel input, #admin-panel select { width: 100%; padding: 6px; margin-top: 2px; border: 1px solid #ccc; border-radius: 4px; }
   .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
+
+  /* ---- Orders Dashboard ---- */
+  .od-wrap { padding: 4px 0 20px; }
+  .od-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .od-tile { background: #fff; border: none; border-top: 4px solid var(--c); border-radius: 10px; padding: 14px 16px; box-shadow: 0 1px 4px rgba(0,0,0,.1); cursor: pointer; text-align: left; font-family: inherit; transition: transform .1s, box-shadow .1s; }
+  .od-tile:hover { transform: translateY(-2px); box-shadow: 0 4px 10px rgba(0,0,0,.15); }
+  .od-tile.zero { cursor: default; opacity: .75; }
+  .od-tile.zero:hover { transform: none; box-shadow: 0 1px 4px rgba(0,0,0,.1); }
+  .od-t-label { display: block; font-size: 12px; color: #555; text-transform: uppercase; letter-spacing: .4px; }
+  .od-t-num { display: block; font-size: 32px; font-weight: 700; color: var(--c); line-height: 1.2; }
+  .od-t-sub { display: block; font-size: 12px; color: #777; min-height: 15px; }
+  .od-tabs { display: flex; gap: 6px; margin: 6px 0 12px; }
+  .od-tab { padding: 6px 14px; border-radius: 20px; border: 1px solid #cbd5e1; background: #fff; cursor: pointer; font-size: 13px; color: var(--navy); font-family: inherit; }
+  .od-tab:hover { background: #eef3fb; }
+  .od-tab.active { background: var(--navy); color: #fff; border-color: var(--navy); }
+  .od-card { background: #fff; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,.1); padding: 14px 16px; margin-bottom: 16px; }
+  .od-card h4 { margin: 0 0 8px; color: var(--navy); }
+  .od-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: #555; margin-bottom: 8px; }
+  .od-dot { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; }
+  .od-chart { display: flex; align-items: flex-end; gap: 10px; overflow-x: auto; padding: 6px 4px 2px; min-height: 190px; }
+  .od-bar-col { display: flex; flex-direction: column; align-items: center; justify-content: flex-end; min-width: 42px; }
+  .od-bar { width: 30px; display: flex; flex-direction: column-reverse; border-radius: 4px 4px 0 0; overflow: hidden; background: #e5e7eb; }
+  .od-seg { cursor: pointer; min-height: 2px; }
+  .od-seg:hover { filter: brightness(1.2); }
+  .od-bar-total { font-size: 11px; font-weight: 600; color: #333; margin-bottom: 2px; }
+  .od-bar-label { font-size: 11px; color: #666; margin-top: 4px; white-space: nowrap; }
+  .od-link { display: inline-block; min-width: 34px; text-align: center; padding: 2px 10px; border-radius: 12px; cursor: pointer; font-weight: 600; color: var(--c); background: #f1f5f9; }
+  .od-link:hover { background: #e2e8f0; text-decoration: underline; }
+  .od-zero { color: #aaa; }
+  .od-name { cursor: pointer; font-weight: 600; color: var(--navy); }
+  .od-name:hover { text-decoration: underline; }
+  .od-progress { height: 8px; background: #e5e7eb; border-radius: 4px; overflow: hidden; min-width: 90px; }
+  .od-progress > div { height: 100%; background: #16a34a; }
+  .od-drill-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+  .od-drill-head h4 { margin: 0; color: var(--navy); }
+  .od-scroll { max-height: 68vh; overflow: auto; background: #fff; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,.1); }
 </style>
 </head>
 <body>
@@ -238,15 +274,19 @@
           <label>From <input type="date" id="od-date-from"></label>
           <label>To <input type="date" id="od-date-to"></label>
           <label>Process <select id="od-process"></select></label>
+          <label id="od-team-lead-label" style="display:none;">Team Lead <select id="od-team-lead" onchange="loadOrdersDashboard()"></select></label>
         </div>
-        <div style="display:flex; gap:10px;">
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
           <button class="action-btn" onclick="loadOrdersDashboard()">Load</button>
-          <button class="action-btn" onclick="exportOrdersDashboardCSV()">Export CSV</button>
+          <span style="font-size:12px; color:#666; margin-left:6px;">Quick:</span>
+          <button class="od-tab" onclick="odQuickRange(1)">Today</button>
+          <button class="od-tab" onclick="odQuickRange(7)">Last 7 days</button>
+          <button class="od-tab" onclick="odQuickRange(14)">Last 14 days</button>
+          <button class="od-tab" onclick="odQuickRange(30)">Last 30 days</button>
+          <span style="flex:1;"></span>
+          <button class="action-btn" onclick="odExportCSV()">Export CSV</button>
           <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
         </div>
-        <div style="font-size:12px; color:#666;">Each date counts the orders <strong>received</strong> that day by their current status
-          (Received = Pending + In-Process + Clarification + Completed). <strong>Pending</strong> = received but not yet assigned/started.
-          <strong>Completed on this date</strong> counts orders finished that day, whenever they were received.</div>
       </div>
       <div id="batch-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px;">
         <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
@@ -1026,6 +1066,7 @@ function showApp() {
     document.getElementById("import-btn").style.display = "inline-block";
     document.getElementById("import-file").addEventListener("change", importCSV);
     if (currentProcessId) loadImportOnBehalfDropdown();
+    document.getElementById("nav-orders-dash-btn").style.display = "block";   // Orders Dashboard (all teams, Team Lead-wise)
   } else {
     document.getElementById("submit-day-btn").style.display = "inline-block";
     document.getElementById("production-btn").style.display = "inline-block";
@@ -1072,11 +1113,48 @@ function navTo(dest) {
 
 
 // ---------------------------------------------------------------------
-// Team Lead Orders Dashboard — date-wise Received / Pending / In-Process /
-// Clarification / Completed (server: GET /dashboard/orders, own team only).
+// Orders Dashboard — tiles + chart + date table; click ANY number to open
+// the raw orders behind it. Admin / Super Admin also get a "By Team Lead"
+// tab (every team); a Team Lead only ever sees their own team (enforced on
+// the server: /dashboard/orders, /by-team-lead, /details).
 // ---------------------------------------------------------------------
 
-let currentOrdersDash = [];
+const OD_METRICS = [
+  {k: "received",          label: "Orders Received",        color: "#2563eb"},
+  {k: "pending",           label: "Pending",                color: "#d97706"},
+  {k: "in_process",        label: "In-Process",             color: "#7c3aed"},
+  {k: "clarification",     label: "Clarification",          color: "#dc2626"},
+  {k: "completed",         label: "Completed",              color: "#16a34a"},
+  {k: "completed_on_date", label: "Completed on this date", color: "#0d9488"},
+];
+const OD_STACK = ["completed", "in_process", "clarification", "pending"];   // bottom -> top
+const OD_DETAIL_KEYS = ["received_date", "assigned_date", "employee_name", "edm", "status", "def_doc_type", "division",
+  "amount", "posting_status", "posted_amount", "bar_batch", "trans_count", "escalation_category", "posted_date", "tat_days", "time_taken"];
+
+let odState = {rows: [], tlRows: [], tab: "date", drill: null};
+
+function odAllTeams() { return role === "admin" || role === "super_admin"; }
+function odMetric(k) { return OD_METRICS.find(m => m.k === k); }
+function odTlFilter() { const el = document.getElementById("od-team-lead"); return (el && odAllTeams()) ? el.value : ""; }
+function odTotals(rows) {
+  const t = {received: 0, pending: 0, in_process: 0, clarification: 0, completed: 0, completed_on_date: 0};
+  rows.forEach(r => Object.keys(t).forEach(k => t[k] += r[k] || 0));
+  return t;
+}
+function odShortDate(iso) {
+  const d = new Date(iso + "T00:00:00");
+  return d.toLocaleDateString("en-GB", {day: "2-digit", month: "short"});
+}
+function odBaseParams() {
+  const p = new URLSearchParams();
+  const f = document.getElementById("od-date-from").value;
+  const t = document.getElementById("od-date-to").value;
+  const pr = document.getElementById("od-process").value;
+  if (f) p.set("start_date", f);
+  if (t) p.set("end_date", t);
+  if (pr) p.set("process_id", pr);
+  return p;
+}
 
 async function showOrdersDashboardView() {
   viewMode = "orders-dash";
@@ -1091,70 +1169,234 @@ async function showOrdersDashboardView() {
   document.getElementById("share-bar").style.display = "none";
   document.getElementById("orders-dash-bar").style.display = "flex";
 
+  odState = {rows: [], tlRows: [], tab: "date", drill: null};
   const today = new Date();
   const from = new Date(); from.setDate(today.getDate() - 13);
   document.getElementById("od-date-from").value = _isoLocalDate(from);
   document.getElementById("od-date-to").value = _isoLocalDate(today);
-  document.getElementById("od-process").innerHTML = `<option value="">All my processes</option>` +
-    myProcesses.map(p => `<option value="${p.id}">${_esc(p.name)}</option>`).join("");
+  // Admin / Super Admin see every process; a Team Lead only their own.
+  let dashProcesses = myProcesses;
+  if (odAllTeams()) {
+    try {
+      const pr = await fetch(API + "/processes/public");
+      if (pr.ok) dashProcesses = await pr.json();
+    } catch (_) { /* fall back to the user's own processes */ }
+  }
+  document.getElementById("od-process").innerHTML =
+    `<option value="">${odAllTeams() ? "All processes" : "All my processes"}</option>` +
+    dashProcesses.map(p => `<option value="${p.id}">${_esc(p.name)}</option>`).join("");
+  document.getElementById("od-team-lead-label").style.display = odAllTeams() ? "inline-block" : "none";
+  document.getElementById("od-team-lead").innerHTML = `<option value="">All Team Leads</option>`;
   await loadOrdersDashboard();
 }
 
+function odQuickRange(days) {
+  const today = new Date();
+  const from = new Date(); from.setDate(today.getDate() - (days - 1));
+  document.getElementById("od-date-from").value = _isoLocalDate(from);
+  document.getElementById("od-date-to").value = _isoLocalDate(today);
+  loadOrdersDashboard();
+}
+
 async function loadOrdersDashboard() {
-  const params = new URLSearchParams();
-  const f = document.getElementById("od-date-from").value;
-  const t = document.getElementById("od-date-to").value;
-  const pr = document.getElementById("od-process").value;
-  if (f) params.set("start_date", f);
-  if (t) params.set("end_date", t);
-  if (pr) params.set("process_id", pr);
-  const res = await authFetch("/dashboard/orders?" + params.toString());
-  if (!res.ok) {
-    alert("Couldn't load the Orders Dashboard: " + (await res.text()));
-    return;
+  odState.drill = null;
+  const base = odBaseParams();
+  const byDate = new URLSearchParams(base);
+  const tl = odTlFilter();
+  if (tl !== "") byDate.set("team_lead_id", tl);
+  const reqs = [authFetch("/dashboard/orders?" + byDate.toString())];
+  if (odAllTeams()) reqs.push(authFetch("/dashboard/orders/by-team-lead?" + base.toString()));
+  const res = await Promise.all(reqs);
+  for (const r of res) {
+    if (!r.ok) { alert("Couldn't load the Orders Dashboard: " + (await r.text())); return; }
   }
-  currentOrdersDash = await res.json();
+  odState.rows = await res[0].json();
+  odState.tlRows = odAllTeams() ? await res[1].json() : [];
+  if (odAllTeams()) odPopulateTeamLeads();
   renderOrdersDashboard();
 }
 
-function _ordersDashTotals(rows) {
-  const t = {received: 0, pending: 0, in_process: 0, clarification: 0, completed: 0, completed_on_date: 0};
-  rows.forEach(r => Object.keys(t).forEach(k => t[k] += r[k] || 0));
-  return t;
+function odPopulateTeamLeads() {
+  const sel = document.getElementById("od-team-lead");
+  const keep = sel.value;
+  sel.innerHTML = `<option value="">All Team Leads</option>` +
+    odState.tlRows.map(r => `<option value="${r.team_lead_id}">${_esc(r.team_lead_name)}</option>`).join("");
+  if (Array.from(sel.options).some(o => o.value === keep)) sel.value = keep;
+}
+
+// ---- rendering ----
+function odTile(m, t, tlArg) {
+  const v = t[m.k];
+  const sub = m.k === "received" ? "in the selected dates"
+    : m.k === "completed_on_date" ? "finished in the selected dates"
+    : (t.received ? `${(v / t.received * 100).toFixed(1)}% of received` : "");
+  const click = v > 0 ? `onclick="odDrill('${m.k}', '', ${tlArg})"` : "";
+  return `<button class="od-tile${v > 0 ? "" : " zero"}" style="--c:${m.color}" ${click}>` +
+    `<span class="od-t-label">${m.label}</span><span class="od-t-num">${v}</span><span class="od-t-sub">${sub}</span></button>`;
+}
+
+function odCell(metricKey, value, onDate, tlArg) {
+  if (!value) return `<td><span class="od-zero">0</span></td>`;
+  const m = odMetric(metricKey);
+  return `<td><span class="od-link" style="--c:${m.color}" onclick="odDrill('${metricKey}', '${onDate}', ${tlArg})">${value}</span></td>`;
+}
+
+function odChartHTML(rows) {
+  const asc = rows.slice().sort((a, b) => a.work_date < b.work_date ? -1 : 1);
+  const max = Math.max(1, ...asc.map(r => r.received));
+  const H = 150;
+  let html = `<div class="od-legend">` +
+    OD_STACK.slice().reverse().map(k => { const m = odMetric(k); return `<span><span class="od-dot" style="background:${m.color}"></span>${m.label}</span>`; }).join("") +
+    `<span style="color:#888;">Click a bar segment to see those orders</span></div><div class="od-chart">`;
+  asc.forEach(r => {
+    html += `<div class="od-bar-col"><div class="od-bar-total">${r.received}</div>` +
+      `<div class="od-bar" style="height:${Math.max(6, Math.round(r.received / max * H))}px">`;
+    OD_STACK.forEach(k => {
+      if (!r[k]) return;
+      const m = odMetric(k);
+      html += `<div class="od-seg" title="${_esc(odShortDate(r.work_date))} \u00b7 ${m.label}: ${r[k]}" style="flex:${r[k]}; background:${m.color}" onclick="odDrill('${k}', '${r.work_date}', null)"></div>`;
+    });
+    html += `</div><div class="od-bar-label">${_esc(odShortDate(r.work_date))}</div></div>`;
+  });
+  return html + `</div>`;
+}
+
+function odDateTableHTML(rows) {
+  const heads = OD_METRICS.map(m => `<th>${m.label}</th>`).join("");
+  let html = `<table><thead><tr><th>Date</th>${heads}</tr></thead><tbody>`;
+  rows.forEach(r => {
+    html += `<tr><td><strong>${_esc(r.work_date)}</strong></td>` +
+      OD_METRICS.map(m => odCell(m.k, r[m.k], r.work_date, "null")).join("") + `</tr>`;
+  });
+  const t = odTotals(rows);
+  html += `<tr style="background:#eef3fb; font-weight:bold;"><td>Total</td>` +
+    OD_METRICS.map(m => odCell(m.k, t[m.k], "", "null")).join("") + `</tr></tbody></table>`;
+  return html;
+}
+
+function odTeamLeadTableHTML(rows) {
+  const heads = OD_METRICS.map(m => `<th>${m.label}</th>`).join("");
+  let html = `<table><thead><tr><th>Team Lead</th>${heads}<th>Completion</th></tr></thead><tbody>`;
+  rows.forEach(r => {
+    const pct = r.received ? Math.round(r.completed / r.received * 100) : 0;
+    html += `<tr><td><span class="od-name" title="Show all orders for this Team Lead" onclick="odDrill('received', '', ${r.team_lead_id})">${_esc(r.team_lead_name)}</span></td>` +
+      OD_METRICS.map(m => odCell(m.k, r[m.k], "", r.team_lead_id)).join("") +
+      `<td title="${pct}% of received orders are completed"><div class="od-progress"><div style="width:${pct}%"></div></div></td></tr>`;
+  });
+  const t = odTotals(rows);
+  const tp = t.received ? Math.round(t.completed / t.received * 100) : 0;
+  html += `<tr style="background:#eef3fb; font-weight:bold;"><td>All Team Leads</td>` +
+    OD_METRICS.map(m => odCell(m.k, t[m.k], "", "''")).join("") +
+    `<td title="${tp}% of received orders are completed"><div class="od-progress"><div style="width:${tp}%"></div></div></td></tr></tbody></table>`;
+  return html;
 }
 
 function renderOrdersDashboard() {
-  const rows = currentOrdersDash;
-  if (!rows.length) {
-    document.getElementById("grid-container").innerHTML = "<p>No orders found for this date range.</p>";
+  const box = document.getElementById("grid-container");
+  if (odState.drill) { box.innerHTML = odDrillHTML(); return; }
+  const onTl = odAllTeams() && odState.tab === "tl";
+  const src = onTl ? odState.tlRows : odState.rows;
+  const t = odTotals(src);
+  const tlArg = onTl ? "''" : "null";    // '' = every Team Lead, null = whatever the Team Lead filter says
+  let html = `<div class="od-wrap"><div class="od-tiles">` + OD_METRICS.map(m => odTile(m, t, tlArg)).join("") + `</div>`;
+  if (odAllTeams()) {
+    html += `<div class="od-tabs"><button class="od-tab${onTl ? "" : " active"}" onclick="odSetTab('date')">By Date</button>` +
+            `<button class="od-tab${onTl ? " active" : ""}" onclick="odSetTab('tl')">By Team Lead</button></div>`;
+  }
+  if (!src.length) {
+    html += `<div class="od-card">No orders found for this date range.</div></div>`;
+    box.innerHTML = html;
     return;
   }
-  const th = l => `<th class="col">${l}</th>`;
-  let html = "<table><thead><tr>" + ["Date", "Orders Received", "Pending", "In-Process", "Clarification", "Completed", "Completed on this date"].map(th).join("") + "</tr></thead><tbody>";
-  rows.forEach(r => {
-    html += `<tr><td>${_esc(r.work_date)}</td><td>${r.received}</td><td>${r.pending}</td><td>${r.in_process}</td>` +
-            `<td>${r.clarification}</td><td>${r.completed}</td><td>${r.completed_on_date}</td></tr>`;
-  });
-  const t = _ordersDashTotals(rows);
-  html += `<tr style="background:#eef3fb; font-weight:bold;"><td>Total</td><td>${t.received}</td><td>${t.pending}</td><td>${t.in_process}</td>` +
-          `<td>${t.clarification}</td><td>${t.completed}</td><td>${t.completed_on_date}</td></tr>`;
-  html += "</tbody></table>";
-  document.getElementById("grid-container").innerHTML = html;
+  if (onTl) {
+    html += `<div class="od-card" style="padding:0; overflow:auto;">${odTeamLeadTableHTML(odState.tlRows)}</div>`;
+  } else {
+    html += `<div class="od-card"><h4>Orders received by date</h4>${odChartHTML(odState.rows)}</div>`;
+    html += `<div class="od-card" style="padding:0; overflow:auto;">${odDateTableHTML(odState.rows)}</div>`;
+  }
+  box.innerHTML = html + `</div>`;
 }
 
-function exportOrdersDashboardCSV() {
-  if (!currentOrdersDash.length) { alert("Nothing to export \u2014 load a date range first."); return; }
-  const headers = ["Date", "Orders Received", "Pending", "In-Process", "Clarification", "Completed", "Completed on this date"];
-  const t = _ordersDashTotals(currentOrdersDash);
-  const lines = currentOrdersDash.map(r => [r.work_date, r.received, r.pending, r.in_process, r.clarification, r.completed, r.completed_on_date])
-    .concat([["Total", t.received, t.pending, t.in_process, t.clarification, t.completed, t.completed_on_date]])
-    .map(row => row.map(v => `"${String(v).replace(/"/g, '""')}"`).join(","));
-  const csv = [headers.join(",")].concat(lines).join("\r\n");
+function odSetTab(tab) { odState.tab = tab; renderOrdersDashboard(); }
+
+// ---- drill-down: the raw orders behind a number ----
+function odDetailCols() {
+  const cols = [];
+  if (odAllTeams()) cols.push(["team_lead_name", "Team Lead"]);
+  OD_DETAIL_KEYS.forEach(k => { const c = COLUMNS.find(x => x.k === k); if (c) cols.push([k, c.label]); });
+  return cols;
+}
+function odDetailText(o, k) {
+  if (k === "team_lead_name") return o.team_lead_name || "";
+  if (k === "posting_status" && !o.posting_status) return "Pending";
+  return _prodCellText(o, k);
+}
+
+async function odDrill(metric, onDate, tlArg) {
+  const p = odBaseParams();
+  p.set("metric", metric);
+  if (onDate) { p.delete("start_date"); p.delete("end_date"); p.set("on_date", onDate); }
+  const tl = (tlArg === null || tlArg === undefined) ? odTlFilter() : String(tlArg);
+  if (tl !== "" && odAllTeams()) p.set("team_lead_id", tl);
+  const res = await authFetch("/dashboard/orders/details?" + p.toString());
+  if (!res.ok) { alert("Couldn't load the orders: " + (await res.text())); return; }
+  const rows = await res.json();
+
+  const when = onDate ? odShortDate(onDate) + " " + onDate.slice(0, 4)
+    : `${document.getElementById("od-date-from").value || "start"} \u2192 ${document.getElementById("od-date-to").value || "today"}`;
+  const tlRow = odState.tlRows.find(r => String(r.team_lead_id) === tl);
+  const who = tlRow ? ` \u00b7 ${tlRow.team_lead_name}` : "";
+  odState.drill = {metric, rows, truncated: rows.length >= 5000, title: `${odMetric(metric).label} \u00b7 ${when}${who}`};
+  renderOrdersDashboard();
+  window.scrollTo({top: 0});
+}
+
+function odBack() { odState.drill = null; renderOrdersDashboard(); }
+
+function odDrillHTML() {
+  const d = odState.drill;
+  const m = odMetric(d.metric);
+  const cols = odDetailCols();
+  let html = `<div class="od-wrap"><div class="od-drill-head"><button class="action-btn" onclick="odBack()">\u2190 Back to dashboard</button>` +
+    `<h4><span class="od-dot" style="background:${m.color}"></span>${_esc(d.title)} \u2014 ${d.rows.length} order${d.rows.length === 1 ? "" : "s"}</h4>` +
+    (d.truncated ? `<span style="color:#b45309; font-size:12px;">Showing the first 5,000 \u2014 narrow the dates to see the rest.</span>` : "") + `</div>`;
+  if (!d.rows.length) return html + `<div class="od-card">No orders.</div></div>`;
+  html += `<div class="od-scroll"><table><thead><tr>` + cols.map(([, l]) => `<th>${_esc(l)}</th>`).join("") + `</tr></thead><tbody>`;
+  d.rows.forEach(o => {
+    html += `<tr>` + cols.map(([k]) => `<td>${_esc(odDetailText(o, k))}</td>`).join("") + `</tr>`;
+  });
+  return html + `</tbody></table></div></div>`;
+}
+
+// ---- CSV: exports whatever is on screen (raw orders, Team Lead table or date table) ----
+function odExportCSV() {
+  let headers, lines, name;
+  const q = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const stamp = `${document.getElementById("od-date-from").value || "all"}_to_${document.getElementById("od-date-to").value || "all"}`;
+  if (odState.drill) {
+    const cols = odDetailCols();
+    headers = cols.map(([, l]) => l);
+    lines = odState.drill.rows.map(o => cols.map(([k]) => odDetailText(o, k)));
+    name = `orders_${odState.drill.metric}_${stamp}.csv`;
+  } else if (odAllTeams() && odState.tab === "tl") {
+    headers = ["Team Lead"].concat(OD_METRICS.map(m => m.label));
+    lines = odState.tlRows.map(r => [r.team_lead_name].concat(OD_METRICS.map(m => r[m.k])));
+    const t = odTotals(odState.tlRows);
+    lines.push(["All Team Leads"].concat(OD_METRICS.map(m => t[m.k])));
+    name = `orders_dashboard_by_team_lead_${stamp}.csv`;
+  } else {
+    headers = ["Date"].concat(OD_METRICS.map(m => m.label));
+    lines = odState.rows.map(r => [r.work_date].concat(OD_METRICS.map(m => r[m.k])));
+    const t = odTotals(odState.rows);
+    lines.push(["Total"].concat(OD_METRICS.map(m => t[m.k])));
+    name = `orders_dashboard_${stamp}.csv`;
+  }
+  if (!lines.length) { alert("Nothing to export \u2014 load a date range first."); return; }
+  const csv = [headers.map(q).join(",")].concat(lines.map(r => r.map(q).join(","))).join("\r\n");
   const blob = new Blob([csv], {type: "text/csv;charset=utf-8;"});
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  a.href = url;
-  a.download = `orders_dashboard_${document.getElementById("od-date-from").value || "all"}_to_${document.getElementById("od-date-to").value || "all"}.csv`;
+  a.href = url; a.download = name;
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
