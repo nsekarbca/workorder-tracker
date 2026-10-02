@@ -342,6 +342,10 @@ class WorkOrderOut(BaseModel):
     timer_started_at: Optional[datetime] = None
     time_taken_seconds: int = 0
 
+    # Filled in for Admin / Super Admin on the Active Queue, Escalation queue
+    # and Production lists so those screens can be shown Team Lead-wise.
+    team_lead_name: Optional[str] = None
+
     class Config:
         from_attributes = True
 

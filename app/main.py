@@ -1292,7 +1292,7 @@ def list_orders(
     db: Session = Depends(get_db),
 ):
     """Active queue for one process — orders already submitted to Production are hidden here for everyone."""
-    _require_process_access(current_user, process_id)
+    _require_view_access(current_user, process_id)
     query = db.query(models.WorkOrder).filter(
         models.WorkOrder.submitted == False,  # noqa: E712
         models.WorkOrder.process_id == process_id,
@@ -1310,7 +1310,10 @@ def list_orders(
                 models.WorkOrder.team_lead_id.is_(None),
             )
         )
-    return query.order_by(models.WorkOrder.id.asc()).all()
+    orders = query.order_by(models.WorkOrder.id.asc()).all()
+    if current_user.role in ("admin", "super_admin"):
+        _attach_team_leads(db, orders, prefer="owner")     # so the screen can group by Team Lead
+    return orders
 
 
 @app.get("/orders/production", response_model=List[schemas.WorkOrderOut])
@@ -1339,8 +1342,9 @@ def list_production_orders(
     server-side regardless of what filters are passed, not just hidden in
     the UI. All filters are optional and combine with AND. start_date/end_date
     filter by Posted Date (inclusive) — the day the work was actually completed.
+    Admin (read-only) and Super Admin get every row tagged with its Team Lead.
     """
-    _require_process_access(current_user, process_id)
+    _require_view_access(current_user, process_id)
     query = db.query(models.WorkOrder).filter(
         models.WorkOrder.submitted == True,  # noqa: E712
         models.WorkOrder.process_id == process_id,
@@ -1391,14 +1395,17 @@ def list_production_orders(
         if cond is not None:
             query = query.filter(cond)
 
-    return query.order_by(models.WorkOrder.posted_date.asc(), models.WorkOrder.id.asc()).all()
+    orders = query.order_by(models.WorkOrder.posted_date.asc(), models.WorkOrder.id.asc()).all()
+    if current_user.role in ("admin", "super_admin"):
+        _attach_team_leads(db, orders, prefer="colleague")
+    return orders
 
 
 @app.get("/orders/escalations", response_model=List[schemas.WorkOrderOut])
 def list_escalations(
     process_id: int,
     resolved: bool = False,
-    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -1407,14 +1414,15 @@ def list_escalations(
     Lead has already resolved (any escalation category with a detail form,
     no longer locked, Issue Closed Date stamped) — a history view, so it
     isn't filtered by submitted like the open queue is.
-    A Team Lead sees only their own team's rows either way; a Super Admin
-    sees every row in the process. Registered before /orders/{order_id}
+    A Team Lead sees only their own team's rows either way; Admin (read-only)
+    and Super Admin see every row in the process, each tagged with its Team
+    Lead. Registered before /orders/{order_id}
     on purpose: FastAPI matches routes in registration order, so a
     literal path like this one has to come before a dynamic
     {order_id}: int path or "escalations" gets swallowed as an attempted
     (and invalid) order_id.
     """
-    _require_process_access(current_user, process_id)
+    _require_view_access(current_user, process_id)
     query = db.query(models.WorkOrder).filter(models.WorkOrder.process_id == process_id)
     if resolved:
         query = query.filter(
@@ -1430,7 +1438,10 @@ def list_escalations(
     if current_user.role == "team_lead":
         query = query.filter(models.WorkOrder.team_lead_id == current_user.id)
     order_col = models.WorkOrder.issue_raised_date
-    return query.order_by(order_col.desc() if resolved else order_col.asc()).all()
+    orders = query.order_by(order_col.desc() if resolved else order_col.asc()).all()
+    if current_user.role in ("admin", "super_admin"):
+        _attach_team_leads(db, orders, prefer="owner")
+    return orders
 
 
 @app.get("/orders/{order_id}", response_model=schemas.WorkOrderOut)
@@ -1730,6 +1741,33 @@ def list_order_changes(
         item.process_name = names.get(r.process_id)
         out.append(item)
     return out
+
+
+def _require_view_access(user: models.User, process_id: int):
+    """Viewing a process's queues: Admin may view every process (read-only);
+    everyone else needs the process assigned to them."""
+    if user.role != "admin":
+        _require_process_access(user, process_id)
+
+
+def _attach_team_leads(db: Session, orders: list, prefer: str = "owner") -> list:
+    """
+    Sets order.team_lead_name on each order (Admin / Super Admin lists).
+      prefer="owner"     -> the Team Lead who owns the order (team_lead_id); if
+                            unowned, its assigned colleague's Team Lead.
+                            (How Active Queue / Escalations are scoped.)
+      prefer="colleague" -> the assigned colleague's Team Lead; if unassigned,
+                            the owner. (How Production is scoped.)
+    Anything else is "No Team Lead".
+    """
+    tls, members, _orphans = _tl_membership(db)
+    colleague_tl = {cid: tid for tid, ids in members.items() for cid in ids}
+    for o in orders:
+        owner = o.team_lead_id if o.team_lead_id in tls else None
+        via_colleague = colleague_tl.get(o.assigned_to_id) if o.assigned_to_id is not None else None
+        tid = (owner or via_colleague) if prefer == "owner" else (via_colleague or owner)
+        o.team_lead_name = tls.get(tid) if tid else None
+    return orders
 
 
 def _tl_membership(db: Session):
