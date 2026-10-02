@@ -211,7 +211,7 @@
       </div>
       <div id="nav-menu" class="nav-menu" style="display:none;">
         <button class="nav-menu-item" onclick="navTo('home')">🏠 Home</button>
-        <button class="nav-menu-item" onclick="navTo('active')">📋 Active Queue</button>
+        <button class="nav-menu-item" id="nav-active-btn" onclick="navTo('active')">📋 Active Queue</button>
         <button class="nav-menu-item" id="nav-audit-btn" style="display:none;" onclick="navTo('audit')">🛡️ Team Lead Change Log</button>
         <button class="nav-menu-item" id="nav-orders-dash-btn" style="display:none;" onclick="navTo('orders-dash')">📈 Orders Dashboard</button>
         <button class="nav-menu-item" id="nav-batch-btn" style="display:none;" onclick="navTo('batch')">📊 Batch Dashboard</button>
@@ -271,7 +271,7 @@
           <button class="action-btn" onclick="loadProduction()">Load</button>
           <button class="action-btn" onclick="exportProductionCSV()">Export CSV</button>
           <button class="action-btn" onclick="clearProductionFilters()">Clear Filters</button>
-          <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
+          <button class="action-btn" id="prod-back-btn" onclick="showActiveView()">Back to Active Queue</button>
         </div>
       </div>
       <div id="audit-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px;">
@@ -420,6 +420,7 @@
             <option value="colleague">Colleague</option>
             <option value="team_lead">Team Lead</option>
             <option value="admin">Admin</option>
+            <option value="quality">Quality</option>
             <option value="super_admin">Super Admin</option>
           </select>
         </label>
@@ -640,7 +641,7 @@ function isLeadRole() { return role === "team_lead" || role === "super_admin"; }
 // ---------------------------------------------------------------------
 const TL_NONE_LABEL = "No Team Lead";
 const TL_COLUMN = {k: "team_lead_name", label: "Team Lead", group: "col"};
-function tlAllTeams() { return role === "admin" || role === "super_admin"; }
+function tlAllTeams() { return role === "admin" || role === "quality" || role === "super_admin"; }
 function tlName(o) { return o.team_lead_name || TL_NONE_LABEL; }
 
 // Stable: Team Leads A-Z with "No Team Lead" last; rows keep their order inside a group.
@@ -1156,6 +1157,12 @@ function showApp() {
     document.getElementById("nav-escalations-btn").style.display = "block";   // Escalation queue (all teams, Team Lead-wise, view-only)
     document.getElementById("nav-production-btn").style.display = "block";    // Production (all teams, Team Lead-wise, view-only)
     document.getElementById("active-tl-label").style.display = "inline-block";
+  } else if (role === "quality") {
+    // Quality profile: view / export Production data only (all teams, Team Lead-wise).
+    document.getElementById("nav-production-btn").style.display = "block";
+    document.getElementById("nav-active-btn").style.display = "none";
+    document.getElementById("prod-back-btn").textContent = "Back to Home";
+    document.getElementById("prod-back-btn").setAttribute("onclick", "showHomeView()");
   } else {
     document.getElementById("submit-day-btn").style.display = "inline-block";
     document.getElementById("production-btn").style.display = "inline-block";
@@ -1168,7 +1175,8 @@ function showApp() {
   }
 
   if (currentProcessId) {
-    showHomeView();
+    if (role === "quality") showProductionView();
+    else showHomeView();
   } else if (role === "super_admin") {
     showAdminView();
   }
@@ -2727,7 +2735,7 @@ function populateFilterFieldDropdown() {
   const sel = document.getElementById("prod-filter-field");
   sel.innerHTML = "";
   FILTER_FIELD_OPTIONS.forEach(opt => {
-    if (opt.teamLeadOnly && !isLeadRole() && role !== "admin") return;
+    if (opt.teamLeadOnly && !isLeadRole() && role !== "admin" && role !== "quality") return;
     if (opt.allTeamsOnly && !tlAllTeams()) return;
     const o = document.createElement("option");
     o.value = opt.value;
