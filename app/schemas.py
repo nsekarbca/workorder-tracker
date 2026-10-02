@@ -432,3 +432,24 @@ class BatchTeamLeadRow(BaseModel):
     accounts_audited: Optional[int] = None
     errors: Optional[int] = None
     quality_pct: Optional[float] = None
+
+
+# Admin / Super Admin: what Team Leads changed on locked / completed orders.
+class OrderChangeLogOut(BaseModel):
+    id: int
+    created_at: datetime
+    process_id: Optional[int] = None
+    process_name: Optional[str] = None
+    order_id: int
+    edm: Optional[str] = None
+    employee_name: Optional[str] = None
+    actor_id: Optional[int] = None
+    actor_username: Optional[str] = None
+    actor_name: Optional[str] = None
+    actor_role: Optional[str] = None
+    action: str
+    order_state: Optional[str] = None
+    changes: List[dict] = []
+
+    class Config:
+        from_attributes = True

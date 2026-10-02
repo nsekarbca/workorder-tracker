@@ -91,6 +91,78 @@ def _require_process_access(user: models.User, process_id: int):
         raise HTTPException(status_code=403, detail="You don't have access to this process")
 
 
+# ---------------------------------------------------------------------------
+# Audit trail: Team Lead changes to locked / completed orders
+# ---------------------------------------------------------------------------
+
+# Columns that change as a side effect (or are pure noise) and would only
+# clutter the "what changed" list.
+AUDIT_SKIP_FIELDS = {"id", "last_edited_by", "updated_at", "timer_status", "timer_started_at", "time_taken_seconds"}
+
+
+def _audit_value(v):
+    return v.isoformat() if isinstance(v, (date, datetime)) else v
+
+
+def _order_snapshot(order: models.WorkOrder) -> dict:
+    return {
+        c.name: _audit_value(getattr(order, c.name))
+        for c in models.WorkOrder.__table__.columns
+        if c.name not in AUDIT_SKIP_FIELDS
+    }
+
+
+def _order_lock_reasons(order: models.WorkOrder) -> list:
+    """Why an order counts as locked/completed ([] = an ordinary open order)."""
+    reasons = []
+    if order.posting_status == "Completed":
+        reasons.append("Completed")
+    if order.escalated:
+        reasons.append("Escalated (locked)")
+    if order.submitted:
+        reasons.append("Submitted to Production")
+    return reasons
+
+
+def _audit_applies(user: models.User) -> bool:
+    """Whose changes are logged. Today: Team Leads (extend here to include others)."""
+    return user.role == "team_lead"
+
+
+def _log_order_change(db: Session, user: models.User, order: models.WorkOrder, action: str,
+                      reasons: list, before: dict):
+    """
+    Adds one audit row. `before` is the snapshot taken BEFORE the change.
+    For "delete" the key fields are recorded; otherwise only the fields that
+    actually changed (a save that changes nothing logs nothing).
+    """
+    if action == "delete":
+        changes = [
+            {"field": k, "old": before.get(k), "new": None}
+            for k in ("edm", "posting_status", "employee_name", "amount", "posted_amount", "posted_date")
+            if before.get(k) not in (None, "")
+        ]
+    else:
+        after = _order_snapshot(order)
+        changes = [{"field": k, "old": before.get(k), "new": after.get(k)} for k in after if before.get(k) != after.get(k)]
+        if not changes:
+            return
+    db.add(models.OrderChangeLog(
+        created_at=datetime.now(IST).replace(tzinfo=None),
+        process_id=order.process_id,
+        order_id=order.id,
+        edm=order.edm,
+        employee_name=before.get("employee_name"),
+        actor_id=user.id,
+        actor_username=user.username,
+        actor_name=user.full_name,
+        actor_role=user.role,
+        action=action,
+        order_state=", ".join(reasons),
+        changes=changes,
+    ))
+
+
 def _team_colleague_ids(db: Session, team_lead: models.User) -> list:
     """Ids of the colleagues who report to this Team Lead (matched on Reporting Manager)."""
     return [
@@ -897,12 +969,17 @@ def reassign_order(
     if not new_colleague:
         raise HTTPException(status_code=400, detail="Not a valid colleague for this process")
 
+    reasons = _order_lock_reasons(order) if _audit_applies(current_user) else []
+    before = _order_snapshot(order) if reasons else None
+
     order.assigned_to_id = new_colleague.id
     order.assigned_date = datetime.now(IST).date()
     order.employee_id = new_colleague.employee_id or new_colleague.username
     order.employee_name = new_colleague.full_name
     order.last_edited_by = current_user.username
     _start_timer(order)
+    if reasons:
+        _log_order_change(db, current_user, order, "reassign", reasons, before)
     db.commit()
     db.refresh(order)
     return order
@@ -990,6 +1067,15 @@ def delete_all_orders(
     routing gotcha as /orders/escalations earlier.
     """
     _require_process_access(current_user, process_id)
+    if _audit_applies(current_user):
+        # Record every locked / completed order that is about to disappear.
+        for o in db.query(models.WorkOrder).filter(
+            models.WorkOrder.process_id == process_id,
+            or_(models.WorkOrder.posting_status == "Completed",
+                models.WorkOrder.escalated == True,  # noqa: E712
+                models.WorkOrder.submitted == True),  # noqa: E712
+        ).all():
+            _log_order_change(db, current_user, o, "delete", _order_lock_reasons(o), _order_snapshot(o))
     deleted_count = db.query(models.WorkOrder).filter(models.WorkOrder.process_id == process_id).delete()
     db.commit()
     return {"deleted": deleted_count}
@@ -1006,6 +1092,9 @@ def delete_one_order(
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     _require_process_access(current_user, order.process_id)
+    reasons = _order_lock_reasons(order) if _audit_applies(current_user) else []
+    if reasons:
+        _log_order_change(db, current_user, order, "delete", reasons, _order_snapshot(order))
     db.delete(order)
     db.commit()
     return {"deleted": 1}
@@ -1370,9 +1459,13 @@ def update_team_lead_fields(
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     _require_process_access(current_user, order.process_id)
+    reasons = _order_lock_reasons(order) if _audit_applies(current_user) else []
+    before = _order_snapshot(order) if reasons else None
     for field, value in payload.dict(exclude_unset=True).items():
         setattr(order, field, value)
     order.last_edited_by = current_user.username
+    if reasons:
+        _log_order_change(db, current_user, order, "edit", reasons, before)
     db.commit()
     db.refresh(order)
     return order
@@ -1605,6 +1698,39 @@ def update_colleague_fields(
 # Team Lead Orders Dashboard (date-wise: received / pending / in-process /
 # clarification / completed)
 # ---------------------------------------------------------------------------
+
+AUDIT_LIMIT = 5000
+
+
+@app.get("/audit/order-changes", response_model=List[schemas.OrderChangeLogOut])
+def list_order_changes(
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    process_id: Optional[int] = None,
+    current_user: models.User = Depends(auth.require_role("admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    What Team Leads changed on locked / completed orders (Admin and Super
+    Admin only), newest first. start_date / end_date filter on the day the
+    change was made (IST). At most 5,000 entries.
+    """
+    q = db.query(models.OrderChangeLog)
+    if process_id is not None:
+        q = q.filter(models.OrderChangeLog.process_id == process_id)
+    if start_date:
+        q = q.filter(models.OrderChangeLog.created_at >= datetime.combine(start_date, datetime.min.time()))
+    if end_date:
+        q = q.filter(models.OrderChangeLog.created_at < datetime.combine(end_date + timedelta(days=1), datetime.min.time()))
+    rows = q.order_by(models.OrderChangeLog.created_at.desc(), models.OrderChangeLog.id.desc()).limit(AUDIT_LIMIT).all()
+    names = {p.id: p.name for p in db.query(models.Process).all()}
+    out = []
+    for r in rows:
+        item = schemas.OrderChangeLogOut.model_validate(r)
+        item.process_name = names.get(r.process_id)
+        out.append(item)
+    return out
+
 
 def _tl_membership(db: Session):
     """
@@ -2281,6 +2407,9 @@ def correct_completed_order(
             detail="posting_status must be 'Completed', 'In-Process', or 'Clarification'",
         )
 
+    reasons = _order_lock_reasons(order) if _audit_applies(current_user) else []   # state BEFORE the fix
+    before = _order_snapshot(order) if reasons else None
+
     for field, value in payload_data.items():
         setattr(order, field, value)
     order.last_edited_by = current_user.username
@@ -2295,6 +2424,8 @@ def correct_completed_order(
             pause_bdays = _count_business_days(order.issue_raised_date, order.issue_closed_date)
         order.tat_days = total_bdays - pause_bdays
 
+    if reasons:
+        _log_order_change(db, current_user, order, "correction", reasons, before)
     db.commit()
     db.refresh(order)
     return order

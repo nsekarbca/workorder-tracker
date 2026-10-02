@@ -337,3 +337,29 @@ class DailyBatchStat(Base):
 
     updated_by = Column(String, nullable=True)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class OrderChangeLog(Base):
+    """
+    Audit trail: every change a Team Lead makes to an order that is locked or
+    completed (Completed, escalated-and-locked, or submitted to Production) —
+    corrections, assignment edits, reassigns and deletions. Shown to Admin and
+    Super Admin. order_id is deliberately NOT a foreign key so the entry
+    survives when the order itself is deleted; edm / employee_name are copied
+    at the time for the same reason.
+    """
+    __tablename__ = "order_change_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    created_at = Column(DateTime, nullable=False, index=True)   # IST, set in code
+    process_id = Column(Integer, nullable=True, index=True)
+    order_id = Column(Integer, nullable=False, index=True)
+    edm = Column(String, nullable=True)
+    employee_name = Column(String, nullable=True)               # colleague on the order at the time
+    actor_id = Column(Integer, nullable=True, index=True)
+    actor_username = Column(String, nullable=True)
+    actor_name = Column(String, nullable=True)
+    actor_role = Column(String, nullable=True)
+    action = Column(String, nullable=False)                     # correction | edit | reassign | delete
+    order_state = Column(String, nullable=True)                 # e.g. "Completed", "Escalated (locked)"
+    changes = Column(JSON, nullable=False, default=list)        # [{"field", "old", "new"}, ...]
