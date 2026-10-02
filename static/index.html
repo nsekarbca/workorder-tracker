@@ -208,6 +208,7 @@
       <div id="nav-menu" class="nav-menu" style="display:none;">
         <button class="nav-menu-item" onclick="navTo('home')">🏠 Home</button>
         <button class="nav-menu-item" onclick="navTo('active')">📋 Active Queue</button>
+        <button class="nav-menu-item" id="nav-audit-btn" style="display:none;" onclick="navTo('audit')">🛡️ Team Lead Change Log</button>
         <button class="nav-menu-item" id="nav-orders-dash-btn" style="display:none;" onclick="navTo('orders-dash')">📈 Orders Dashboard</button>
         <button class="nav-menu-item" id="nav-batch-btn" style="display:none;" onclick="navTo('batch')">📊 Batch Dashboard</button>
         <button class="nav-menu-item" id="nav-production-btn" style="display:none;" onclick="navTo('production')">📦 Production</button>
@@ -267,6 +268,32 @@
           <button class="action-btn" onclick="clearProductionFilters()">Clear Filters</button>
           <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
         </div>
+      </div>
+      <div id="audit-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px;">
+        <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
+          <h3 style="margin:0;">🛡️ Team Lead Change Log</h3>
+          <label>From <input type="date" id="audit-date-from"></label>
+          <label>To <input type="date" id="audit-date-to"></label>
+          <label>Process <select id="audit-process"></select></label>
+          <label>Team Lead <select id="audit-team-lead" onchange="renderAudit()"></select></label>
+          <label>Action <select id="audit-action" onchange="renderAudit()">
+            <option value="">All</option><option value="correction">Correction</option><option value="edit">Assignment edit</option>
+            <option value="reassign">Reassigned</option><option value="delete">Deleted</option></select></label>
+          <label>Search <input type="text" id="audit-search" placeholder="EDM, employee or value" oninput="renderAudit()" style="width:160px;"></label>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <button class="action-btn" onclick="loadAudit()">Load</button>
+          <span style="font-size:12px; color:#666; margin-left:6px;">Quick:</span>
+          <button class="od-tab" onclick="auditQuickRange(1)">Today</button>
+          <button class="od-tab" onclick="auditQuickRange(7)">Last 7 days</button>
+          <button class="od-tab" onclick="auditQuickRange(30)">Last 30 days</button>
+          <span style="flex:1;"></span>
+          <button class="action-btn" onclick="auditExportCSV()">Export CSV</button>
+          <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
+        </div>
+        <div style="font-size:12px; color:#666;">Every change a Team Lead makes to an order that is <strong>Completed</strong>, <strong>escalated &amp; locked</strong> or
+          <strong>submitted to Production</strong> is recorded here with what it was before and after — corrections, assignment edits, reassignments and deletions.
+          Times are IST.</div>
       </div>
       <div id="orders-dash-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px;">
         <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
@@ -1065,6 +1092,9 @@ function showApp() {
     if (role === "team_lead") {
       document.getElementById("share-btn").style.display = "inline-block";
     }
+    if (role === "super_admin") {
+      document.getElementById("nav-audit-btn").style.display = "block";    // Team Lead Change Log
+    }
   } else if (role === "admin") {
     // Admin currently only gets Import (with on-behalf-of-Team-Lead
     // delegation) — not the rest of the Team Lead toolset yet.
@@ -1073,6 +1103,7 @@ function showApp() {
     if (currentProcessId) loadImportOnBehalfDropdown();
     document.getElementById("nav-orders-dash-btn").style.display = "block";   // Orders Dashboard (all teams, Team Lead-wise)
     document.getElementById("nav-batch-btn").style.display = "block";         // Batch Dashboard (all teams, Team Lead-wise, view-only)
+    document.getElementById("nav-audit-btn").style.display = "block";         // Team Lead Change Log
   } else {
     document.getElementById("submit-day-btn").style.display = "inline-block";
     document.getElementById("production-btn").style.display = "inline-block";
@@ -1110,6 +1141,7 @@ function navTo(dest) {
   else if (dest === "active") showActiveView();
   else if (dest === "batch") showBatchDashboardView();
   else if (dest === "orders-dash") showOrdersDashboardView();
+  else if (dest === "audit") showAuditView();
   else if (dest === "production") showProductionView();
   else if (dest === "escalations") showEscalationsView();
   else if (dest === "admin") showAdminView();
@@ -1117,6 +1149,175 @@ function navTo(dest) {
 }
 
 
+
+// ---------------------------------------------------------------------
+// Team Lead Change Log (Admin / Super Admin) — what Team Leads changed on
+// Completed / escalated-and-locked / submitted orders (server: GET
+// /audit/order-changes). Date range + process are filtered on the server;
+// Team Lead / Action / Search narrow the loaded entries in the browser.
+// ---------------------------------------------------------------------
+
+let auditRows = [];
+
+const AUDIT_ACTIONS = {
+  correction: {label: "Correction",      color: "#2563eb"},
+  edit:       {label: "Assignment edit", color: "#7c3aed"},
+  reassign:   {label: "Reassigned",      color: "#d97706"},
+  delete:     {label: "Deleted",         color: "#dc2626"},
+};
+const AUDIT_EXTRA_LABELS = {
+  assigned_to_id: "Assigned To (ID)", employee_id: "Employee ID", escalated: "Escalated",
+  submitted: "Submitted to Production", submitted_at: "Submitted At", team_lead_id: "Team Lead (ID)",
+  issue_raised_date: "Issue Raised Date", issue_closed_date: "Issue Closed Date", ventra_comment: "VENTRA Comment",
+};
+
+function auditFieldLabel(k) {
+  const c = (typeof COLUMNS !== "undefined") ? COLUMNS.find(x => x.k === k) : null;
+  if (c) return c.label;
+  return AUDIT_EXTRA_LABELS[k] || k.replace(/_/g, " ").replace(/\b\w/g, m => m.toUpperCase());
+}
+function auditVal(v) {
+  if (v === null || v === undefined || v === "") return "\u2014";
+  if (v === true) return "Yes";
+  if (v === false) return "No";
+  return String(v);
+}
+function auditWhen(iso) {
+  const d = new Date(iso);                     // stored as IST wall-clock, shown as-is
+  if (isNaN(d)) return String(iso);
+  return d.toLocaleDateString("en-GB", {day: "2-digit", month: "short", year: "numeric"}) + ", " +
+         d.toLocaleTimeString("en-GB", {hour: "2-digit", minute: "2-digit"});
+}
+// Reassigns carry employee_id and assigned_to_id too; the name says it better.
+function auditShownChanges(row) {
+  const names = row.changes.map(c => c.field);
+  return row.changes.filter(c => !(c.field === "assigned_to_id" && names.includes("employee_name")) &&
+                                 !(c.field === "employee_id" && names.includes("employee_name")));
+}
+function auditChangeText(row) {
+  if (row.action === "delete") {
+    return "Order deleted \u2014 " + row.changes.map(c => `${auditFieldLabel(c.field)}: ${auditVal(c.old)}`).join(" \u00b7 ");
+  }
+  return auditShownChanges(row).map(c => `${auditFieldLabel(c.field)}: ${auditVal(c.old)} \u2192 ${auditVal(c.new)}`).join("\n");
+}
+
+async function showAuditView() {
+  viewMode = "audit";
+  document.getElementById("toolbar").style.display = "none";
+  document.getElementById("production-bar").style.display = "none";
+  document.getElementById("batch-bar").style.display = "none";
+  document.getElementById("orders-dash-bar").style.display = "none";
+  document.getElementById("admin-panel").style.display = "none";
+  document.getElementById("dashboard-panel").style.display = "none";
+  document.getElementById("under-construction-banner").style.display = "none";
+  shareMode = false;
+  selectedForShare.clear();
+  document.getElementById("share-bar").style.display = "none";
+  document.getElementById("audit-bar").style.display = "flex";
+
+  const today = new Date();
+  const from = new Date(); from.setDate(today.getDate() - 29);
+  document.getElementById("audit-date-from").value = _isoLocalDate(from);
+  document.getElementById("audit-date-to").value = _isoLocalDate(today);
+  document.getElementById("audit-action").value = "";
+  document.getElementById("audit-search").value = "";
+  document.getElementById("audit-team-lead").innerHTML = `<option value="">All</option>`;
+
+  let procs = myProcesses;
+  try {
+    const pr = await fetch(API + "/processes/public");
+    if (pr.ok) procs = await pr.json();
+  } catch (_) { /* fall back to the user's own processes */ }
+  document.getElementById("audit-process").innerHTML = `<option value="">All processes</option>` +
+    procs.map(p => `<option value="${p.id}">${_esc(p.name)}</option>`).join("");
+  await loadAudit();
+}
+
+function auditQuickRange(days) {
+  const today = new Date();
+  const from = new Date(); from.setDate(today.getDate() - (days - 1));
+  document.getElementById("audit-date-from").value = _isoLocalDate(from);
+  document.getElementById("audit-date-to").value = _isoLocalDate(today);
+  loadAudit();
+}
+
+async function loadAudit() {
+  const p = new URLSearchParams();
+  const f = document.getElementById("audit-date-from").value;
+  const t = document.getElementById("audit-date-to").value;
+  const pr = document.getElementById("audit-process").value;
+  if (f) p.set("start_date", f);
+  if (t) p.set("end_date", t);
+  if (pr) p.set("process_id", pr);
+  const res = await authFetch("/audit/order-changes?" + p.toString());
+  if (!res.ok) { alert("Couldn't load the change log: " + (await res.text())); return; }
+  auditRows = await res.json();
+
+  const sel = document.getElementById("audit-team-lead");
+  const keep = sel.value;
+  const names = Array.from(new Set(auditRows.map(r => r.actor_name || r.actor_username || ""))).filter(Boolean).sort();
+  sel.innerHTML = `<option value="">All</option>` + names.map(n => `<option value="${_esc(n)}">${_esc(n)}</option>`).join("");
+  if (names.includes(keep)) sel.value = keep;
+  renderAudit();
+}
+
+function auditVisibleRows() {
+  const tl = document.getElementById("audit-team-lead").value;
+  const act = document.getElementById("audit-action").value;
+  const q = document.getElementById("audit-search").value.trim().toLowerCase();
+  return auditRows.filter(r =>
+    (!tl || (r.actor_name || r.actor_username) === tl) &&
+    (!act || r.action === act) &&
+    (!q || (r.edm || "").toLowerCase().includes(q) || (r.employee_name || "").toLowerCase().includes(q) ||
+           auditChangeText(r).toLowerCase().includes(q)));
+}
+
+function renderAudit() {
+  const rows = auditVisibleRows();
+  const box = document.getElementById("grid-container");
+  if (!rows.length) {
+    box.innerHTML = auditRows.length
+      ? "<p>No changes match these filters.</p>"
+      : "<p>No Team Lead changes to locked or completed orders in this date range.</p>";
+    return;
+  }
+  const tls = new Set(rows.map(r => r.actor_name || r.actor_username)).size;
+  let html = `<p style="margin:0 0 8px; color:#555;"><strong>${rows.length}</strong> change${rows.length === 1 ? "" : "s"} by <strong>${tls}</strong> Team Lead${tls === 1 ? "" : "s"}` +
+    (auditRows.length >= 5000 ? ` <span style="color:#b45309;">\u2014 showing the latest 5,000; narrow the dates to see older ones.</span>` : "") + `</p>`;
+  html += `<div class="od-scroll"><table><thead><tr>` +
+    ["When (IST)", "Team Lead", "Process", "EDM", "Employee", "Action", "Order State", "What changed"].map(h => `<th class="col">${h}</th>`).join("") +
+    `</tr></thead><tbody>`;
+  rows.forEach(r => {
+    const a = AUDIT_ACTIONS[r.action] || {label: r.action, color: "#555"};
+    html += `<tr><td style="white-space:nowrap;">${_esc(auditWhen(r.created_at))}</td>` +
+      `<td>${_esc(r.actor_name || r.actor_username)}</td><td>${_esc(r.process_name)}</td><td>${_esc(r.edm)}</td><td>${_esc(r.employee_name)}</td>` +
+      `<td><span style="display:inline-block; padding:2px 10px; border-radius:12px; color:#fff; font-size:12px; background:${a.color};">${_esc(a.label)}</span></td>` +
+      `<td>${_esc(r.order_state)}</td><td style="white-space:pre-line; min-width:280px;">${_esc(auditChangeText(r))}</td></tr>`;
+  });
+  box.innerHTML = html + `</tbody></table></div>`;
+}
+
+function auditExportCSV() {
+  const rows = auditVisibleRows();
+  if (!rows.length) { alert("Nothing to export \u2014 load a date range first."); return; }
+  const q = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const headers = ["When (IST)", "Team Lead", "Process", "EDM", "Employee", "Action", "Order State", "Field", "Old Value", "New Value"];
+  const lines = [];
+  rows.forEach(r => {
+    const a = (AUDIT_ACTIONS[r.action] || {label: r.action}).label;
+    const base = [r.created_at.replace("T", " ").slice(0, 19), r.actor_name || r.actor_username, r.process_name, r.edm, r.employee_name, a, r.order_state];
+    const ch = r.action === "delete" ? r.changes : auditShownChanges(r);
+    ch.forEach(c => lines.push(base.concat([auditFieldLabel(c.field), c.old ?? "", r.action === "delete" ? "(deleted)" : (c.new ?? "")])));
+  });
+  const csv = [headers.map(q).join(",")].concat(lines.map(r => r.map(q).join(","))).join("\r\n");
+  const blob = new Blob([csv], {type: "text/csv;charset=utf-8;"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `team_lead_change_log_${document.getElementById("audit-date-from").value || "all"}_to_${document.getElementById("audit-date-to").value || "all"}.csv`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
 
 // ---------------------------------------------------------------------
 // Orders Dashboard — tiles + chart + date table; click ANY number to open
@@ -1173,6 +1374,7 @@ async function showOrdersDashboardView() {
   shareMode = false;
   selectedForShare.clear();
   document.getElementById("share-bar").style.display = "none";
+  document.getElementById("audit-bar").style.display = "none";
   document.getElementById("orders-dash-bar").style.display = "flex";
 
   odState = {rows: [], tlRows: [], tab: "date", drill: null};
@@ -1449,6 +1651,7 @@ async function showBatchDashboardView() {
   document.getElementById("share-bar").style.display = "none";
   document.getElementById("batch-bar").style.display = "flex";
   document.getElementById("orders-dash-bar").style.display = "none";
+  document.getElementById("audit-bar").style.display = "none";
 
   batchTab = "detail";
   currentBatchTL = [];
@@ -1726,6 +1929,7 @@ function showHomeView() {
   document.getElementById("production-bar").style.display = "none";
   document.getElementById("batch-bar").style.display = "none";
   document.getElementById("orders-dash-bar").style.display = "none";
+  document.getElementById("audit-bar").style.display = "none";
   shareMode = false;
   selectedForShare.clear();
   document.getElementById("share-bar").style.display = "none";
@@ -1754,6 +1958,7 @@ async function showEscalationsView() {
   document.getElementById("production-bar").style.display = "none";
   document.getElementById("batch-bar").style.display = "none";
   document.getElementById("orders-dash-bar").style.display = "none";
+  document.getElementById("audit-bar").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
   shareMode = false;
@@ -2040,6 +2245,7 @@ async function showAdminView() {
   document.getElementById("production-bar").style.display = "none";
   document.getElementById("batch-bar").style.display = "none";
   document.getElementById("orders-dash-bar").style.display = "none";
+  document.getElementById("audit-bar").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
   shareMode = false;
@@ -2478,6 +2684,7 @@ async function showProductionView() {
   document.getElementById("production-bar").style.display = "flex";
   document.getElementById("batch-bar").style.display = "none";
   document.getElementById("orders-dash-bar").style.display = "none";
+  document.getElementById("audit-bar").style.display = "none";
 
   dateFilters = {posted:{from:"",to:""}, received:{from:"",to:""}, assigned:{from:"",to:""}, created:{from:"",to:""}};
   valueFilters = emptyValueFilters();
@@ -2502,6 +2709,7 @@ function showActiveView() {
   document.getElementById("production-bar").style.display = "none";
   document.getElementById("batch-bar").style.display = "none";
   document.getElementById("orders-dash-bar").style.display = "none";
+  document.getElementById("audit-bar").style.display = "none";
   document.getElementById("admin-panel").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
@@ -2694,6 +2902,7 @@ async function loadOrders() {
   document.getElementById("production-bar").style.display = "none";
   document.getElementById("batch-bar").style.display = "none";
   document.getElementById("orders-dash-bar").style.display = "none";
+  document.getElementById("audit-bar").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
   viewMode = "active";
