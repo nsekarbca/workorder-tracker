@@ -173,7 +173,7 @@ class ResetPasswordWithTokenRequest(BaseModel):
 class CreateUserRequest(BaseModel):
     username: str
     full_name: str
-    role: str  # "colleague", "team_lead", or "super_admin"
+    role: str  # "colleague", "team_lead", "admin", "quality" or "super_admin"
     email: Optional[str] = None
     dob: Optional[date] = None
     doj: Optional[date] = None

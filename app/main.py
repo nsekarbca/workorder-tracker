@@ -232,10 +232,11 @@ def login(
         raise HTTPException(status_code=401, detail="Incorrect username or password")
     if user.employment_status == "Inactive":
         raise HTTPException(status_code=403, detail="This account is inactive")
-    if process_id is not None and not _user_has_process(user, process_id):
+    # Quality (view/export Production only) can open any process; everyone else needs it assigned.
+    if process_id is not None and user.role != "quality" and not _user_has_process(user, process_id):
         raise HTTPException(status_code=403, detail="You don't have access to that process")
     token = auth.create_access_token({"sub": user.username})
-    processes = db.query(models.Process).all() if user.role == "super_admin" else user.processes
+    processes = db.query(models.Process).all() if user.role in ("super_admin", "quality") else user.processes
     if user.role == "colleague":
         for p in processes:
             _auto_assign_open_slots(db, p.id)
@@ -391,8 +392,8 @@ def create_user(
     for this deployment) — the temporary password is returned in this
     response so the Super Admin can relay it to the new user directly.
     """
-    if payload.role not in ("colleague", "team_lead", "admin", "super_admin"):
-        raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', 'admin', or 'super_admin'")
+    if payload.role not in ("colleague", "team_lead", "admin", "quality", "super_admin"):
+        raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', 'admin', 'quality', or 'super_admin'")
     if db.query(models.User).filter(models.User.username == payload.username).first():
         raise HTTPException(status_code=400, detail="username already exists")
 
@@ -433,8 +434,8 @@ def update_user(
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    if payload.role not in ("colleague", "team_lead", "admin", "super_admin"):
-        raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', 'admin', or 'super_admin'")
+    if payload.role not in ("colleague", "team_lead", "admin", "quality", "super_admin"):
+        raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', 'admin', 'quality', or 'super_admin'")
 
     user.full_name = payload.full_name
     user.role = payload.role
@@ -1292,6 +1293,7 @@ def list_orders(
     db: Session = Depends(get_db),
 ):
     """Active queue for one process — orders already submitted to Production are hidden here for everyone."""
+    _deny_quality(current_user)
     _require_view_access(current_user, process_id)
     query = db.query(models.WorkOrder).filter(
         models.WorkOrder.submitted == False,  # noqa: E712
@@ -1342,7 +1344,8 @@ def list_production_orders(
     server-side regardless of what filters are passed, not just hidden in
     the UI. All filters are optional and combine with AND. start_date/end_date
     filter by Posted Date (inclusive) — the day the work was actually completed.
-    Admin (read-only) and Super Admin get every row tagged with its Team Lead.
+    Admin (read-only), Quality (read-only) and Super Admin get every row
+    tagged with its Team Lead.
     """
     _require_view_access(current_user, process_id)
     query = db.query(models.WorkOrder).filter(
@@ -1396,7 +1399,7 @@ def list_production_orders(
             query = query.filter(cond)
 
     orders = query.order_by(models.WorkOrder.posted_date.asc(), models.WorkOrder.id.asc()).all()
-    if current_user.role in ("admin", "super_admin"):
+    if current_user.role in ("admin", "quality", "super_admin"):
         _attach_team_leads(db, orders, prefer="colleague")
     return orders
 
@@ -1449,6 +1452,7 @@ def get_order(order_id: int, current_user: models.User = Depends(auth.get_curren
     order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+    _deny_quality(current_user)
     _require_process_access(current_user, order.process_id)
     if current_user.role == "colleague" and order.assigned_to_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not your assigned order")
@@ -1744,10 +1748,16 @@ def list_order_changes(
 
 
 def _require_view_access(user: models.User, process_id: int):
-    """Viewing a process's queues: Admin may view every process (read-only);
-    everyone else needs the process assigned to them."""
-    if user.role != "admin":
+    """Viewing a process's queues: Admin and Quality may view every process
+    (read-only); everyone else needs the process assigned to them."""
+    if user.role not in ("admin", "quality"):
         _require_process_access(user, process_id)
+
+
+def _deny_quality(user: models.User):
+    """Quality can only view / export Production — nothing else."""
+    if user.role == "quality":
+        raise HTTPException(status_code=403, detail="The Quality profile can only view Production data")
 
 
 def _attach_team_leads(db: Session, orders: list, prefer: str = "owner") -> list:
@@ -2517,6 +2527,7 @@ def _require_clarification_access(current_user: models.User, order: models.WorkO
     """Same actors who can touch escalation_category on a row: the
     colleague it's assigned to, or a Team Lead/Super Admin with access
     to its process."""
+    _deny_quality(current_user)
     if current_user.role == "colleague":
         if order.assigned_to_id != current_user.id:
             raise HTTPException(status_code=403, detail="This order is not assigned to you")
