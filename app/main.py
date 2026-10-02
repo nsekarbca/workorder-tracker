@@ -1886,26 +1886,47 @@ def _batch_visible_colleagues(db: Session, current_user: models.User):
         return q.filter(models.User.id == current_user.id).all()
     if current_user.role == "team_lead":
         return q.filter(models.User.reporting_manager == current_user.full_name).all()
-    return q.all()  # super_admin
+    return q.all()  # admin / super_admin: every team
 
 
-@app.get("/batch-dashboard", response_model=List[schemas.BatchDashboardRow])
-def batch_dashboard(
-    start_date: Optional[date] = None,
-    end_date: Optional[date] = None,
-    process_id: Optional[int] = None,
-    user_id: Optional[int] = None,
-    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "super_admin")),
-    db: Session = Depends(get_db),
-):
+def _batch_aggregate(group: list) -> dict:
     """
-    One row per colleague / process / date on which at least one order was
-    marked Completed (by Posted Date). Colleagues only ever get their own
-    rows; a Team Lead gets the colleagues who report to them; a Super Admin
-    gets everyone — all enforced here, not just in the UI.
+    Combines several per-process rows (one colleague's day, or a whole Team
+    Lead's range) into one set of figures — used by the "Overall" row and the
+    Team Lead-wise view so both follow exactly the same rules:
+      * Hours / Accounts Audited / Errors: simple totals of what was entered
+      * Production %: transactions of the rows that can be measured (daily
+        target AND hours entered) vs their combined expected output
+      * Quality %: only rows that have both Accounts Audited and Errors
     """
-    if process_id is not None:
-        _require_process_access(current_user, process_id)
+    hrs = [r["hours_worked"] for r in group if r["hours_worked"] is not None]
+    aud = [r["accounts_audited"] for r in group if r["accounts_audited"] is not None]
+    err = [r["errors"] for r in group if r["errors"] is not None]
+    measured = [r for r in group if r["_expected"]]
+    prod = None
+    if measured:
+        prod = round(sum(r["total_trans_count"] for r in measured) / sum(r["_expected"] for r in measured) * 100, 2)
+    complete = [r for r in group if r["accounts_audited"] and r["errors"] is not None]
+    qual = None
+    if complete:
+        a_sum = sum(r["accounts_audited"] for r in complete)
+        e_sum = sum(r["errors"] for r in complete)
+        qual = round((a_sum - e_sum) / a_sum * 100, 2)
+    return {
+        "batches_worked": sum(r["batches_worked"] for r in group),
+        "total_trans_count": sum(r["total_trans_count"] for r in group),
+        "hours_worked": round(sum(hrs), 2) if hrs else None,
+        "production_pct": prod,
+        "accounts_audited": sum(aud) if aud else None,
+        "errors": sum(err) if err else None,
+        "quality_pct": qual,
+    }
+
+
+def _batch_base_rows(db: Session, current_user: models.User, start_date, end_date, process_id, user_id) -> list:
+    """One row per colleague / process / date with completed work (before any Overall rows)."""
+    if process_id is not None and current_user.role != "admin":
+        _require_process_access(current_user, process_id)   # Admin / Super Admin see every process
 
     colleagues = {u.id: u for u in _batch_visible_colleagues(db, current_user)}
     if user_id is not None:
@@ -1943,6 +1964,8 @@ def batch_dashboard(
             models.DailyBatchStat.user_id.in_(list(colleagues.keys()))
         ).all()
     }
+    tls, members, _orphans = _tl_membership(db)
+    colleague_tl = {cid: tid for tid, ids in members.items() for cid in ids}
 
     rows = []
     for (uid, pid, d), g in groups.items():
@@ -1962,9 +1985,12 @@ def batch_dashboard(
         if audited and audited > 0 and errs is not None:
             quality_pct = round((audited - errs) / audited * 100, 2)
 
+        tid = colleague_tl.get(uid, 0)
         rows.append({
             "user_id": uid,
             "employee_name": colleagues[uid].full_name,
+            "team_lead_id": tid,
+            "team_lead_name": tls.get(tid, "No Team Lead"),
             "process_id": pid,
             "process_name": proc.name if proc else "",
             "work_date": d,
@@ -1979,6 +2005,28 @@ def batch_dashboard(
             "is_summary": False,
             "_expected": expected,
         })
+    return rows
+
+
+@app.get("/batch-dashboard", response_model=List[schemas.BatchDashboardRow])
+def batch_dashboard(
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    process_id: Optional[int] = None,
+    user_id: Optional[int] = None,
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    One row per colleague / process / date on which at least one order was
+    marked Completed (by Posted Date). Colleagues only ever get their own
+    rows; a Team Lead gets the colleagues who report to them; Admin and
+    Super Admin get everyone — all enforced here, not just in the UI. Each
+    row carries its Team Lead.
+    """
+    rows = _batch_base_rows(db, current_user, start_date, end_date, process_id, user_id)
+    if not rows:
+        return []
 
     # Newest date first, then employee, then process.
     rows.sort(key=lambda r: (-r["work_date"].toordinal(), r["employee_name"], r["process_name"]))
@@ -1994,38 +2042,17 @@ def batch_dashboard(
         group = rows[i:j]
         out.extend(group)
         if len(group) > 1:
-            hrs = [r["hours_worked"] for r in group if r["hours_worked"] is not None]
-            aud = [r["accounts_audited"] for r in group if r["accounts_audited"] is not None]
-            err = [r["errors"] for r in group if r["errors"] is not None]
-            # Overall Production % = transactions of the processes that can be
-            # measured (daily target AND hours entered) vs their combined
-            # expected output.
-            measured = [r for r in group if r["_expected"]]
-            prod = None
-            if measured:
-                prod = round(sum(r["total_trans_count"] for r in measured) / sum(r["_expected"] for r in measured) * 100, 2)
-            # Overall Quality % uses only rows with both audit figures entered.
-            complete = [r for r in group if r["accounts_audited"] and r["errors"] is not None]
-            qual = None
-            if complete:
-                a_sum = sum(r["accounts_audited"] for r in complete)
-                e_sum = sum(r["errors"] for r in complete)
-                qual = round((a_sum - e_sum) / a_sum * 100, 2)
             out.append({
                 "user_id": group[0]["user_id"],
                 "employee_name": group[0]["employee_name"],
+                "team_lead_id": group[0]["team_lead_id"],
+                "team_lead_name": group[0]["team_lead_name"],
                 "process_id": 0,
                 "process_name": f"Overall ({len(group)} processes)",
                 "work_date": group[0]["work_date"],
-                "batches_worked": sum(r["batches_worked"] for r in group),
-                "total_trans_count": sum(r["total_trans_count"] for r in group),
                 "daily_target": None,
-                "hours_worked": round(sum(hrs), 2) if hrs else None,
-                "production_pct": prod,
-                "accounts_audited": sum(aud) if aud else None,
-                "errors": sum(err) if err else None,
-                "quality_pct": qual,
                 "is_summary": True,
+                **_batch_aggregate(group),
             })
         i = j
     for r in out:
@@ -2033,10 +2060,43 @@ def batch_dashboard(
     return out
 
 
+@app.get("/batch-dashboard/by-team-lead", response_model=List[schemas.BatchTeamLeadRow])
+def batch_dashboard_by_team_lead(
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    process_id: Optional[int] = None,
+    current_user: models.User = Depends(auth.require_role("admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    The Batch Count Dashboard figures grouped by Team Lead over the whole
+    date range (Admin / Super Admin only), plus an "All Team Leads" total
+    row. Uses the same rules as the Overall row, so a Team Lead's row is the
+    combined figure for everything their colleagues did in the range.
+    """
+    rows = _batch_base_rows(db, current_user, start_date, end_date, process_id, None)
+    by_tl = {}
+    for r in rows:
+        by_tl.setdefault(r["team_lead_id"], []).append(r)
+
+    def build(tid, name, group):
+        return {
+            "team_lead_id": tid, "team_lead_name": name,
+            "colleagues": len({r["user_id"] for r in group}),
+            **_batch_aggregate(group),
+        }
+
+    out = [build(tid, group[0]["team_lead_name"], group) for tid, group in by_tl.items()]
+    out.sort(key=lambda r: (r["team_lead_id"] == 0, r["team_lead_name"].lower()))
+    if out:
+        out.append(build(-1, "All Team Leads", rows))
+    return out
+
+
 @app.put("/batch-dashboard", response_model=schemas.BatchDashboardRow)
 def save_batch_stat(
     payload: schemas.BatchStatUpdate,
-    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -2045,6 +2105,8 @@ def save_batch_stat(
     Team Lead / Super Admin -> # of Accounts Audited and # of Errors, for
     colleagues in their team (Super Admin: anyone).
     """
+    if current_user.role == "admin":
+        raise HTTPException(status_code=403, detail="Admin can view the Batch Dashboard but not edit it")
     data = payload.dict(exclude_unset=True)
     colleague_fields = {"hours_worked"}
     lead_fields = {"accounts_audited", "errors"}

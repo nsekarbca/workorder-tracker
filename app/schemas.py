@@ -365,6 +365,8 @@ class BatchDashboardRow(BaseModel):
     accounts_audited: Optional[int] = None
     errors: Optional[int] = None
     quality_pct: Optional[float] = None
+    team_lead_id: Optional[int] = None      # 0 = no Team Lead
+    team_lead_name: Optional[str] = None
     # True for the "Overall" row added when a colleague worked more than one
     # process on the same date (process_id is 0 on those rows).
     is_summary: bool = False
@@ -414,3 +416,19 @@ class OrdersDashboardTLRow(BaseModel):
 # Raw-data drill-down: a normal order plus the Team Lead it belongs to.
 class OrdersDashboardDetail(WorkOrderOut):
     team_lead_name: Optional[str] = None
+
+
+# Batch Count Dashboard grouped by Team Lead over the whole date range
+# (Admin / Super Admin). team_lead_id 0 = colleagues with no Team Lead,
+# -1 = the "All Team Leads" total row.
+class BatchTeamLeadRow(BaseModel):
+    team_lead_id: int
+    team_lead_name: str
+    colleagues: int
+    batches_worked: int
+    total_trans_count: int
+    hours_worked: Optional[float] = None
+    production_pct: Optional[float] = None
+    accounts_audited: Optional[int] = None
+    errors: Optional[int] = None
+    quality_pct: Optional[float] = None
