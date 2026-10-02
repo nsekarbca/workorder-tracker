@@ -130,6 +130,10 @@
   .od-drill-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
   .od-drill-head h4 { margin: 0; color: var(--navy); }
   .od-scroll { max-height: 68vh; overflow: auto; background: #fff; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,.1); }
+
+  /* ---- Team Lead-wise grouping (Admin / Super Admin) ---- */
+  tr.tl-group td { background: var(--navy); color: #fff; font-weight: 600; padding: 7px 12px; letter-spacing: .2px; }
+  tr.tl-group td span { font-weight: 400; opacity: .85; margin-left: 6px; }
 </style>
 </head>
 <body>
@@ -233,6 +237,7 @@
         <button class="action-btn" id="clear-data-btn" style="display:none; background:var(--red);" onclick="clearAllData()">Clear All Data</button>
         <button class="action-btn" id="production-btn" style="display:none;" onclick="showProductionView()">Production</button>
         <button class="action-btn" id="share-btn" style="display:none;" onclick="toggleShareMode()">Share Orders</button>
+        <label id="active-tl-label" style="display:none; font-size:14px;">Team Lead <select id="active-team-lead" onchange="renderGrid(currentOrders)"></select></label>
         <button class="action-btn" onclick="loadOrders()">Refresh</button>
         <button class="action-btn" id="submit-day-btn" style="display:none; background:var(--green);" onclick="submitEndOfDay()">Submit End of Day</button>
         <button class="action-btn" id="switch-process-btn" style="display:none;" onclick="showProcessSwitcher()">Switch Process</button>
@@ -627,6 +632,43 @@ const ESCALATION_CATEGORY_FIELDS = {
 
 function isLeadRole() { return role === "team_lead" || role === "super_admin"; }
 
+// ---------------------------------------------------------------------
+// Team Lead-wise views (Admin / Super Admin): Active Queue, Escalation
+// queue and Production show a Team Lead column, are grouped under a header
+// row per Team Lead, and can be narrowed to one Team Lead. The server tags
+// each order with team_lead_name (read-only for Admin).
+// ---------------------------------------------------------------------
+const TL_NONE_LABEL = "No Team Lead";
+const TL_COLUMN = {k: "team_lead_name", label: "Team Lead", group: "col"};
+function tlAllTeams() { return role === "admin" || role === "super_admin"; }
+function tlName(o) { return o.team_lead_name || TL_NONE_LABEL; }
+
+// Stable: Team Leads A-Z with "No Team Lead" last; rows keep their order inside a group.
+function tlSortGroup(rows) {
+  return rows.map((o, i) => [o, i]).sort((a, b) => {
+    const an = tlName(a[0]), bn = tlName(b[0]);
+    const aN = an === TL_NONE_LABEL, bN = bn === TL_NONE_LABEL;
+    if (aN !== bN) return aN ? 1 : -1;
+    return an.localeCompare(bn) || a[1] - b[1];
+  }).map(x => x[0]);
+}
+function tlCounts(rows) {
+  const m = new Map();
+  rows.forEach(o => m.set(tlName(o), (m.get(tlName(o)) || 0) + 1));
+  return m;
+}
+function tlGroupRow(name, count, colspan, noun) {
+  return `<tr class="tl-group"><td colspan="${colspan}">\ud83d\udc64 ${_esc(name)}<span>\u2014 ${count} ${noun}${count === 1 ? "" : "s"}</span></td></tr>`;
+}
+// <option>s for a Team Lead dropdown, built from the rows currently loaded.
+function tlOptionsHTML(rows, selected) {
+  const counts = tlCounts(rows);
+  const names = Array.from(counts.keys()).sort((a, b) => (a === TL_NONE_LABEL) - (b === TL_NONE_LABEL) || a.localeCompare(b));
+  return `<option value="">All Team Leads (${rows.length})</option>` +
+    names.map(n => `<option value="${_esc(n)}" ${n === selected ? "selected" : ""}>${_esc(n)} (${counts.get(n)})</option>`).join("");
+}
+
+
 function formatCurrency(val) {
   if (val === null || val === undefined || val === "") return "";
   const num = parseFloat(val);
@@ -882,6 +924,13 @@ async function login() {
   const data = await res.json();
   token = data.access_token; role = data.role; fullName = data.full_name; myUserId = data.id;
   myProcesses = data.processes || [];
+  if (role === "admin") {
+    // Admin can VIEW every process (read-only); importing still needs the process to be assigned.
+    try {
+      const pr = await fetch(API + "/processes/public");
+      if (pr.ok) myProcesses = await pr.json();
+    } catch (_) { /* keep the assigned processes */ }
+  }
   sessionStorage.setItem("wot_token", token);
   sessionStorage.setItem("wot_role", role);
   sessionStorage.setItem("wot_name", fullName);
@@ -1104,6 +1153,9 @@ function showApp() {
     document.getElementById("nav-orders-dash-btn").style.display = "block";   // Orders Dashboard (all teams, Team Lead-wise)
     document.getElementById("nav-batch-btn").style.display = "block";         // Batch Dashboard (all teams, Team Lead-wise, view-only)
     document.getElementById("nav-audit-btn").style.display = "block";         // Team Lead Change Log
+    document.getElementById("nav-escalations-btn").style.display = "block";   // Escalation queue (all teams, Team Lead-wise, view-only)
+    document.getElementById("nav-production-btn").style.display = "block";    // Production (all teams, Team Lead-wise, view-only)
+    document.getElementById("active-tl-label").style.display = "inline-block";
   } else {
     document.getElementById("submit-day-btn").style.display = "inline-block";
     document.getElementById("production-btn").style.display = "inline-block";
@@ -2082,6 +2134,7 @@ function _escalationSearchText(o) {
 }
 
 let escalationFilters = { category: "", escalationType: "", search: "", dateFrom: "", dateTo: "" };
+let escalationTeamLead = "";   // Admin / Super Admin: "" = every Team Lead
 
 function _escalationsTabBar() {
   const openActive = escalationsTab === "open";
@@ -2101,6 +2154,9 @@ function _escalationsFilterBar() {
     ESCALATION_TYPES.forEach(t => html += `<option value="${t}" ${escalationFilters.escalationType === t ? "selected" : ""}>${t}</option>`);
     html += `</select></label>`;
   }
+  if (tlAllTeams()) {
+    html += `<label style="font-size:13px;">Team Lead <select id="esc-filter-team-lead" onchange="escalationTeamLead = this.value; renderEscalations(currentEscalations);">${tlOptionsHTML(currentEscalations, escalationTeamLead)}</select></label>`;
+  }
   html += `<label style="font-size:13px;">Search <input id="esc-filter-search" value="${escalationFilters.search || ""}" onchange="applyEscalationFilters()" placeholder="EDM, BAR batch, payer, amount..." style="width:220px;"></label>`;
   html += `<label style="font-size:13px;">${dateLabel} From <input type="date" id="esc-filter-from" value="${escalationFilters.dateFrom}" onchange="applyEscalationFilters()"></label>`;
   html += `<label style="font-size:13px;">To <input type="date" id="esc-filter-to" value="${escalationFilters.dateTo}" onchange="applyEscalationFilters()"></label>`;
@@ -2119,6 +2175,7 @@ function applyEscalationFilters() {
 }
 
 function clearEscalationFilters() {
+  escalationTeamLead = "";
   escalationFilters = { category: "", escalationType: "", search: "", dateFrom: "", dateTo: "" };
   renderEscalations(currentEscalations);
 }
@@ -2126,6 +2183,7 @@ function clearEscalationFilters() {
 function _filteredEscalations(list) {
   const resolved = escalationsTab === "resolved";
   return list.filter(o => {
+    if (tlAllTeams() && escalationTeamLead && tlName(o) !== escalationTeamLead) return false;
     if (escalationFilters.category && o.escalation_category !== escalationFilters.category) return false;
     if (escalationFilters.escalationType) {
       const d = o.clarification_detail || {};
@@ -2142,9 +2200,11 @@ function _filteredEscalations(list) {
 function renderEscalations(list) {
   const container = document.getElementById("grid-container");
   const resolved = escalationsTab === "resolved";
-  const filtered = _filteredEscalations(list);
+  let filtered = _filteredEscalations(list);
   const cols = _escColumns();
   const showCat = !escalationFilters.category;
+  const byTl = tlAllTeams();
+  const canResolve = isLeadRole();       // Admin is view-only
   let html = _escalationsCategoryBar() + _escalationsTabBar() + _escalationsFilterBar();
   if (!filtered.length) {
     const catLabel = escalationFilters.category ? ` ${escalationFilters.category}` : "";
@@ -2152,20 +2212,31 @@ function renderEscalations(list) {
     container.innerHTML = html;
     return;
   }
-  html += "<table><thead><tr>" + (showCat ? "<th>Category</th>" : "");
+  if (byTl) filtered = tlSortGroup(filtered);
+  const groupCounts = byTl ? tlCounts(filtered) : null;
+  const colspan = (byTl ? 1 : 0) + (showCat ? 1 : 0) + cols.length + 2;
+  let lastGroup = null;
+  html += "<table><thead><tr>" + (byTl ? "<th>Team Lead</th>" : "") + (showCat ? "<th>Category</th>" : "");
   cols.forEach(([, label]) => html += `<th>${label}</th>`);
   html += resolved ? "<th>VENTRA Comment</th><th>Issue Closed Date</th>" : "<th>VENTRA Comment</th><th>Action</th>";
   html += "</tr></thead><tbody>";
   filtered.forEach(o => {
+    if (groupCounts && tlName(o) !== lastGroup) {
+      lastGroup = tlName(o);
+      html += tlGroupRow(lastGroup, groupCounts.get(lastGroup), colspan, "escalation");
+    }
     html += "<tr>";
+    if (byTl) html += `<td>${_esc(tlName(o))}</td>`;
     if (showCat) html += `<td>${o.escalation_category ?? ""}</td>`;
     cols.forEach(([key]) => html += `<td>${_detailFieldValue(o, key)}</td>`);
     if (resolved) {
       html += `<td style="max-width:220px; white-space:normal;">${o.ventra_comment ?? ""}</td>`;
       html += `<td>${o.issue_closed_date ?? ""}</td>`;
-    } else {
+    } else if (canResolve) {
       html += `<td><textarea id="resolve-comment-${o.id}" rows="2" style="width:180px; font-family:inherit; padding:4px;"></textarea></td>`;
       html += `<td><button class="action-btn" onclick="resolveEscalation(${o.id}, this)">Resolve</button></td>`;
+    } else {
+      html += `<td></td><td>\u23f3 Awaiting Team Lead</td>`;
     }
     html += "</tr>";
   });
@@ -2182,10 +2253,11 @@ function exportEscalationsCSV() {
   const resolved = escalationsTab === "resolved";
   const cols = _escColumns();
   const showCat = !escalationFilters.category;
-  const headers = (showCat ? ["Category"] : []).concat(cols.map(([, label]) => label)).concat(["VENTRA Comment"])
+  const byTl = tlAllTeams();
+  const headers = (byTl ? ["Team Lead"] : []).concat(showCat ? ["Category"] : []).concat(cols.map(([, label]) => label)).concat(["VENTRA Comment"])
     .concat(resolved ? ["Issue Closed Date"] : []);
-  const rows = filtered.map(o => {
-    const cells = (showCat ? [o.escalation_category ?? ""] : [])
+  const rows = (byTl ? tlSortGroup(filtered) : filtered).map(o => {
+    const cells = (byTl ? [tlName(o)] : []).concat(showCat ? [o.escalation_category ?? ""] : [])
       .concat(cols.map(([key]) => _detailFieldValue(o, key)))
       .concat([o.ventra_comment ?? ""])
       .concat(resolved ? [o.issue_closed_date ?? ""] : []);
@@ -2614,13 +2686,15 @@ const DATE_FIELD_PARAMS = {
 // backend already filters are also sent as query params; every field is
 // (re)applied client-side so all headers behave the same way.
 const SERVER_FILTER_FIELDS = ["employee_name", "def_doc_type", "division", "escalation_category", "posting_status"];
-const VALUE_FILTER_FIELDS = COLUMNS.map(c => c.k);
-const FILTER_FIELD_OPTIONS = COLUMNS.map(c => ({value: c.k, label: c.label, teamLeadOnly: c.k === "employee_name"}));
-function emptyValueFilters() { return Object.fromEntries(COLUMNS.map(c => [c.k, []])); }
+const VALUE_FILTER_FIELDS = ["team_lead_name"].concat(COLUMNS.map(c => c.k));
+const FILTER_FIELD_OPTIONS = [{value: "team_lead_name", label: "Team Lead", allTeamsOnly: true}]
+  .concat(COLUMNS.map(c => ({value: c.k, label: c.label, teamLeadOnly: c.k === "employee_name"})));
+function emptyValueFilters() { return Object.fromEntries(VALUE_FILTER_FIELDS.map(k => [k, []])); }
 
 // The text a cell shows in Production — used both for the Filter By value
 // list and for matching rows, so what you pick is what you see.
 function _prodCellText(o, k) {
+  if (k === "team_lead_name") return tlName(o);
   if (k === "time_taken") return _formatDuration(_timeTakenSeconds(o));
   const col = COLUMNS.find(c => c.k === k);
   const v = o[k];
@@ -2653,7 +2727,8 @@ function populateFilterFieldDropdown() {
   const sel = document.getElementById("prod-filter-field");
   sel.innerHTML = "";
   FILTER_FIELD_OPTIONS.forEach(opt => {
-    if (opt.teamLeadOnly && !isLeadRole()) return;
+    if (opt.teamLeadOnly && !isLeadRole() && role !== "admin") return;
+    if (opt.allTeamsOnly && !tlAllTeams()) return;
     const o = document.createElement("option");
     o.value = opt.value;
     o.textContent = opt.label;
@@ -2692,7 +2767,7 @@ async function showProductionView() {
   document.getElementById("prod-filter-manual").value = "";
   document.getElementById("prod-date-field").value = "posted";
   populateFilterFieldDropdown();
-  document.getElementById("prod-filter-field").value = isLeadRole() ? "employee_name" : "def_doc_type";
+  document.getElementById("prod-filter-field").value = tlAllTeams() ? "team_lead_name" : (isLeadRole() ? "employee_name" : "def_doc_type");
   document.getElementById("prod-filter-field").dataset.prev = document.getElementById("prod-filter-field").value;
   document.getElementById("prod-date-from").value = "";
   document.getElementById("prod-date-to").value = "";
@@ -2802,13 +2877,26 @@ function clearProductionFilters() {
 }
 
 function renderProductionGrid(orders) {
+  const byTl = tlAllTeams();
+  const cols = byTl ? [TL_COLUMN, ...COLUMNS] : COLUMNS;
+  if (byTl) orders = tlSortGroup(orders);
+  const groupCounts = byTl ? tlCounts(orders) : null;
+  let lastGroup = null;
   let html = "<table><thead><tr>";
-  COLUMNS.forEach(c => html += `<th class="${c.group}">${c.label}</th>`);
+  cols.forEach(c => html += `<th class="${c.group}">${c.label}</th>`);
   html += `<th class="col">Submitted At</th>`;
   html += "</tr></thead><tbody>";
   orders.forEach(o => {
+    if (groupCounts && tlName(o) !== lastGroup) {
+      lastGroup = tlName(o);
+      html += tlGroupRow(lastGroup, groupCounts.get(lastGroup), cols.length + 1, "record");
+    }
     html += "<tr>";
-    COLUMNS.forEach(c => {
+    cols.forEach(c => {
+      if (c.k === "team_lead_name") {
+        html += `<td>${_esc(tlName(o))}</td>`;
+        return;
+      }
       if (c.k === "time_taken") {
         html += `<td>${_formatDuration(_timeTakenSeconds(o))}</td>`;
         return;
@@ -2832,9 +2920,11 @@ function exportProductionCSV() {
     alert("Nothing to export \u2014 load a date range first.");
     return;
   }
-  const headers = COLUMNS.map(c => c.label).concat(["Submitted At"]);
-  const rows = currentProduction.map(o => {
-    const cells = COLUMNS.map(c => {
+  const cols = tlAllTeams() ? [TL_COLUMN, ...COLUMNS] : COLUMNS;
+  const headers = cols.map(c => c.label).concat(["Submitted At"]);
+  const rows = (tlAllTeams() ? tlSortGroup(currentProduction) : currentProduction).map(o => {
+    const cells = cols.map(c => {
+      if (c.k === "team_lead_name") return tlName(o);
       if (c.k === "time_taken") return _formatDuration(_timeTakenSeconds(o));
       return o[c.k] ?? "";
     }).concat([formatIST(o.submitted_at)]);
@@ -2899,6 +2989,7 @@ async function loadOrders() {
   if (!currentProcessId) return;
   document.getElementById("admin-panel").style.display = "none";
   document.getElementById("toolbar").style.display = "flex";
+  document.getElementById("active-tl-label").style.display = tlAllTeams() ? "inline-block" : "none";
   document.getElementById("production-bar").style.display = "none";
   document.getElementById("batch-bar").style.display = "none";
   document.getElementById("orders-dash-bar").style.display = "none";
@@ -3310,19 +3401,39 @@ function visibleColumns() {
   if (role === "colleague") {
     return COLUMNS.filter(c => !HIDDEN_FOR_COLLEAGUE.includes(c.k));
   }
-  return COLUMNS;
+  return tlAllTeams() ? [TL_COLUMN, ...COLUMNS] : COLUMNS;
 }
 
 function renderGrid(orders) {
   const cols = visibleColumns();
+  const hasActionCol = role === "colleague" || isLeadRole();
+  let activeTl = "";
+  if (tlAllTeams()) {
+    // Team Lead dropdown (options from everything loaded), then group the rows by Team Lead.
+    const sel = document.getElementById("active-team-lead");
+    activeTl = sel ? sel.value : "";
+    if (sel) {
+      sel.innerHTML = tlOptionsHTML(orders, activeTl);
+      if (activeTl && !Array.from(sel.options).some(o => o.value === activeTl)) activeTl = "";
+      sel.value = activeTl;
+    }
+    orders = tlSortGroup(activeTl ? orders.filter(o => tlName(o) === activeTl) : orders);
+  }
+  const groupCounts = tlAllTeams() ? tlCounts(orders) : null;
+  const colspan = cols.length + (shareMode ? 1 : 0) + (hasActionCol ? 1 : 0);
+  let lastGroup = null;
   let html = "<table><thead><tr>";
   if (shareMode) html += `<th class="col">Share</th>`;
   cols.forEach(c => html += `<th class="${c.group}">${c.label}</th>`);
-  if (role === "colleague" || isLeadRole()) html += `<th class="col">Action</th>`;
+  if (hasActionCol) html += `<th class="col">Action</th>`;
   html += "</tr></thead><tbody>";
 
   let hasActionable = false;
   orders.forEach(o => {
+    if (groupCounts && tlName(o) !== lastGroup) {
+      lastGroup = tlName(o);
+      html += tlGroupRow(lastGroup, groupCounts.get(lastGroup), colspan, "order");
+    }
     const savedCompleted = o.posting_status === "Completed";
     const isEscalated = o.escalated === true;
     const locked = role === "colleague" && (savedCompleted || isEscalated);
