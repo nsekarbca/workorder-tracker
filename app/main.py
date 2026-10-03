@@ -2116,11 +2116,14 @@ def _eligible_team_lead(db: Session, team_lead_id: int) -> models.User:
 
 @app.get("/clients", response_model=schemas.ClientListResponse)
 def list_clients(
-    current_user: models.User = Depends(auth.require_role("super_admin")),
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "super_admin")),
     db: Session = Depends(get_db),
 ):
-    """Everything the Clients screen needs in one call: clients (with their
-    Team Lead per process), the Team Leads to choose from, and the processes."""
+    """Everything the Clients screens need in one call: clients (with their
+    Team Lead per process), the Team Leads, and the processes. READ-ONLY for
+    colleagues, Team Leads and Admin (the "Clients" view); only the Super
+    Admin can change anything (every write endpoint below is Super Admin
+    only). The Quality profile has no access."""
     clients = sorted(db.query(models.Client).all(), key=_facility_sort_key)
     team_leads = [
         {"id": u.id, "full_name": u.full_name, "active": u.employment_status != "Inactive", "process_ids": sorted(p.id for p in u.processes)}
