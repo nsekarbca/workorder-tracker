@@ -411,6 +411,11 @@
       </div>
     </div>
     <div id="admin-panel" style="display:none;">
+      <div class="od-tabs" style="margin-top:0;">
+        <button class="od-tab active" id="admin-tab-users-btn" onclick="adminSetTab('users')">Users &amp; Processes</button>
+        <button class="od-tab" id="admin-tab-clients-btn" onclick="adminSetTab('clients')">Clients</button>
+      </div>
+      <div id="admin-tab-users">
       <h3 id="user-form-heading">Create User</h3>
       <div class="form-grid">
         <label>Username <input id="nu-username"></label>
@@ -469,8 +474,51 @@
       <hr style="margin:20px 0;">
       <h3>Existing Users</h3>
       <div id="user-list"></div>
+      </div>
+      <div id="admin-tab-clients" style="display:none;">
+        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:10px;">
+          <h3 style="margin:0;">Clients</h3>
+          <button class="action-btn" onclick="openClientModal(null)">+ Add Client</button>
+          <button class="action-btn" onclick="exportClientsCSV()">Export CSV</button>
+          <span style="font-size:12px; color:#666;">Each client has a Team Lead per process. Pick one in a cell (saves instantly), or tick clients and assign in bulk.</span>
+        </div>
+        <div id="client-summary" class="od-tiles"></div>
+        <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:8px; font-size:13px;">
+          <label>Search <input id="client-search" placeholder="Facility No or name" oninput="renderClients()" style="width:190px;"></label>
+          <label>Status <select id="client-status-filter" onchange="renderClients()"><option value="">All</option><option value="Active">Active</option><option value="Inactive">Inactive</option></select></label>
+          <label>Assignment <select id="client-assign-filter" onchange="renderClients()"><option value="">All</option><option value="missing">Missing a Team Lead</option><option value="full">Fully assigned</option></select></label>
+          <label>Team Lead <select id="client-tl-filter" onchange="renderClients()"></select></label>
+          <button class="od-tab" onclick="clearClientFilters()">Clear filters</button>
+        </div>
+        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:10px; padding:8px 12px; background:#eef3fb; border-radius:8px; font-size:13px;">
+          <strong id="client-sel-count">0 selected</strong>
+          <label>Process <select id="client-bulk-process" onchange="clientBulkProcessChanged()"></select></label>
+          <label>Team Lead <select id="client-bulk-tl"></select></label>
+          <button class="action-btn" onclick="clientBulkApply(false)">Assign to selected</button>
+          <button class="action-btn" style="background:#888;" onclick="clientBulkApply(true)">Clear assignment</button>
+        </div>
+        <div id="client-table-wrap" class="od-scroll"></div>
+      </div>
     </div>
     <div id="grid-container"></div>
+  </div>
+</div>
+
+<div id="client-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:100; align-items:center; justify-content:center;">
+  <div style="background:white; border-radius:8px; padding:20px; width:460px; max-width:92vw; max-height:88vh; overflow-y:auto;">
+    <h3 id="client-modal-heading" style="margin-top:0;">Add Client</h3>
+    <div class="form-grid">
+      <label>Facility No <input id="cm-facility-no" inputmode="numeric"></label>
+      <label>Status
+        <select id="cm-status" onchange="clientModalStatusChanged()"><option value="Active">Active</option><option value="Inactive">Inactive</option></select>
+      </label>
+    </div>
+    <label style="display:block; margin-top:10px;">Client Name <input id="cm-client-name" style="width:100%;"></label>
+    <label id="cm-inactive-label" style="display:none; margin-top:10px;">Inactive Date <input id="cm-inactive-date" type="date"></label>
+    <div style="margin-top:14px;">
+      <button class="action-btn" id="cm-save-btn" onclick="saveClientModal()">Save</button>
+      <button class="action-btn" style="background:#888;" onclick="closeClientModal()">Cancel</button>
+    </div>
   </div>
 </div>
 
@@ -1209,6 +1257,226 @@ function navTo(dest) {
 }
 
 
+
+// ---------------------------------------------------------------------
+// Admin -> Clients (Super Admin): client list with Active / Inactive status
+// (+ the date it went inactive) and a Team Lead per client per process.
+// Server: GET/POST /clients, PATCH /clients/{id}, PUT /clients/{id}/assignments,
+// POST /clients/bulk-assign.
+// ---------------------------------------------------------------------
+
+let clientData = {clients: [], team_leads: [], processes: []};
+let clientSel = new Set();
+let clientEditId = null;
+
+function adminSetTab(tab) {
+  document.getElementById("admin-tab-users").style.display = tab === "users" ? "block" : "none";
+  document.getElementById("admin-tab-clients").style.display = tab === "clients" ? "block" : "none";
+  document.getElementById("admin-tab-users-btn").classList.toggle("active", tab === "users");
+  document.getElementById("admin-tab-clients-btn").classList.toggle("active", tab === "clients");
+  if (tab === "clients") loadClients();
+}
+
+async function loadClients() {
+  const res = await authFetch("/clients");
+  if (!res.ok) { alert("Couldn't load clients: " + (await res.text())); return; }
+  clientData = await res.json();
+  clientData.clients.forEach(c => { c._a = Object.fromEntries(c.assignments.map(a => [a.process_id, a.team_lead_id])); });
+  const ids = new Set(clientData.clients.map(c => c.id));
+  clientSel = new Set(Array.from(clientSel).filter(id => ids.has(id)));
+
+  const tlSel = document.getElementById("client-tl-filter");
+  const keep = tlSel.value;
+  tlSel.innerHTML = `<option value="">All</option>` +
+    clientData.team_leads.map(t => `<option value="${t.id}">${_esc(t.full_name)}${t.active ? "" : " (inactive)"}</option>`).join("");
+  if (Array.from(tlSel.options).some(o => o.value === keep)) tlSel.value = keep;
+
+  const ps = document.getElementById("client-bulk-process");
+  const keepP = ps.value;
+  ps.innerHTML = `<option value="">All processes</option>` + clientData.processes.map(p => `<option value="${p.id}">${_esc(p.name)}</option>`).join("");
+  if (Array.from(ps.options).some(o => o.value === keepP)) ps.value = keepP;
+  clientBulkProcessChanged();
+  renderClients();
+}
+
+function clientFullyAssigned(c) { return clientData.processes.every(p => c._a[p.id]); }
+function clientTlName(id) { const t = clientData.team_leads.find(x => x.id === id); return t ? t.full_name : ""; }
+
+function clientFiltered() {
+  const q = document.getElementById("client-search").value.trim().toLowerCase();
+  const st = document.getElementById("client-status-filter").value;
+  const asg = document.getElementById("client-assign-filter").value;
+  const tl = document.getElementById("client-tl-filter").value;
+  return clientData.clients.filter(c =>
+    (!q || c.facility_no.toLowerCase().includes(q) || c.client_name.toLowerCase().includes(q)) &&
+    (!st || c.status === st) &&
+    (asg !== "missing" || !clientFullyAssigned(c)) &&
+    (asg !== "full" || clientFullyAssigned(c)) &&
+    (!tl || Object.values(c._a).some(v => String(v) === tl)));
+}
+
+function clearClientFilters() {
+  document.getElementById("client-search").value = "";
+  document.getElementById("client-status-filter").value = "";
+  document.getElementById("client-assign-filter").value = "";
+  document.getElementById("client-tl-filter").value = "";
+  renderClients();
+}
+
+function renderClientSummary() {
+  const cs = clientData.clients;
+  const active = cs.filter(c => c.status === "Active").length;
+  const full = cs.filter(clientFullyAssigned).length;
+  const tiles = [
+    ["Total clients", cs.length, "#2563eb", "clearClientFilters()"],
+    ["Active", active, "#16a34a", "setClientFilter('client-status-filter','Active')"],
+    ["Inactive", cs.length - active, "#dc2626", "setClientFilter('client-status-filter','Inactive')"],
+    ["Fully assigned", full, "#0d9488", "setClientFilter('client-assign-filter','full')"],
+    ["Missing a Team Lead", cs.length - full, "#d97706", "setClientFilter('client-assign-filter','missing')"],
+  ];
+  document.getElementById("client-summary").innerHTML = tiles.map(([l, n, col, fn]) =>
+    `<button class="od-tile" style="--c:${col}" onclick="${fn}"><span class="od-t-label">${l}</span><span class="od-t-num">${n}</span></button>`).join("");
+}
+function setClientFilter(id, v) { clearClientFilters(); document.getElementById(id).value = v; renderClients(); }
+
+function clientCellHTML(c, p) {
+  const cur = c._a[p.id] || "";
+  const eligible = clientData.team_leads.filter(t => t.active && t.process_ids.includes(p.id));
+  let opts = `<option value="">\u2014 Unassigned \u2014</option>`;
+  eligible.forEach(t => opts += `<option value="${t.id}" ${t.id === cur ? "selected" : ""}>${_esc(t.full_name)}</option>`);
+  if (cur && !eligible.some(t => t.id === cur)) {   // keep an existing assignment visible even if that Team Lead is now inactive / off the process
+    opts += `<option value="${cur}" selected>${_esc(clientTlName(cur))} (not eligible)</option>`;
+  }
+  return `<td><select data-cid="${c.id}" data-pid="${p.id}" onchange="clientAssign(this)" style="max-width:150px;${cur ? "" : " color:#b45309;"}">${opts}</select></td>`;
+}
+
+function renderClients() {
+  renderClientSummary();
+  const rows = clientFiltered();
+  const wrap = document.getElementById("client-table-wrap");
+  if (!clientData.clients.length) { wrap.innerHTML = "<p style='padding:12px;'>No clients yet \u2014 use + Add Client.</p>"; updateClientSelCount(); return; }
+  if (!rows.length) { wrap.innerHTML = "<p style='padding:12px;'>No clients match these filters.</p>"; updateClientSelCount(); return; }
+  const allTicked = rows.every(c => clientSel.has(c.id));
+  let html = `<table><thead><tr><th><input type="checkbox" ${allTicked ? "checked" : ""} onchange="clientToggleAll(this.checked)" title="Select all shown"></th>` +
+    `<th>Facility No</th><th>Client Name</th><th>Status</th><th>Inactive Date</th>` +
+    clientData.processes.map(p => `<th style="min-width:140px;">${_esc(p.name)}</th>`).join("") + `<th></th></tr></thead><tbody>`;
+  rows.forEach(c => {
+    const inactive = c.status === "Inactive";
+    html += `<tr${inactive ? ' style="color:#777;"' : ""}><td><input type="checkbox" ${clientSel.has(c.id) ? "checked" : ""} onchange="clientToggle(${c.id}, this.checked)"></td>` +
+      `<td>${_esc(c.facility_no)}</td><td>${_esc(c.client_name)}</td>` +
+      `<td><span style="display:inline-block; padding:2px 10px; border-radius:12px; font-size:12px; color:#fff; background:${inactive ? "#dc2626" : "#16a34a"};">${c.status}</span></td>` +
+      `<td>${inactive ? _esc(c.inactive_date || "") : ""}</td>` +
+      clientData.processes.map(p => clientCellHTML(c, p)).join("") +
+      `<td><button class="action-btn" onclick="openClientModal(${c.id})">Edit</button></td></tr>`;
+  });
+  wrap.innerHTML = html + `</tbody></table>`;
+  updateClientSelCount();
+}
+
+// ---- selection + bulk ----
+function updateClientSelCount() { document.getElementById("client-sel-count").textContent = `${clientSel.size} selected`; }
+function clientToggle(id, on) { on ? clientSel.add(id) : clientSel.delete(id); updateClientSelCount(); }
+function clientToggleAll(on) { clientFiltered().forEach(c => on ? clientSel.add(c.id) : clientSel.delete(c.id)); renderClients(); }
+
+function clientBulkProcessChanged() {
+  const pid = Number(document.getElementById("client-bulk-process").value) || null;
+  const tls = clientData.team_leads.filter(t => t.active && (!pid || t.process_ids.includes(pid)));
+  document.getElementById("client-bulk-tl").innerHTML = `<option value="">\u2014 choose \u2014</option>` +
+    tls.map(t => `<option value="${t.id}">${_esc(t.full_name)}</option>`).join("");
+}
+
+async function clientBulkApply(clear) {
+  if (!clientSel.size) { alert("Tick at least one client first."); return; }
+  const pid = Number(document.getElementById("client-bulk-process").value) || null;
+  const tl = Number(document.getElementById("client-bulk-tl").value) || null;
+  if (!clear && !tl) { alert("Choose a Team Lead to assign."); return; }
+  const pname = pid ? clientData.processes.find(p => p.id === pid).name : "all processes";
+  const what = clear ? `Clear the Team Lead for ${clientSel.size} client(s) in ${pname}?` : `Assign ${clientTlName(tl)} to ${clientSel.size} client(s) in ${pname}?`;
+  if (!confirm(what)) return;
+  const res = await authFetch("/clients/bulk-assign", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({client_ids: Array.from(clientSel), process_ids: pid ? [pid] : null, team_lead_id: clear ? null : tl}),
+  });
+  if (!res.ok) { let m = await res.text(); try { m = JSON.parse(m).detail || m; } catch (_) {} alert("Couldn't apply: " + m); return; }
+  const r = await res.json();
+  await loadClients();
+  alert(`${r.updated} assignment(s) ${clear ? "cleared" : "saved"}.` +
+    (r.skipped_processes.length ? `\n\nSkipped (${clientTlName(tl)} doesn't work on): ${r.skipped_processes.join(", ")}` : ""));
+}
+
+// ---- inline per-process assignment ----
+async function clientAssign(sel) {
+  const cid = Number(sel.dataset.cid), pid = Number(sel.dataset.pid);
+  const c = clientData.clients.find(x => x.id === cid);
+  const val = sel.value ? Number(sel.value) : null;
+  const res = await authFetch(`/clients/${cid}/assignments`, {
+    method: "PUT", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({assignments: {[pid]: val}}),
+  });
+  if (!res.ok) {
+    let m = await res.text(); try { m = JSON.parse(m).detail || m; } catch (_) {}
+    alert("Couldn't save: " + m);
+    renderClients();                       // put the cell back
+    return;
+  }
+  const out = await res.json();
+  c.assignments = out.assignments;
+  c._a = Object.fromEntries(out.assignments.map(a => [a.process_id, a.team_lead_id]));
+  sel.style.color = val ? "" : "#b45309";
+  renderClientSummary();
+}
+
+// ---- add / edit ----
+function openClientModal(id) {
+  clientEditId = id;
+  const c = id ? clientData.clients.find(x => x.id === id) : null;
+  document.getElementById("client-modal-heading").textContent = c ? `Edit Client ${c.facility_no}` : "Add Client";
+  document.getElementById("cm-facility-no").value = c ? c.facility_no : "";
+  document.getElementById("cm-client-name").value = c ? c.client_name : "";
+  document.getElementById("cm-status").value = c ? c.status : "Active";
+  document.getElementById("cm-inactive-date").value = c && c.inactive_date ? c.inactive_date : "";
+  clientModalStatusChanged();
+  document.getElementById("client-modal").style.display = "flex";
+}
+function closeClientModal() { document.getElementById("client-modal").style.display = "none"; }
+function clientModalStatusChanged() {
+  const inactive = document.getElementById("cm-status").value === "Inactive";
+  document.getElementById("cm-inactive-label").style.display = inactive ? "block" : "none";
+  const d = document.getElementById("cm-inactive-date");
+  if (inactive && !d.value) d.value = _isoLocalDate(new Date());
+}
+async function saveClientModal() {
+  const status = document.getElementById("cm-status").value;
+  const body = {
+    facility_no: document.getElementById("cm-facility-no").value.trim(),
+    client_name: document.getElementById("cm-client-name").value.trim(),
+    status,
+    inactive_date: status === "Inactive" ? (document.getElementById("cm-inactive-date").value || null) : null,
+  };
+  if (!body.facility_no || !body.client_name) { alert("Facility No and Client Name are required."); return; }
+  const res = await authFetch(clientEditId ? `/clients/${clientEditId}` : "/clients", {
+    method: clientEditId ? "PATCH" : "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body),
+  });
+  if (!res.ok) { let m = await res.text(); try { m = JSON.parse(m).detail || m; } catch (_) {} alert("Couldn't save: " + m); return; }
+  closeClientModal();
+  await loadClients();
+}
+
+function exportClientsCSV() {
+  const rows = clientFiltered();
+  if (!rows.length) { alert("Nothing to export."); return; }
+  const q = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const headers = ["Facility No", "Client Name", "Status", "Inactive Date"].concat(clientData.processes.map(p => p.name));
+  const lines = rows.map(c => [c.facility_no, c.client_name, c.status, c.inactive_date || ""]
+    .concat(clientData.processes.map(p => c._a[p.id] ? clientTlName(c._a[p.id]) : "")));
+  const csv = [headers.map(q).join(",")].concat(lines.map(r => r.map(q).join(","))).join("\r\n");
+  const blob = new Blob([csv], {type: "text/csv;charset=utf-8;"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = `clients_${_isoLocalDate(new Date())}.csv`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
 
 // ---------------------------------------------------------------------
 // Team Lead Change Log (Admin / Super Admin) — what Team Leads changed on
@@ -2333,6 +2601,7 @@ async function showAdminView() {
   document.getElementById("share-bar").style.display = "none";
   document.getElementById("admin-panel").style.display = "block";
   document.getElementById("grid-container").innerHTML = "";
+  adminSetTab("users");
   cancelEditUser();
 
   const procRes = await authFetch("/processes");
