@@ -1,5 +1,5 @@
 from datetime import date, datetime
-from typing import Optional, List
+from typing import Optional, List, Dict
 from pydantic import BaseModel
 
 
@@ -457,3 +457,60 @@ class OrderChangeLogOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# ---- Clients (Super Admin -> Admin -> Clients) ----
+class ClientAssignment(BaseModel):
+    process_id: int
+    team_lead_id: int
+
+
+class ClientOut(BaseModel):
+    id: int
+    facility_no: str
+    client_name: str
+    status: str
+    inactive_date: Optional[date] = None
+    assignments: List[ClientAssignment] = []
+
+
+class ClientTeamLeadOut(BaseModel):
+    id: int
+    full_name: str
+    active: bool
+    process_ids: List[int] = []
+
+
+class ClientProcessOut(BaseModel):
+    id: int
+    name: str
+
+
+class ClientListResponse(BaseModel):
+    clients: List[ClientOut]
+    team_leads: List[ClientTeamLeadOut]
+    processes: List[ClientProcessOut]
+
+
+class ClientSave(BaseModel):
+    facility_no: str
+    client_name: str
+    status: str = "Active"
+    inactive_date: Optional[date] = None   # Inactive with no date -> today (IST)
+
+
+# process_id -> Team Lead id (null clears that process). Only the processes
+# sent are changed.
+class ClientAssignmentsSave(BaseModel):
+    assignments: Dict[int, Optional[int]]
+
+
+class ClientBulkAssign(BaseModel):
+    client_ids: List[int]
+    process_ids: Optional[List[int]] = None   # null / empty = every process
+    team_lead_id: Optional[int] = None        # null = clear the assignment
+
+
+class ClientBulkResult(BaseModel):
+    updated: int                              # client x process assignments set / cleared
+    skipped_processes: List[str] = []         # processes the Team Lead doesn't work on

@@ -363,3 +363,35 @@ class OrderChangeLog(Base):
     action = Column(String, nullable=False)                     # correction | edit | reassign | delete
     order_state = Column(String, nullable=True)                 # e.g. "Completed", "Escalated (locked)"
     changes = Column(JSON, nullable=False, default=list)        # [{"field", "old", "new"}, ...]
+
+
+class Client(Base):
+    """
+    Client master list (Facility No + name), managed by a Super Admin under
+    Admin -> Clients. A client is Active, or Inactive since `inactive_date`.
+    Which Team Lead looks after it in each process is in
+    ClientProcessTeamLead. Master data only — nothing in order routing reads
+    it (yet).
+    """
+    __tablename__ = "clients"
+
+    id = Column(Integer, primary_key=True, index=True)
+    facility_no = Column(String, unique=True, nullable=False, index=True)
+    client_name = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="Active")      # Active | Inactive
+    inactive_date = Column(Date, nullable=True)                    # set only while Inactive
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class ClientProcessTeamLead(Base):
+    """The Team Lead assigned to one client in one process (one row per client + process)."""
+    __tablename__ = "client_process_team_leads"
+    __table_args__ = (
+        UniqueConstraint("client_id", "process_id", name="uq_client_process_team_lead"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id", ondelete="CASCADE"), nullable=False, index=True)
+    process_id = Column(Integer, ForeignKey("processes.id"), nullable=False)
+    team_lead_id = Column(Integer, ForeignKey("users.id"), nullable=False)

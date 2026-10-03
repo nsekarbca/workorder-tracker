@@ -62,6 +62,13 @@ def bootstrap_and_seed():
                 db.add(models.Process(name=name))
         db.commit()
 
+        # One-time starting client list (only when the clients table is empty).
+        if db.query(models.Client).first() is None:
+            from .client_seed import SEED_CLIENTS
+            for facility_no, client_name in SEED_CLIENTS:
+                db.add(models.Client(facility_no=facility_no, client_name=client_name, status="Active"))
+            db.commit()
+
         if db.query(models.User).first() is None:
             username = os.getenv("BOOTSTRAP_USERNAME")
             password = os.getenv("BOOTSTRAP_PASSWORD")
@@ -2051,6 +2058,197 @@ def orders_dashboard_details(
 # Production % compares transactions against the process's DAILY target
 # scaled to the hours actually worked: expected = daily_target * hours / this.
 STANDARD_SHIFT_HOURS = 8.0
+
+
+# ---------------------------------------------------------------------------
+# Clients (Super Admin -> Admin -> Clients): client list, Active / Inactive
+# status with the date it went inactive, and the Team Lead per process
+# ---------------------------------------------------------------------------
+
+def _client_payload(db: Session, clients: list) -> list:
+    ids = [c.id for c in clients]
+    assigned = {}
+    if ids:
+        for a in db.query(models.ClientProcessTeamLead).filter(models.ClientProcessTeamLead.client_id.in_(ids)).all():
+            assigned.setdefault(a.client_id, []).append({"process_id": a.process_id, "team_lead_id": a.team_lead_id})
+    return [
+        {
+            "id": c.id, "facility_no": c.facility_no, "client_name": c.client_name,
+            "status": c.status, "inactive_date": c.inactive_date,
+            "assignments": sorted(assigned.get(c.id, []), key=lambda x: x["process_id"]),
+        }
+        for c in clients
+    ]
+
+
+def _facility_sort_key(c: models.Client):
+    return (0, int(c.facility_no), c.facility_no) if c.facility_no.isdigit() else (1, 0, c.facility_no)
+
+
+def _clean_client_fields(db: Session, payload: schemas.ClientSave, client_id: Optional[int]) -> dict:
+    facility_no = (payload.facility_no or "").strip()
+    name = " ".join((payload.client_name or "").split())
+    if not facility_no.isdigit():
+        raise HTTPException(status_code=400, detail="Facility No must be a number")
+    if not name:
+        raise HTTPException(status_code=400, detail="Client Name is required")
+    if payload.status not in ("Active", "Inactive"):
+        raise HTTPException(status_code=400, detail="Status must be 'Active' or 'Inactive'")
+    dup = db.query(models.Client).filter(models.Client.facility_no == facility_no)
+    if client_id is not None:
+        dup = dup.filter(models.Client.id != client_id)
+    if dup.first():
+        raise HTTPException(status_code=400, detail=f"Facility No {facility_no} already exists")
+    inactive_date = None
+    if payload.status == "Inactive":
+        inactive_date = payload.inactive_date or datetime.now(IST).date()
+    return {"facility_no": facility_no, "client_name": name, "status": payload.status, "inactive_date": inactive_date}
+
+
+def _eligible_team_lead(db: Session, team_lead_id: int) -> models.User:
+    tl = db.query(models.User).filter(models.User.id == team_lead_id, models.User.role == "team_lead").first()
+    if not tl:
+        raise HTTPException(status_code=400, detail="Not a valid Team Lead")
+    if tl.employment_status == "Inactive":
+        raise HTTPException(status_code=400, detail=f"{tl.full_name} is inactive")
+    return tl
+
+
+@app.get("/clients", response_model=schemas.ClientListResponse)
+def list_clients(
+    current_user: models.User = Depends(auth.require_role("super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Everything the Clients screen needs in one call: clients (with their
+    Team Lead per process), the Team Leads to choose from, and the processes."""
+    clients = sorted(db.query(models.Client).all(), key=_facility_sort_key)
+    team_leads = [
+        {"id": u.id, "full_name": u.full_name, "active": u.employment_status != "Inactive", "process_ids": sorted(p.id for p in u.processes)}
+        for u in db.query(models.User).filter(models.User.role == "team_lead").order_by(models.User.full_name.asc()).all()
+    ]
+    processes = [{"id": p.id, "name": p.name} for p in db.query(models.Process).order_by(models.Process.id.asc()).all()]
+    return {"clients": _client_payload(db, clients), "team_leads": team_leads, "processes": processes}
+
+
+@app.post("/clients", response_model=schemas.ClientOut)
+def create_client(
+    payload: schemas.ClientSave,
+    current_user: models.User = Depends(auth.require_role("super_admin")),
+    db: Session = Depends(get_db),
+):
+    client = models.Client(**_clean_client_fields(db, payload, None))
+    db.add(client)
+    db.commit()
+    db.refresh(client)
+    return _client_payload(db, [client])[0]
+
+
+# Registered before the {client_id} routes (literal path first).
+@app.post("/clients/bulk-assign", response_model=schemas.ClientBulkResult)
+def bulk_assign_clients(
+    payload: schemas.ClientBulkAssign,
+    current_user: models.User = Depends(auth.require_role("super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    Set (or, with team_lead_id null, clear) the Team Lead for many clients at
+    once, in one process or in all of them. A Team Lead is only assigned to
+    processes they actually work on; the others are reported back as skipped.
+    """
+    if not payload.client_ids:
+        raise HTTPException(status_code=400, detail="Select at least one client")
+    clients = db.query(models.Client).filter(models.Client.id.in_(payload.client_ids)).all()
+    if len(clients) != len(set(payload.client_ids)):
+        raise HTTPException(status_code=404, detail="Some clients were not found")
+    all_processes = db.query(models.Process).order_by(models.Process.id.asc()).all()
+    wanted = set(payload.process_ids or [p.id for p in all_processes])
+    targets = [p for p in all_processes if p.id in wanted]
+    if not targets or len(targets) != len(wanted):
+        raise HTTPException(status_code=400, detail="Unknown process")
+
+    skipped = []
+    if payload.team_lead_id is not None:
+        tl = _eligible_team_lead(db, payload.team_lead_id)
+        tl_process_ids = {p.id for p in tl.processes}
+        skipped = [p.name for p in targets if p.id not in tl_process_ids]
+        targets = [p for p in targets if p.id in tl_process_ids]
+        if not targets:
+            raise HTTPException(status_code=400, detail=f"{tl.full_name} doesn't work on the selected process(es)")
+
+    target_ids = [p.id for p in targets]
+    existing = {
+        (a.client_id, a.process_id): a
+        for a in db.query(models.ClientProcessTeamLead).filter(
+            models.ClientProcessTeamLead.client_id.in_([c.id for c in clients]),
+            models.ClientProcessTeamLead.process_id.in_(target_ids),
+        ).all()
+    }
+    updated = 0
+    for c in clients:
+        for pid in target_ids:
+            row = existing.get((c.id, pid))
+            if payload.team_lead_id is None:
+                if row:
+                    db.delete(row)
+                    updated += 1
+            else:
+                if row:
+                    row.team_lead_id = payload.team_lead_id
+                else:
+                    db.add(models.ClientProcessTeamLead(client_id=c.id, process_id=pid, team_lead_id=payload.team_lead_id))
+                updated += 1
+    db.commit()
+    return {"updated": updated, "skipped_processes": skipped}
+
+
+@app.patch("/clients/{client_id}", response_model=schemas.ClientOut)
+def update_client(
+    client_id: int,
+    payload: schemas.ClientSave,
+    current_user: models.User = Depends(auth.require_role("super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Edit Facility No / name / status. Going Inactive stamps the Inactive Date
+    (the one given, else today IST); going Active clears it."""
+    client = db.query(models.Client).filter(models.Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    for k, v in _clean_client_fields(db, payload, client_id).items():
+        setattr(client, k, v)
+    db.commit()
+    db.refresh(client)
+    return _client_payload(db, [client])[0]
+
+
+@app.put("/clients/{client_id}/assignments", response_model=schemas.ClientOut)
+def save_client_assignments(
+    client_id: int,
+    payload: schemas.ClientAssignmentsSave,
+    current_user: models.User = Depends(auth.require_role("super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Set the Team Lead for this client in the processes sent (null = unassign)."""
+    client = db.query(models.Client).filter(models.Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    known = {p.id for p in db.query(models.Process).all()}
+    for pid, tl_id in payload.assignments.items():
+        if pid not in known:
+            raise HTTPException(status_code=400, detail="Unknown process")
+        row = db.query(models.ClientProcessTeamLead).filter_by(client_id=client_id, process_id=pid).first()
+        if tl_id is None:
+            if row:
+                db.delete(row)
+            continue
+        tl = _eligible_team_lead(db, tl_id)
+        if not any(p.id == pid for p in tl.processes):
+            raise HTTPException(status_code=400, detail=f"{tl.full_name} doesn't work on that process")
+        if row:
+            row.team_lead_id = tl_id
+        else:
+            db.add(models.ClientProcessTeamLead(client_id=client_id, process_id=pid, team_lead_id=tl_id))
+    db.commit()
+    return _client_payload(db, [client])[0]
 
 
 def _batch_visible_colleagues(db: Session, current_user: models.User):
