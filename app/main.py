@@ -282,6 +282,34 @@ def read_me(current_user: models.User = Depends(auth.get_current_user)):
     return current_user
 
 
+@app.put("/auth/me/profile", response_model=schemas.UserOut)
+def update_my_profile(
+    payload: schemas.ProfileDatesUpdate,
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "quality")),
+    db: Session = Depends(get_db),
+):
+    """
+    Self-service profile edit for Colleague, Team Lead, Admin and Quality:
+    ONLY Date of Birth and Anniversary Date. Everything else on the profile
+    (name, role, email, designation, reporting manager, DOJ, processes ...)
+    stays Super Admin-only, and no other field is read from this request.
+    """
+    today = datetime.now(IST).date()
+    data = payload.dict(exclude_unset=True)
+    for field, label in (("dob", "Date of Birth"), ("anniversary_date", "Anniversary Date")):
+        v = data.get(field)
+        if v is not None and v > today:
+            raise HTTPException(status_code=400, detail=f"{label} can't be in the future")
+    if "dob" in data:
+        current_user.dob = data["dob"]
+    if "anniversary_date" in data:
+        current_user.anniversary_date = data["anniversary_date"]
+    db.add(current_user)
+    db.commit()
+    db.refresh(current_user)
+    return current_user
+
+
 DEFAULT_SESSION_TIMEOUT_MINUTES = 60
 SESSION_TIMEOUT_SETTING_KEY = "session_timeout_minutes"
 

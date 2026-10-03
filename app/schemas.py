@@ -119,6 +119,12 @@ class ProcessUpdate(BaseModel):
     daily_target: Optional[int] = None
 
 
+class ProfileDatesUpdate(BaseModel):
+    """What a user may change on their own profile: only these two dates."""
+    dob: Optional[date] = None
+    anniversary_date: Optional[date] = None
+
+
 class UserOut(BaseModel):
     id: int
     username: str
