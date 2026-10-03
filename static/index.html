@@ -227,6 +227,7 @@
         <span id="process-badge" class="process-badge" style="display:none;"></span>
         <span id="whoami" class="badge"></span>
         <button class="action-btn" id="admin-btn" style="display:none;" onclick="showAdminView()">Admin</button>
+        <button class="action-btn" id="header-profile-btn" style="display:none;" title="My Profile" onclick="openProfileModal()">👤 My Profile</button>
         <button class="action-btn" onclick="logout()">Log out</button>
       </div>
     </header>
@@ -1288,6 +1289,7 @@ function showApp() {
   }
   // Clients (view-only): colleague, Team Lead, Admin, Super Admin — not the Quality profile.
   document.getElementById("nav-profile-btn").style.display = role === "super_admin" ? "none" : "block";
+  document.getElementById("header-profile-btn").style.display = role === "super_admin" ? "none" : "inline-block";
   document.getElementById("nav-clients-btn").style.display = role === "quality" ? "none" : "block";
   // Import Exceptions: Team Lead (their "already completed" notices), Admin, Super Admin.
   document.getElementById("nav-import-exc-btn").style.display = (role === "team_lead" || role === "admin" || role === "super_admin") ? "block" : "none";
