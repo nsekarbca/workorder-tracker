@@ -1119,7 +1119,80 @@ def delete_one_order(
 # ---------------------------------------------------------------------------
 
 # EDM process: only these Def Doc Types are imported (compared ignoring case / extra spaces).
-EDM_ALLOWED_DOC_TYPES = {"manual eft eob", "lockbox payment", "insurance credit card pmt only"}
+EDM_ALLOWED_DOC_TYPES = {"manual eft eob", "lockbox payment", "insurance credit card pmt only", "insurance credit card pmt"}
+# Rows in this Bar Grp are never imported (any process).
+SKIP_BAR_GRPS = {"grp - 4 gottlieb-sound phys"}
+
+# Original inventory headers (Batch Manager export) -> internal field names.
+_HEADER_ALIASES = {
+    "batch": "edm", "edm": "edm", "edm#": "edm",
+    "status": "status", "created": "created",
+    "images": "image_count", "image count": "image_count", "image_count": "image_count",
+    "docs": "doc_count", "doc count": "doc_count", "doc_count": "doc_count",
+    "def doc type": "def_doc_type", "def_doc_type": "def_doc_type",
+    "amount": "amount", "description": "description",
+    "division": "division", "deposit date": "deposit_date", "deposit_date": "deposit_date",
+    "bar grp": "bar_grp", "bar_grp": "bar_grp",
+    "last edited by": "last_edited_by", "scanned date": "scanned_date", "scanned batch": "scanned_batch",
+}
+
+
+def _cell_text(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, datetime):
+        return v.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(v, date):
+        return v.isoformat()
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v).strip()
+
+
+def _read_inventory_rows(raw: bytes, filename: str):
+    """
+    Reads the uploaded inventory (.xlsx or .csv) into a list of dicts keyed by
+    internal field names. Title rows above the header (e.g. "Batch Manager -
+    Group 1") and blank rows are ignored. Division and Deposit Date are taken
+    from Description (text before the 1st "_" and between the 1st and 2nd "_",
+    e.g. 1340_09-30-2026_334.99_...pdf); the Division / Deposit Date columns
+    are only a fallback for older CSVs.
+    """
+    name = (filename or "").lower()
+    if name.endswith(".xlsx") or name.endswith(".xlsm") or raw[:2] == b"PK":
+        try:
+            import openpyxl
+        except ImportError:
+            raise HTTPException(status_code=500, detail="Excel support (openpyxl) is not installed on the server")
+        wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        matrix = [[_cell_text(c) for c in r] for r in wb.worksheets[0].iter_rows(values_only=True)]
+    elif name.endswith(".xls"):
+        raise HTTPException(status_code=400, detail="Please save the file as .xlsx or .csv and upload again")
+    else:
+        text = raw.decode("utf-8-sig", errors="replace")
+        matrix = [[c.strip() for c in r] for r in csv.reader(io.StringIO(text))]
+
+    header_idx, mapping = None, {}
+    for i, r in enumerate(matrix[:30]):
+        m = {j: _HEADER_ALIASES[_norm_text(c)] for j, c in enumerate(r) if _norm_text(c) in _HEADER_ALIASES}
+        if "edm" in m.values() and len(m) >= 3:
+            header_idx, mapping = i, m
+            break
+    if header_idx is None:
+        raise HTTPException(status_code=400, detail="Could not find the header row (Batch, Status, Created, Images, Docs, Def Doc Type, ...)")
+
+    rows = []
+    for r in matrix[header_idx + 1:]:
+        if not any(c for c in r):
+            continue
+        d = {f: (r[j] if j < len(r) else "") for j, f in mapping.items()}
+        desc = d.get("description") or ""
+        if "_" in desc:
+            parts = desc.split("_")
+            d["division"] = parts[0].strip()
+            d["deposit_date"] = parts[1].strip() if len(parts) > 2 else (d.get("deposit_date") or "")
+        rows.append(d)
+    return rows
 DUPLICATE_LOOKBACK_MONTHS = 1      # an EDM already imported within this window is not imported again
 EXCEPTION_DEDUPE_DAYS = 30         # the same EDM isn't logged twice as an exception within this many days
 
@@ -1165,8 +1238,9 @@ def import_inventory(
     db: Session = Depends(get_db),
 ):
     """
-    Accepts a CSV with columns matching E-O:
-    edm,status,created,image_count,doc_count,def_doc_type,amount,description,division,deposit_date
+    Accepts the original inventory file (.xlsx or .csv): Batch, Status, Created, Images, Docs,
+    Def Doc Type, Amount, Description, Bar Grp... Division / Deposit Date come from Description.
+    Rows with Bar Grp "Grp - 4 Gottlieb-Sound Phys" are skipped.
     Creates one unassigned WorkOrder row per accepted line, tagged to this process.
 
     Which rows are accepted:
@@ -1242,10 +1316,9 @@ def import_inventory(
         ).all():
             existing.setdefault(_norm_edm(o.edm), []).append(o)
 
-    content = file.file.read().decode("utf-8-sig")
-    reader = csv.DictReader(io.StringIO(content))
+    reader = _read_inventory_rows(file.file.read(), file.filename)
     counts = {
-        "total_rows": 0, "imported": 0,
+        "total_rows": 0, "imported": 0, "skipped_bar_grp": 0,
         "skipped_doc_type": 0, "skipped_other_team_lead": 0, "skipped_unassigned_client": 0,
         "skipped_duplicate_open": 0, "skipped_duplicate_in_file": 0, "skipped_duplicate_completed": 0,
     }
@@ -1272,6 +1345,11 @@ def import_inventory(
 
     for row in reader:
         counts["total_rows"] += 1
+
+        # 0) Bar Grp rows that are never imported
+        if _norm_text(row.get("bar_grp")) in SKIP_BAR_GRPS:
+            counts["skipped_bar_grp"] += 1
+            continue
 
         # 1) EDM process: only the allowed Def Doc Types
         if is_edm and _norm_text(row.get("def_doc_type")) not in EDM_ALLOWED_DOC_TYPES:
@@ -1324,7 +1402,7 @@ def import_inventory(
             amount=_parse_float(row.get("amount")),
             description=row.get("description") or None,
             division=row.get("division") or None,
-            deposit_date=_parse_date(row.get("deposit_date")),
+            deposit_date=_safe_date(row.get("deposit_date")),
             last_edited_by=current_user.username,
         ))
         counts["imported"] += 1
@@ -1400,6 +1478,13 @@ def _parse_date(v: Optional[str]) -> Optional[date]:
         return date_parser.parse(v.strip()).date()
     except (ValueError, OverflowError) as e:
         raise ValueError(f"Unrecognized date format: {v!r}") from e
+
+
+def _safe_date(v):
+    try:
+        return _parse_date(v)
+    except ValueError:
+        return None
 
 
 def _parse_dt(v: Optional[str]) -> Optional[datetime]:
