@@ -212,6 +212,7 @@
       <div id="nav-menu" class="nav-menu" style="display:none;">
         <button class="nav-menu-item" onclick="navTo('home')">🏠 Home</button>
         <button class="nav-menu-item" id="nav-active-btn" onclick="navTo('active')">📋 Active Queue</button>
+        <button class="nav-menu-item" id="nav-clients-btn" style="display:none;" onclick="navTo('clients')">📇 Clients</button>
         <button class="nav-menu-item" id="nav-audit-btn" style="display:none;" onclick="navTo('audit')">🛡️ Team Lead Change Log</button>
         <button class="nav-menu-item" id="nav-orders-dash-btn" style="display:none;" onclick="navTo('orders-dash')">📈 Orders Dashboard</button>
         <button class="nav-menu-item" id="nav-batch-btn" style="display:none;" onclick="navTo('batch')">📊 Batch Dashboard</button>
@@ -272,6 +273,24 @@
           <button class="action-btn" onclick="exportProductionCSV()">Export CSV</button>
           <button class="action-btn" onclick="clearProductionFilters()">Clear Filters</button>
           <button class="action-btn" id="prod-back-btn" onclick="showActiveView()">Back to Active Queue</button>
+        </div>
+      </div>
+      <div id="clients-view-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px;">
+        <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
+          <h3 style="margin:0;">📇 Clients</h3>
+          <label>Search <input id="cv-search" placeholder="Facility No or name" oninput="renderClientsView()" style="width:190px;"></label>
+          <label>Status <select id="cv-status" onchange="renderClientsView()"><option value="">All</option><option value="Active">Active</option><option value="Inactive">Inactive</option></select></label>
+          <label>Team Lead <select id="cv-tl" onchange="renderClientsView()"></select></label>
+          <label>Process <select id="cv-process" onchange="renderClientsView()"></select></label>
+          <button class="od-tab" onclick="cvClear()">Clear filters</button>
+        </div>
+        <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+          <button class="od-tab active" id="cv-tab-list" onclick="cvSetTab('list')">Client List</button>
+          <button class="od-tab" id="cv-tab-tl" onclick="cvSetTab('tl')">By Team Lead</button>
+          <button class="od-tab" id="cv-tab-process" onclick="cvSetTab('process')">By Process</button>
+          <span style="flex:1;"></span>
+          <span style="font-size:12px; color:#666;">View only</span>
+          <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
         </div>
       </div>
       <div id="audit-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px;">
@@ -1217,6 +1236,8 @@ function showApp() {
     document.getElementById("nav-production-btn").style.display = "block";
     document.getElementById("nav-batch-btn").style.display = "block";
   }
+  // Clients (view-only): colleague, Team Lead, Admin, Super Admin — not the Quality profile.
+  document.getElementById("nav-clients-btn").style.display = role === "quality" ? "none" : "block";
   if (role === "super_admin") {
     document.getElementById("admin-btn").style.display = "inline-block";
     document.getElementById("nav-admin-btn").style.display = "block";
@@ -1250,6 +1271,7 @@ function navTo(dest) {
   else if (dest === "batch") showBatchDashboardView();
   else if (dest === "orders-dash") showOrdersDashboardView();
   else if (dest === "audit") showAuditView();
+  else if (dest === "clients") showClientsView();
   else if (dest === "production") showProductionView();
   else if (dest === "escalations") showEscalationsView();
   else if (dest === "admin") showAdminView();
@@ -1257,6 +1279,163 @@ function navTo(dest) {
 }
 
 
+
+// ---------------------------------------------------------------------
+// Clients (view only) — colleague, Team Lead, Admin, Super Admin.
+// Three read-only views of the client list from GET /clients:
+//   Client List    one row per client, a Team Lead column per process
+//   By Team Lead   clients grouped under each Team Lead (with the processes)
+//   By Process     clients grouped under each process (with the Team Lead)
+// Editing lives in Admin -> Clients (Super Admin only).
+// ---------------------------------------------------------------------
+
+let cvData = {clients: [], team_leads: [], processes: []};
+let cvTab = "list";
+
+function cvTlName(id) { const t = cvData.team_leads.find(x => x.id === id); return t ? t.full_name : "?"; }
+function cvBadge(status) {
+  return `<span style="display:inline-block; padding:2px 10px; border-radius:12px; font-size:12px; color:#fff; background:${status === "Inactive" ? "#dc2626" : "#16a34a"};">${_esc(status)}</span>`;
+}
+function cvGroupRow(icon, title, extra, colspan) {
+  return `<tr class="tl-group"><td colspan="${colspan}">${icon} ${_esc(title)}<span>${_esc(extra)}</span></td></tr>`;
+}
+
+async function showClientsView() {
+  viewMode = "clients";
+  document.getElementById("toolbar").style.display = "none";
+  document.getElementById("production-bar").style.display = "none";
+  document.getElementById("batch-bar").style.display = "none";
+  document.getElementById("orders-dash-bar").style.display = "none";
+  document.getElementById("audit-bar").style.display = "none";
+  document.getElementById("admin-panel").style.display = "none";
+  document.getElementById("dashboard-panel").style.display = "none";
+  document.getElementById("under-construction-banner").style.display = "none";
+  shareMode = false;
+  selectedForShare.clear();
+  document.getElementById("share-bar").style.display = "none";
+  document.getElementById("clients-view-bar").style.display = "flex";
+  cvTab = "list";
+  cvSyncTabs();
+  document.getElementById("grid-container").innerHTML = "<p>Loading\u2026</p>";
+  const res = await authFetch("/clients");
+  if (!res.ok) { alert("Couldn't load the client list: " + (await res.text())); return; }
+  cvData = await res.json();
+  cvData.clients.forEach(c => { c._a = Object.fromEntries(c.assignments.map(a => [a.process_id, a.team_lead_id])); });
+  document.getElementById("cv-search").value = "";
+  document.getElementById("cv-status").value = "";
+  document.getElementById("cv-tl").innerHTML = `<option value="">All Team Leads</option>` +
+    cvData.team_leads.map(t => `<option value="${t.id}">${_esc(t.full_name)}${t.active ? "" : " (inactive)"}</option>`).join("");
+  document.getElementById("cv-process").innerHTML = `<option value="">All processes</option>` +
+    cvData.processes.map(p => `<option value="${p.id}">${_esc(p.name)}</option>`).join("");
+  renderClientsView();
+}
+
+function cvClear() {
+  document.getElementById("cv-search").value = "";
+  document.getElementById("cv-status").value = "";
+  document.getElementById("cv-tl").value = "";
+  document.getElementById("cv-process").value = "";
+  renderClientsView();
+}
+function cvSetTab(tab) { cvTab = tab; cvSyncTabs(); renderClientsView(); }
+function cvSyncTabs() {
+  ["list", "tl", "process"].forEach(t => document.getElementById("cv-tab-" + t).classList.toggle("active", cvTab === t));
+}
+
+// The assignments that match the Team Lead / Process filters for one client.
+function cvMatchingAssignments(c, tlF, procF) {
+  return cvData.processes
+    .filter(p => c._a[p.id] && (!procF || p.id === procF) && (!tlF || c._a[p.id] === tlF))
+    .map(p => ({process: p, tlId: c._a[p.id]}));
+}
+
+function cvFilteredClients() {
+  const q = document.getElementById("cv-search").value.trim().toLowerCase();
+  const st = document.getElementById("cv-status").value;
+  const tlF = Number(document.getElementById("cv-tl").value) || 0;
+  const procF = Number(document.getElementById("cv-process").value) || 0;
+  return cvData.clients.filter(c =>
+    (!q || c.facility_no.toLowerCase().includes(q) || c.client_name.toLowerCase().includes(q)) &&
+    (!st || c.status === st) &&
+    ((!tlF && !procF) || cvMatchingAssignments(c, tlF, procF).length));
+}
+
+function renderClientsView() {
+  const box = document.getElementById("grid-container");
+  const clients = cvFilteredClients();
+  const tlF = Number(document.getElementById("cv-tl").value) || 0;
+  const procF = Number(document.getElementById("cv-process").value) || 0;
+  const active = clients.filter(c => c.status === "Active").length;
+  let html = `<p style="margin:0 0 8px; color:#555;"><strong>${clients.length}</strong> of ${cvData.clients.length} clients \u00b7 ${active} active \u00b7 ${clients.length - active} inactive</p>`;
+  if (!clients.length) { box.innerHTML = html + "<p>No clients match these filters.</p>"; return; }
+
+  if (cvTab === "tl") html += cvByTeamLeadHTML(clients, tlF, procF);
+  else if (cvTab === "process") html += cvByProcessHTML(clients, tlF, procF);
+  else html += cvListHTML(clients, procF);
+  box.innerHTML = html;
+}
+
+function cvListHTML(clients, procF) {
+  const procs = cvData.processes.filter(p => !procF || p.id === procF);
+  let html = `<div class="od-scroll"><table><thead><tr><th>Facility No</th><th>Client Name</th><th>Status</th><th>Inactive Date</th>` +
+    procs.map(p => `<th style="min-width:120px;">${_esc(p.name)}</th>`).join("") + `</tr></thead><tbody>`;
+  clients.forEach(c => {
+    const inactive = c.status === "Inactive";
+    html += `<tr${inactive ? ' style="color:#777;"' : ""}><td>${_esc(c.facility_no)}</td><td>${_esc(c.client_name)}</td><td>${cvBadge(c.status)}</td>` +
+      `<td>${inactive ? _esc(c.inactive_date || "") : ""}</td>` +
+      procs.map(p => `<td>${c._a[p.id] ? _esc(cvTlName(c._a[p.id])) : '<span style="color:#b45309;">\u2014</span>'}</td>`).join("") + `</tr>`;
+  });
+  return html + `</tbody></table></div>`;
+}
+
+function cvByTeamLeadHTML(clients, tlF, procF) {
+  const groups = new Map();      // tlId -> [{client, procs: [names]}]
+  const none = [];
+  clients.forEach(c => {
+    const asg = cvMatchingAssignments(c, tlF, procF);
+    if (!asg.length) { none.push(c); return; }
+    const byTl = new Map();
+    asg.forEach(a => { if (!byTl.has(a.tlId)) byTl.set(a.tlId, []); byTl.get(a.tlId).push(a.process.name); });
+    byTl.forEach((names, tlId) => { if (!groups.has(tlId)) groups.set(tlId, []); groups.get(tlId).push({c, names}); });
+  });
+  const tlIds = Array.from(groups.keys()).sort((a, b) => cvTlName(a).localeCompare(cvTlName(b)));
+  let html = `<div class="od-scroll"><table><thead><tr><th>Facility No</th><th>Client Name</th><th>Status</th><th>Inactive Date</th><th>Processes</th></tr></thead><tbody>`;
+  const row = (c, procsText) => {
+    const inactive = c.status === "Inactive";
+    return `<tr${inactive ? ' style="color:#777;"' : ""}><td>${_esc(c.facility_no)}</td><td>${_esc(c.client_name)}</td><td>${cvBadge(c.status)}</td>` +
+      `<td>${inactive ? _esc(c.inactive_date || "") : ""}</td><td>${procsText}</td></tr>`;
+  };
+  tlIds.forEach(id => {
+    const rows = groups.get(id).sort((x, y) => Number(x.c.facility_no) - Number(y.c.facility_no));
+    html += cvGroupRow("\ud83d\udc64", cvTlName(id), ` \u2014 ${rows.length} client${rows.length === 1 ? "" : "s"}`, 5);
+    rows.forEach(r => html += row(r.c, _esc(r.names.length === cvData.processes.length ? "All processes" : r.names.join(", "))));
+  });
+  if (none.length && !tlF && !procF) {
+    html += cvGroupRow("\u26a0\ufe0f", "No Team Lead assigned", ` \u2014 ${none.length} client${none.length === 1 ? "" : "s"}`, 5);
+    none.forEach(c => html += row(c, ""));
+  }
+  return html + `</tbody></table></div>`;
+}
+
+function cvByProcessHTML(clients, tlF, procF) {
+  const procs = cvData.processes.filter(p => !procF || p.id === procF);
+  let html = `<div class="od-scroll"><table><thead><tr><th>Facility No</th><th>Client Name</th><th>Status</th><th>Inactive Date</th><th>Team Lead</th></tr></thead><tbody>`;
+  let any = false;
+  procs.forEach(p => {
+    const assigned = clients.filter(c => c._a[p.id] && (!tlF || c._a[p.id] === tlF));
+    const missing = clients.filter(c => !c._a[p.id]).length;
+    if (!assigned.length) return;
+    any = true;
+    html += cvGroupRow("\ud83d\udce6", p.name, ` \u2014 ${assigned.length} client${assigned.length === 1 ? "" : "s"}` + (!tlF && missing ? ` \u00b7 ${missing} without a Team Lead` : ""), 5);
+    assigned.forEach(c => {
+      const inactive = c.status === "Inactive";
+      html += `<tr${inactive ? ' style="color:#777;"' : ""}><td>${_esc(c.facility_no)}</td><td>${_esc(c.client_name)}</td><td>${cvBadge(c.status)}</td>` +
+        `<td>${inactive ? _esc(c.inactive_date || "") : ""}</td><td>${_esc(cvTlName(c._a[p.id]))}</td></tr>`;
+    });
+  });
+  if (!any) html += `<tr><td colspan="5">No Team Leads are assigned for these clients yet.</td></tr>`;
+  return html + `</tbody></table></div>`;
+}
 
 // ---------------------------------------------------------------------
 // Admin -> Clients (Super Admin): client list with Active / Inactive status
@@ -1535,6 +1714,7 @@ async function showAuditView() {
   document.getElementById("production-bar").style.display = "none";
   document.getElementById("batch-bar").style.display = "none";
   document.getElementById("orders-dash-bar").style.display = "none";
+  document.getElementById("clients-view-bar").style.display = "none";
   document.getElementById("admin-panel").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
@@ -1703,6 +1883,7 @@ async function showOrdersDashboardView() {
   selectedForShare.clear();
   document.getElementById("share-bar").style.display = "none";
   document.getElementById("audit-bar").style.display = "none";
+  document.getElementById("clients-view-bar").style.display = "none";
   document.getElementById("orders-dash-bar").style.display = "flex";
 
   odState = {rows: [], tlRows: [], tab: "date", drill: null};
@@ -1980,6 +2161,7 @@ async function showBatchDashboardView() {
   document.getElementById("batch-bar").style.display = "flex";
   document.getElementById("orders-dash-bar").style.display = "none";
   document.getElementById("audit-bar").style.display = "none";
+  document.getElementById("clients-view-bar").style.display = "none";
 
   batchTab = "detail";
   currentBatchTL = [];
@@ -2258,6 +2440,7 @@ function showHomeView() {
   document.getElementById("batch-bar").style.display = "none";
   document.getElementById("orders-dash-bar").style.display = "none";
   document.getElementById("audit-bar").style.display = "none";
+  document.getElementById("clients-view-bar").style.display = "none";
   shareMode = false;
   selectedForShare.clear();
   document.getElementById("share-bar").style.display = "none";
@@ -2287,6 +2470,7 @@ async function showEscalationsView() {
   document.getElementById("batch-bar").style.display = "none";
   document.getElementById("orders-dash-bar").style.display = "none";
   document.getElementById("audit-bar").style.display = "none";
+  document.getElementById("clients-view-bar").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
   shareMode = false;
@@ -2594,6 +2778,7 @@ async function showAdminView() {
   document.getElementById("batch-bar").style.display = "none";
   document.getElementById("orders-dash-bar").style.display = "none";
   document.getElementById("audit-bar").style.display = "none";
+  document.getElementById("clients-view-bar").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
   shareMode = false;
@@ -3037,6 +3222,7 @@ async function showProductionView() {
   document.getElementById("batch-bar").style.display = "none";
   document.getElementById("orders-dash-bar").style.display = "none";
   document.getElementById("audit-bar").style.display = "none";
+  document.getElementById("clients-view-bar").style.display = "none";
 
   dateFilters = {posted:{from:"",to:""}, received:{from:"",to:""}, assigned:{from:"",to:""}, created:{from:"",to:""}};
   valueFilters = emptyValueFilters();
@@ -3062,6 +3248,7 @@ function showActiveView() {
   document.getElementById("batch-bar").style.display = "none";
   document.getElementById("orders-dash-bar").style.display = "none";
   document.getElementById("audit-bar").style.display = "none";
+  document.getElementById("clients-view-bar").style.display = "none";
   document.getElementById("admin-panel").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
@@ -3271,6 +3458,7 @@ async function loadOrders() {
   document.getElementById("batch-bar").style.display = "none";
   document.getElementById("orders-dash-bar").style.display = "none";
   document.getElementById("audit-bar").style.display = "none";
+  document.getElementById("clients-view-bar").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
   viewMode = "active";
