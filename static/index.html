@@ -212,6 +212,7 @@
       <div id="nav-menu" class="nav-menu" style="display:none;">
         <button class="nav-menu-item" onclick="navTo('home')">🏠 Home</button>
         <button class="nav-menu-item" id="nav-active-btn" onclick="navTo('active')">📋 Active Queue</button>
+        <button class="nav-menu-item" id="nav-import-exc-btn" style="display:none;" onclick="navTo('import-exceptions')">\u26a0\ufe0f Import Exceptions</button>
         <button class="nav-menu-item" id="nav-clients-btn" style="display:none;" onclick="navTo('clients')">📇 Clients</button>
         <button class="nav-menu-item" id="nav-audit-btn" style="display:none;" onclick="navTo('audit')">🛡️ Team Lead Change Log</button>
         <button class="nav-menu-item" id="nav-orders-dash-btn" style="display:none;" onclick="navTo('orders-dash')">📈 Orders Dashboard</button>
@@ -274,6 +275,29 @@
           <button class="action-btn" onclick="clearProductionFilters()">Clear Filters</button>
           <button class="action-btn" id="prod-back-btn" onclick="showActiveView()">Back to Active Queue</button>
         </div>
+      </div>
+      <div id="import-exc-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px;">
+        <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
+          <h3 style="margin:0;">\u26a0\ufe0f Import Exceptions</h3>
+          <label>From <input type="date" id="ie-date-from"></label>
+          <label>To <input type="date" id="ie-date-to"></label>
+          <label>Process <select id="ie-process"></select></label>
+          <label id="ie-tl-label" style="display:none;">Team Lead <select id="ie-team-lead" onchange="renderImportExceptions()"></select></label>
+          <label>Search <input id="ie-search" placeholder="EDM, client or Division" oninput="renderImportExceptions()" style="width:180px;"></label>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <button class="action-btn" onclick="loadImportExceptions()">Load</button>
+          <span style="font-size:12px; color:#666; margin-left:6px;">Quick:</span>
+          <button class="od-tab" onclick="ieQuickRange(1)">Today</button>
+          <button class="od-tab" onclick="ieQuickRange(7)">Last 7 days</button>
+          <button class="od-tab" onclick="ieQuickRange(30)">Last 30 days</button>
+          <span style="flex:1;"></span>
+          <button class="od-tab active" id="ie-tab-completed" onclick="ieSetTab('duplicate_completed')">Already Completed</button>
+          <button class="od-tab" id="ie-tab-unassigned" style="display:none;" onclick="ieSetTab('unassigned_client')">Unassigned Clients</button>
+          <button class="action-btn" onclick="ieExportCSV()">Export CSV</button>
+          <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
+        </div>
+        <div id="ie-hint" style="font-size:12px; color:#666;"></div>
       </div>
       <div id="clients-view-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px;">
         <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
@@ -1238,6 +1262,8 @@ function showApp() {
   }
   // Clients (view-only): colleague, Team Lead, Admin, Super Admin — not the Quality profile.
   document.getElementById("nav-clients-btn").style.display = role === "quality" ? "none" : "block";
+  // Import Exceptions: Team Lead (their "already completed" notices), Admin, Super Admin.
+  document.getElementById("nav-import-exc-btn").style.display = (role === "team_lead" || role === "admin" || role === "super_admin") ? "block" : "none";
   if (role === "super_admin") {
     document.getElementById("admin-btn").style.display = "inline-block";
     document.getElementById("nav-admin-btn").style.display = "block";
@@ -1272,6 +1298,7 @@ function navTo(dest) {
   else if (dest === "orders-dash") showOrdersDashboardView();
   else if (dest === "audit") showAuditView();
   else if (dest === "clients") showClientsView();
+  else if (dest === "import-exceptions") showImportExceptionsView();
   else if (dest === "production") showProductionView();
   else if (dest === "escalations") showEscalationsView();
   else if (dest === "admin") showAdminView();
@@ -1279,6 +1306,174 @@ function navTo(dest) {
 }
 
 
+
+// ---------------------------------------------------------------------
+// Import Exceptions — rows the inventory import skipped that need a human:
+//   Already Completed    the EDM was imported in the last month and is Completed
+//                        (Team Lead sees their own; Admin / Super Admin see all)
+//   Unassigned Clients   the row's client isn't in the client list, or has no
+//                        Team Lead for the process (Admin / Super Admin only)
+// Server: GET /import-exceptions
+// ---------------------------------------------------------------------
+
+let ieRows = [];
+let ieTab = "duplicate_completed";
+
+function ieAllTeams() { return role === "admin" || role === "super_admin"; }
+
+async function showImportExceptionsView() {
+  viewMode = "import-exceptions";
+  document.getElementById("toolbar").style.display = "none";
+  document.getElementById("production-bar").style.display = "none";
+  document.getElementById("batch-bar").style.display = "none";
+  document.getElementById("orders-dash-bar").style.display = "none";
+  document.getElementById("audit-bar").style.display = "none";
+  document.getElementById("clients-view-bar").style.display = "none";
+  document.getElementById("admin-panel").style.display = "none";
+  document.getElementById("dashboard-panel").style.display = "none";
+  document.getElementById("under-construction-banner").style.display = "none";
+  shareMode = false;
+  selectedForShare.clear();
+  document.getElementById("share-bar").style.display = "none";
+  document.getElementById("import-exc-bar").style.display = "flex";
+
+  const today = new Date();
+  const from = new Date(); from.setDate(today.getDate() - 29);
+  document.getElementById("ie-date-from").value = _isoLocalDate(from);
+  document.getElementById("ie-date-to").value = _isoLocalDate(today);
+  document.getElementById("ie-search").value = "";
+  document.getElementById("ie-tl-label").style.display = ieAllTeams() ? "inline-block" : "none";
+  document.getElementById("ie-tab-unassigned").style.display = ieAllTeams() ? "inline-block" : "none";
+  document.getElementById("ie-team-lead").innerHTML = `<option value="">All</option>`;
+  ieTab = "duplicate_completed";
+  ieSyncTabs();
+
+  let procs = myProcesses;
+  if (ieAllTeams()) {
+    try {
+      const pr = await fetch(API + "/processes/public");
+      if (pr.ok) procs = await pr.json();
+    } catch (_) { /* fall back to the user's own processes */ }
+  }
+  document.getElementById("ie-process").innerHTML = `<option value="">All processes</option>` +
+    procs.map(p => `<option value="${p.id}">${_esc(p.name)}</option>`).join("");
+  await loadImportExceptions();
+}
+
+function ieQuickRange(days) {
+  const today = new Date();
+  const from = new Date(); from.setDate(today.getDate() - (days - 1));
+  document.getElementById("ie-date-from").value = _isoLocalDate(from);
+  document.getElementById("ie-date-to").value = _isoLocalDate(today);
+  loadImportExceptions();
+}
+
+function ieSetTab(tab) { ieTab = tab; ieSyncTabs(); renderImportExceptions(); }
+function ieSyncTabs() {
+  document.getElementById("ie-tab-completed").classList.toggle("active", ieTab === "duplicate_completed");
+  document.getElementById("ie-tab-unassigned").classList.toggle("active", ieTab === "unassigned_client");
+  document.getElementById("ie-hint").textContent = ieTab === "duplicate_completed"
+    ? "These EDMs were in the inventory file but are already Completed (imported within the last month), so they were not imported again."
+    : "These rows were not imported because their client is not in the client list, or has no Team Lead for the process. Assign the client under Admin \u2192 Clients, then import the file again.";
+}
+
+async function loadImportExceptions() {
+  const p = new URLSearchParams();
+  const f = document.getElementById("ie-date-from").value;
+  const t = document.getElementById("ie-date-to").value;
+  const pr = document.getElementById("ie-process").value;
+  if (f) p.set("start_date", f);
+  if (t) p.set("end_date", t);
+  if (pr) p.set("process_id", pr);
+  const res = await authFetch("/import-exceptions?" + p.toString());
+  if (!res.ok) { alert("Couldn't load Import Exceptions: " + (await res.text())); return; }
+  ieRows = await res.json();
+  if (ieAllTeams()) {
+    const sel = document.getElementById("ie-team-lead");
+    const keep = sel.value;
+    const names = Array.from(new Set(ieRows.map(r => r.team_lead_name).filter(Boolean))).sort();
+    sel.innerHTML = `<option value="">All</option>` + names.map(n => `<option value="${_esc(n)}">${_esc(n)}</option>`).join("");
+    if (names.includes(keep)) sel.value = keep;
+  }
+  renderImportExceptions();
+}
+
+function ieVisible() {
+  const q = document.getElementById("ie-search").value.trim().toLowerCase();
+  const tl = ieAllTeams() ? document.getElementById("ie-team-lead").value : "";
+  return ieRows.filter(r => r.kind === ieTab &&
+    (!tl || r.team_lead_name === tl) &&
+    (!q || [r.edm, r.client_name, r.facility_no, r.division_raw].some(v => (v || "").toLowerCase().includes(q))));
+}
+
+function ieWhen(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return String(iso);
+  return d.toLocaleDateString("en-GB", {day: "2-digit", month: "short", year: "numeric"}) + ", " +
+         d.toLocaleTimeString("en-GB", {hour: "2-digit", minute: "2-digit"});
+}
+
+function ieClientText(r) {
+  return r.client_name ? `${r.facility_no} \u00b7 ${r.client_name}` : "\u2014";
+}
+
+function renderImportExceptions() {
+  const box = document.getElementById("grid-container");
+  const rows = ieVisible();
+  const counts = {duplicate_completed: ieRows.filter(r => r.kind === "duplicate_completed").length,
+                  unassigned_client: ieRows.filter(r => r.kind === "unassigned_client").length};
+  document.getElementById("ie-tab-completed").textContent = `Already Completed (${counts.duplicate_completed})`;
+  document.getElementById("ie-tab-unassigned").textContent = `Unassigned Clients (${counts.unassigned_client})`;
+  if (!rows.length) {
+    box.innerHTML = ieRows.some(r => r.kind === ieTab) ? "<p>Nothing matches these filters.</p>"
+      : (ieTab === "duplicate_completed" ? "<p>No already-completed EDMs were skipped in this date range.</p>" : "<p>No unassigned-client rows in this date range.</p>");
+    return;
+  }
+  const th = h => `<th class="col">${h}</th>`;
+  let html = `<p style="margin:0 0 8px; color:#555;"><strong>${rows.length}</strong> row${rows.length === 1 ? "" : "s"}` +
+    (ieRows.length >= 5000 ? ` <span style="color:#b45309;">\u2014 showing the latest 5,000; narrow the dates to see older ones.</span>` : "") + `</p>`;
+  if (ieTab === "duplicate_completed") {
+    html += `<div class="od-scroll"><table><thead><tr>` +
+      ["Imported (IST)", "Process", "EDM", "Client", "Def Doc Type", "Amount", "Team Lead", "Imported By", "Completed On", "Completed By"].map(th).join("") + `</tr></thead><tbody>`;
+    rows.forEach(r => {
+      html += `<tr><td style="white-space:nowrap;">${_esc(ieWhen(r.created_at))}</td><td>${_esc(r.process_name)}</td><td>${_esc(r.edm)}</td>` +
+        `<td>${_esc(ieClientText(r))}</td><td>${_esc(r.def_doc_type)}</td><td>${_esc(r.amount ?? "")}</td><td>${_esc(r.team_lead_name)}</td>` +
+        `<td>${_esc(r.imported_by_name)}</td><td>${_esc(r.existing_posted_date)}</td><td>${_esc(r.existing_employee_name)}</td></tr>`;
+    });
+  } else {
+    html += `<div class="od-scroll"><table><thead><tr>` +
+      ["Imported (IST)", "Process", "EDM", "Division in file", "Client", "Def Doc Type", "Amount", "Reason", "Imported By"].map(th).join("") + `</tr></thead><tbody>`;
+    rows.forEach(r => {
+      html += `<tr><td style="white-space:nowrap;">${_esc(ieWhen(r.created_at))}</td><td>${_esc(r.process_name)}</td><td>${_esc(r.edm)}</td>` +
+        `<td>${_esc(r.division_raw)}</td><td>${_esc(ieClientText(r))}</td><td>${_esc(r.def_doc_type)}</td><td>${_esc(r.amount ?? "")}</td>` +
+        `<td>${_esc(r.reason)}</td><td>${_esc(r.imported_by_name)}</td></tr>`;
+    });
+  }
+  box.innerHTML = html + `</tbody></table></div>`;
+}
+
+function ieExportCSV() {
+  const rows = ieVisible();
+  if (!rows.length) { alert("Nothing to export."); return; }
+  const q = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const done = ieTab === "duplicate_completed";
+  const headers = done
+    ? ["Imported (IST)", "Process", "EDM", "Facility No", "Client", "Def Doc Type", "Amount", "Team Lead", "Imported By", "Completed On", "Completed By"]
+    : ["Imported (IST)", "Process", "EDM", "Division in file", "Facility No", "Client", "Def Doc Type", "Amount", "Reason", "Imported By"];
+  const lines = rows.map(r => {
+    const when = r.created_at.replace("T", " ").slice(0, 19);
+    return done
+      ? [when, r.process_name, r.edm, r.facility_no, r.client_name, r.def_doc_type, r.amount, r.team_lead_name, r.imported_by_name, r.existing_posted_date, r.existing_employee_name]
+      : [when, r.process_name, r.edm, r.division_raw, r.facility_no, r.client_name, r.def_doc_type, r.amount, r.reason, r.imported_by_name];
+  });
+  const csv = [headers.map(q).join(",")].concat(lines.map(r => r.map(q).join(","))).join("\r\n");
+  const blob = new Blob([csv], {type: "text/csv;charset=utf-8;"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = `import_exceptions_${done ? "already_completed" : "unassigned_clients"}_${_isoLocalDate(new Date())}.csv`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
 
 // ---------------------------------------------------------------------
 // Clients (view only) — colleague, Team Lead, Admin, Super Admin.
@@ -1307,6 +1502,7 @@ async function showClientsView() {
   document.getElementById("batch-bar").style.display = "none";
   document.getElementById("orders-dash-bar").style.display = "none";
   document.getElementById("audit-bar").style.display = "none";
+  document.getElementById("import-exc-bar").style.display = "none";
   document.getElementById("admin-panel").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
@@ -1715,6 +1911,7 @@ async function showAuditView() {
   document.getElementById("batch-bar").style.display = "none";
   document.getElementById("orders-dash-bar").style.display = "none";
   document.getElementById("clients-view-bar").style.display = "none";
+  document.getElementById("import-exc-bar").style.display = "none";
   document.getElementById("admin-panel").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
@@ -1884,6 +2081,7 @@ async function showOrdersDashboardView() {
   document.getElementById("share-bar").style.display = "none";
   document.getElementById("audit-bar").style.display = "none";
   document.getElementById("clients-view-bar").style.display = "none";
+  document.getElementById("import-exc-bar").style.display = "none";
   document.getElementById("orders-dash-bar").style.display = "flex";
 
   odState = {rows: [], tlRows: [], tab: "date", drill: null};
@@ -2162,6 +2360,7 @@ async function showBatchDashboardView() {
   document.getElementById("orders-dash-bar").style.display = "none";
   document.getElementById("audit-bar").style.display = "none";
   document.getElementById("clients-view-bar").style.display = "none";
+  document.getElementById("import-exc-bar").style.display = "none";
 
   batchTab = "detail";
   currentBatchTL = [];
@@ -2441,6 +2640,7 @@ function showHomeView() {
   document.getElementById("orders-dash-bar").style.display = "none";
   document.getElementById("audit-bar").style.display = "none";
   document.getElementById("clients-view-bar").style.display = "none";
+  document.getElementById("import-exc-bar").style.display = "none";
   shareMode = false;
   selectedForShare.clear();
   document.getElementById("share-bar").style.display = "none";
@@ -2471,6 +2671,7 @@ async function showEscalationsView() {
   document.getElementById("orders-dash-bar").style.display = "none";
   document.getElementById("audit-bar").style.display = "none";
   document.getElementById("clients-view-bar").style.display = "none";
+  document.getElementById("import-exc-bar").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
   shareMode = false;
@@ -2779,6 +2980,7 @@ async function showAdminView() {
   document.getElementById("orders-dash-bar").style.display = "none";
   document.getElementById("audit-bar").style.display = "none";
   document.getElementById("clients-view-bar").style.display = "none";
+  document.getElementById("import-exc-bar").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
   shareMode = false;
@@ -3080,7 +3282,15 @@ async function importCSV(e) {
     return;
   }
   const data = await res.json();
-  alert(`Imported ${data.imported} rows`);
+  const lines = [`Imported ${data.imported} of ${data.total_rows} rows.`];
+  const add = (n, text) => { if (n) lines.push(`\u2022 ${n} ${text}`); };
+  add(data.skipped_doc_type, "skipped \u2014 Def Doc Type not imported for this process");
+  add(data.skipped_other_team_lead, "skipped \u2014 client belongs to another Team Lead");
+  add(data.skipped_unassigned_client, "skipped \u2014 client not assigned to a Team Lead (reported to Admin / Super Admin)");
+  add(data.skipped_duplicate_open, "skipped \u2014 EDM already in the system (In-Process / Clarification / blank)");
+  add(data.skipped_duplicate_in_file, "skipped \u2014 EDM repeated in this file");
+  add(data.skipped_duplicate_completed, "skipped \u2014 EDM already Completed (see Import Exceptions)");
+  alert(lines.join("\n"));
   loadOrders();
 }
 
@@ -3223,6 +3433,7 @@ async function showProductionView() {
   document.getElementById("orders-dash-bar").style.display = "none";
   document.getElementById("audit-bar").style.display = "none";
   document.getElementById("clients-view-bar").style.display = "none";
+  document.getElementById("import-exc-bar").style.display = "none";
 
   dateFilters = {posted:{from:"",to:""}, received:{from:"",to:""}, assigned:{from:"",to:""}, created:{from:"",to:""}};
   valueFilters = emptyValueFilters();
@@ -3249,6 +3460,7 @@ function showActiveView() {
   document.getElementById("orders-dash-bar").style.display = "none";
   document.getElementById("audit-bar").style.display = "none";
   document.getElementById("clients-view-bar").style.display = "none";
+  document.getElementById("import-exc-bar").style.display = "none";
   document.getElementById("admin-panel").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
@@ -3459,6 +3671,7 @@ async function loadOrders() {
   document.getElementById("orders-dash-bar").style.display = "none";
   document.getElementById("audit-bar").style.display = "none";
   document.getElementById("clients-view-bar").style.display = "none";
+  document.getElementById("import-exc-bar").style.display = "none";
   document.getElementById("dashboard-panel").style.display = "none";
   document.getElementById("under-construction-banner").style.display = "none";
   viewMode = "active";
