@@ -26,7 +26,7 @@
   header .brand img { height: 44px; width: auto; max-width: 220px; object-fit: contain; display: block; }
   header .brand .wordmark { font-size: 20px; font-weight: 700; letter-spacing: .5px; color: var(--navy); }
   header .brand .wordmark span { color: var(--accent); }
-  header .app-title { font-size: 13px; color: #555; margin-left: 10px; border-left: 1px solid #ccc; padding-left: 10px; }
+  header .app-title { font-size: 19px; font-weight: 700; letter-spacing: .3px; color: var(--navy); margin-left: 12px; border-left: 2px solid var(--accent); padding-left: 12px; line-height: 1.2; user-select: none; }
   #login-screen, #change-password-screen, #process-select-screen, #forgot-screen, #reset-token-screen { max-width: 360px; margin: 70px auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.12); }
   #login-screen h2, #change-password-screen h2, #process-select-screen h2, #forgot-screen h2, #reset-token-screen h2 { margin-top: 0; color: var(--navy); }
   #login-screen input, #login-screen select, #change-password-screen input, #forgot-screen input, #reset-token-screen input { width: 100%; padding: 8px; margin: 6px 0 14px; border: 1px solid #ccc; border-radius: 4px; }
@@ -227,7 +227,7 @@
         <span id="process-badge" class="process-badge" style="display:none;"></span>
         <span id="whoami" class="badge"></span>
         <button class="action-btn" id="admin-btn" style="display:none;" onclick="showAdminView()">Admin</button>
-        <button class="action-btn" id="header-profile-btn" style="display:none;" title="My Profile" onclick="openProfileModal()">👤 My Profile</button>
+        <button class="action-btn" id="header-profile-btn" style="display:none; line-height:1.2; align-items:center; gap:6px;" title="My Profile" onclick="openProfileModal()"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" style="vertical-align:-2px; margin-right:5px;"><circle cx="12" cy="8" r="4.5"/><path d="M3.5 21c0-4.6 3.8-8 8.5-8s8.5 3.4 8.5 8z"/></svg>My Profile</button>
         <button class="action-btn" onclick="logout()">Log out</button>
       </div>
     </header>
