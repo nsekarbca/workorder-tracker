@@ -212,7 +212,7 @@
       <div id="nav-menu" class="nav-menu" style="display:none;">
         <button class="nav-menu-item" onclick="navTo('home')">🏠 Home</button>
         <button class="nav-menu-item" id="nav-active-btn" onclick="navTo('active')">📋 Active Queue</button>
-        <button class="nav-menu-item" id="nav-import-exc-btn" style="display:none;" onclick="navTo('import-exceptions')">\u26a0\ufe0f Import Exceptions</button>
+        <button class="nav-menu-item" id="nav-import-exc-btn" style="display:none;" onclick="navTo('import-exceptions')">⚠️ Import Exceptions</button>
         <button class="nav-menu-item" id="nav-clients-btn" style="display:none;" onclick="navTo('clients')">📇 Clients</button>
         <button class="nav-menu-item" id="nav-audit-btn" style="display:none;" onclick="navTo('audit')">🛡️ Team Lead Change Log</button>
         <button class="nav-menu-item" id="nav-orders-dash-btn" style="display:none;" onclick="navTo('orders-dash')">📈 Orders Dashboard</button>
@@ -232,9 +232,9 @@
 
     <div style="padding: 16px 16px 0 16px;">
       <div id="toolbar">
-        <input type="file" id="import-file" style="display:none;">
+        <input type="file" id="import-file" accept=".xlsx,.csv" style="display:none;">
         <select id="import-on-behalf" style="display:none;"></select>
-        <button class="action-btn" id="import-btn" style="display:none;" onclick="document.getElementById('import-file').click()">Import Inventory CSV</button>
+        <button class="action-btn" id="import-btn" style="display:none;" onclick="document.getElementById('import-file').click()">Import Inventory</button>
         <button class="action-btn" id="run-assign-btn" style="display:none;" onclick="runAssignment()">Run Assignment Now</button>
         <button class="action-btn" id="clear-data-btn" style="display:none; background:var(--red);" onclick="clearAllData()">Clear All Data</button>
         <button class="action-btn" id="production-btn" style="display:none;" onclick="showProductionView()">Production</button>
@@ -278,7 +278,7 @@
       </div>
       <div id="import-exc-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px;">
         <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
-          <h3 style="margin:0;">\u26a0\ufe0f Import Exceptions</h3>
+          <h3 style="margin:0;">⚠️ Import Exceptions</h3>
           <label>From <input type="date" id="ie-date-from"></label>
           <label>To <input type="date" id="ie-date-to"></label>
           <label>Process <select id="ie-process"></select></label>
@@ -3284,6 +3284,7 @@ async function importCSV(e) {
   const data = await res.json();
   const lines = [`Imported ${data.imported} of ${data.total_rows} rows.`];
   const add = (n, text) => { if (n) lines.push(`\u2022 ${n} ${text}`); };
+  add(data.skipped_bar_grp, "skipped \u2014 Bar Grp \"Grp - 4 Gottlieb-Sound Phys\"");
   add(data.skipped_doc_type, "skipped \u2014 Def Doc Type not imported for this process");
   add(data.skipped_other_team_lead, "skipped \u2014 client belongs to another Team Lead");
   add(data.skipped_unassigned_client, "skipped \u2014 client not assigned to a Team Lead (reported to Admin / Super Admin)");
