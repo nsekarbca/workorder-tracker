@@ -8,7 +8,7 @@ from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Res
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import or_, and_, false as sa_false, func
 import csv
 import io
@@ -1086,7 +1086,13 @@ def delete_all_orders(
                 models.WorkOrder.submitted == True),  # noqa: E712
         ).all():
             _log_order_change(db, current_user, o, "delete", _order_lock_reasons(o), _order_snapshot(o))
-    deleted_count = db.query(models.WorkOrder).filter(models.WorkOrder.process_id == process_id).delete()
+    # A bulk .delete() skips the ORM cascade, so the child rows (clarification /
+    # escalation details) have to go first or Postgres rejects the delete with a
+    # foreign-key error (the "Internal Server Error").
+    ids = db.query(models.WorkOrder.id).filter(models.WorkOrder.process_id == process_id)
+    db.query(models.ClarificationDetail).filter(models.ClarificationDetail.order_id.in_(ids)).delete(synchronize_session=False)
+    db.query(models.EscalationDetail).filter(models.EscalationDetail.order_id.in_(ids)).delete(synchronize_session=False)
+    deleted_count = db.query(models.WorkOrder).filter(models.WorkOrder.process_id == process_id).delete(synchronize_session=False)
     db.commit()
     return {"deleted": deleted_count}
 
@@ -1599,7 +1605,8 @@ def list_orders(
     """Active queue for one process — orders already submitted to Production are hidden here for everyone."""
     _deny_quality(current_user)
     _require_view_access(current_user, process_id)
-    query = db.query(models.WorkOrder).filter(
+    query = db.query(models.WorkOrder).options(
+        selectinload(models.WorkOrder.clarification_detail), selectinload(models.WorkOrder.escalation_detail)).filter(
         models.WorkOrder.submitted == False,  # noqa: E712
         models.WorkOrder.process_id == process_id,
     )
@@ -1652,7 +1659,8 @@ def list_production_orders(
     tagged with its Team Lead.
     """
     _require_view_access(current_user, process_id)
-    query = db.query(models.WorkOrder).filter(
+    query = db.query(models.WorkOrder).options(
+        selectinload(models.WorkOrder.clarification_detail), selectinload(models.WorkOrder.escalation_detail)).filter(
         models.WorkOrder.submitted == True,  # noqa: E712
         models.WorkOrder.process_id == process_id,
     )
