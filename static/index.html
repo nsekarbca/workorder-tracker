@@ -4523,7 +4523,10 @@ function updateDraft(input) {
   if (role === "colleague" && field === "posting_status" && prevStatus === "Clarification" && value !== "Clarification") {
     delete drafts[id]["escalation_category"];
     delete drafts[id]["issue_raised_date"];
-    drafts[id]["poster_comment"] = null;
+    // ...unless the Team Lead has already answered in VENTRA Comment: then the
+    // Poster Comment is the other half of that conversation and must stay.
+    const hasVentra = orderForDraft && String(orderForDraft.ventra_comment || "").trim() !== "";
+    if (!hasVentra) drafts[id]["poster_comment"] = null;
   }
   const refocusSelect = (input.tagName === "SELECT" && document.activeElement === input && !pendingFocus);
 
