@@ -4588,6 +4588,28 @@ async function saveRow(orderId, btn) {
     return;
   }
 
+  const posted$ = Number(parseCurrency(finalPosted));
+  const barText = String(finalBar).trim();
+  const problems = [];
+  if (Math.abs(posted$) < 0.005) {
+    if (!/^0+$/.test(barText)) problems.push("BAR Batch must be 0 when Posted $ is 0");
+  } else if (!/^\d{7}$/.test(barText) || Number(barText) <= 0) {
+    problems.push("BAR Batch must be a 7-digit number when Posted $ is not 0");
+  }
+  if (/^\d+$/.test(barText) && Number(barText) > 0 && !(Number(finalTrans) > 0)) {
+    problems.push("Trans Count must be greater than 0 when BAR Batch is greater than 0");
+  }
+  const finalComment = draft.poster_comment !== undefined ? draft.poster_comment : order.poster_comment;
+  if (order.amount !== null && order.amount !== undefined && (finalStatus === "Completed" || finalStatus === "Clarification")
+      && Math.abs(Number(order.amount) - posted$) >= 0.005 && !String(finalComment || "").trim()) {
+    problems.push("Poster Comment is required when Pending $ is not 0");
+  }
+  if (problems.length) {
+    alert("Cannot save \u2014 " + problems.join("; "));
+    resetBtn();
+    return;
+  }
+
   if (finalStatus !== "Clarification") {
     const blocked = CLARIFICATION_ONLY_FIELDS.filter(f =>
       !(f === "poster_comment" && finalStatus === "Completed") &&
