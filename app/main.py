@@ -1867,6 +1867,32 @@ def update_colleague_fields(
             detail=f"Cannot save — missing required: {', '.join(missing_core)}",
         )
 
+    # Posting rules (colleague save):
+    #   * Posted $ <> 0  -> BAR Batch must be a 7-digit number
+    #     Posted $ = 0   -> BAR Batch must be 0
+    #   * BAR Batch > 0  -> Trans Count must be > 0
+    #   * Pending $ <> 0 -> Poster Comment is required (checked when the row is
+    #     being Completed or sent to Clarification, the only statuses where the
+    #     comment can be entered at all)
+    bar_text = str(final_bar_batch).strip()
+    problems = []
+    if abs(float(final_posted_amount)) < 0.005:
+        if bar_text not in ("0", "00", "0000000"):
+            problems.append("BAR Batch must be 0 when Posted $ is 0")
+    else:
+        if not (bar_text.isdigit() and len(bar_text) == 7 and int(bar_text) > 0):
+            problems.append("BAR Batch must be a 7-digit number when Posted $ is not 0")
+    bar_positive = bar_text.isdigit() and int(bar_text) > 0
+    if bar_positive and not (final_trans_count and final_trans_count > 0):
+        problems.append("Trans Count must be greater than 0 when BAR Batch is greater than 0")
+    if order.amount is not None and final_status in ("Completed", "Clarification"):
+        pending_now = float(order.amount) - float(final_posted_amount)
+        final_comment = payload_data.get("poster_comment", order.poster_comment)
+        if abs(pending_now) >= 0.005 and not (final_comment or "").strip():
+            problems.append("Poster Comment is required when Pending $ is not 0")
+    if problems:
+        raise HTTPException(status_code=400, detail="Cannot save \u2014 " + "; ".join(problems))
+
     # Poster Comment, Escalation Category, and Issue Raised Date only make
     # sense while a Clarification is open — locked both during In-Process
     # and once Completed. (VENTRA Comment and Issue Closed Date are excluded
