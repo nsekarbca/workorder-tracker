@@ -247,6 +247,8 @@ def login(
     token = auth.create_access_token({"sub": user.username})
     processes = db.query(models.Process).all() if user.role in ("super_admin", "quality") else user.processes
     if user.role == "colleague":
+        user.last_login_date = datetime.now(IST).date()     # logged in today -> eligible for auto-assignment
+        db.commit()
         for p in processes:
             _auto_assign_open_slots(db, p.id)
     return {
@@ -1515,7 +1517,7 @@ def _parse_float(v: Optional[str]) -> Optional[float]:
 
 def _auto_assign_open_slots(db: Session, process_id: int):
     """
-    For every colleague who has access to this process and currently has no
+    For every colleague who has access to this process, has logged in today (IST), and currently has no
     open (non-completed, non-escalated) order *in this process*, hand them
     the oldest unassigned order they're actually eligible for. An order
     imported by a Team Lead only goes to colleagues whose Reporting Manager
@@ -1532,7 +1534,12 @@ def _auto_assign_open_slots(db: Session, process_id: int):
     """
     colleagues = (
         db.query(models.User)
-        .filter(models.User.role == "colleague", models.User.processes.any(models.Process.id == process_id))
+        .filter(
+            models.User.role == "colleague",
+            models.User.processes.any(models.Process.id == process_id),
+            # Orders are only handed out to colleagues who have logged in today (IST).
+            models.User.last_login_date == datetime.now(IST).date(),
+        )
         .all()
     )
     if not colleagues:

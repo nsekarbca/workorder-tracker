@@ -218,6 +218,10 @@ class User(Base):
     reporting_manager = Column(String, nullable=True)
     employment_status = Column(String, nullable=False, default="Active")  # "Active" or "Inactive"
 
+    # IST date of the colleague's most recent login. Auto-assignment only offers
+    # orders to colleagues who have logged in today.
+    last_login_date = Column(Date, nullable=True)
+
     # Forgot-password flow: a short-lived token emailed to the user, cleared
     # once used or once a new one is issued.
     reset_token = Column(String, nullable=True)
