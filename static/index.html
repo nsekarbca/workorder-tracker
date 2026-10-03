@@ -220,6 +220,7 @@
         <button class="nav-menu-item" id="nav-production-btn" style="display:none;" onclick="navTo('production')">📦 Production</button>
         <button class="nav-menu-item" id="nav-escalations-btn" style="display:none;" onclick="navTo('escalations')">🚨 Escalations</button>
         <button class="nav-menu-item" id="nav-admin-btn" style="display:none;" onclick="navTo('admin')">⚙️ Admin</button>
+        <button class="nav-menu-item" id="nav-profile-btn" style="display:none;" onclick="navTo('profile')">👤 My Profile</button>
         <button class="nav-menu-item" id="nav-switch-process-btn" style="display:none;" onclick="navTo('switch')">🔀 Switch Process</button>
       </div>
       <div>
@@ -544,6 +545,31 @@
       </div>
     </div>
     <div id="grid-container"></div>
+  </div>
+</div>
+
+<div id="profile-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:100; align-items:center; justify-content:center;">
+  <div style="background:white; border-radius:8px; padding:20px; width:520px; max-width:92vw; max-height:88vh; overflow-y:auto;">
+    <h3 style="margin-top:0;">👤 My Profile</h3>
+    <p style="font-size:12px; color:#666; margin-top:0;">Only Date of Birth and Anniversary Date can be changed here. Other details are managed by your Super Admin.</p>
+    <div class="form-grid">
+      <label>Name <input id="pf-name" disabled></label>
+      <label>Username <input id="pf-username" disabled></label>
+      <label>Role <input id="pf-role" disabled></label>
+      <label>Employee ID <input id="pf-employee-id" disabled></label>
+      <label>Email <input id="pf-email" disabled></label>
+      <label>Designation <input id="pf-designation" disabled></label>
+      <label>Reporting Manager <input id="pf-manager" disabled></label>
+      <label>Date of Joining <input id="pf-doj" type="date" disabled></label>
+      <label>Processes <input id="pf-processes" disabled></label>
+      <span></span>
+      <label>Date of Birth <input id="pf-dob" type="date"></label>
+      <label>Anniversary Date <input id="pf-anniversary" type="date"></label>
+    </div>
+    <div style="margin-top:14px;">
+      <button class="action-btn" onclick="saveProfileDates()">Save</button>
+      <button class="action-btn" style="background:#888;" onclick="closeProfileModal()">Close</button>
+    </div>
   </div>
 </div>
 
@@ -1261,6 +1287,7 @@ function showApp() {
     document.getElementById("nav-batch-btn").style.display = "block";
   }
   // Clients (view-only): colleague, Team Lead, Admin, Super Admin — not the Quality profile.
+  document.getElementById("nav-profile-btn").style.display = role === "super_admin" ? "none" : "block";
   document.getElementById("nav-clients-btn").style.display = role === "quality" ? "none" : "block";
   // Import Exceptions: Team Lead (their "already completed" notices), Admin, Super Admin.
   document.getElementById("nav-import-exc-btn").style.display = (role === "team_lead" || role === "admin" || role === "super_admin") ? "block" : "none";
@@ -1303,6 +1330,41 @@ function navTo(dest) {
   else if (dest === "escalations") showEscalationsView();
   else if (dest === "admin") showAdminView();
   else if (dest === "switch") showProcessSwitcher();
+  else if (dest === "profile") openProfileModal();
+}
+
+// ---- My Profile: everything is read-only except Date of Birth and Anniversary Date ----
+async function openProfileModal() {
+  const res = await authFetch("/auth/me");
+  if (!res.ok) { alert("Couldn't load your profile: " + (await res.text())); return; }
+  const u = await res.json();
+  const set = (id, v) => { document.getElementById(id).value = v || ""; };
+  set("pf-name", u.full_name); set("pf-username", u.username); set("pf-role", (u.role || "").replace("_", " "));
+  set("pf-employee-id", u.employee_id); set("pf-email", u.email); set("pf-designation", u.designation);
+  set("pf-manager", u.reporting_manager); set("pf-doj", u.doj);
+  set("pf-processes", (u.processes || []).map(p => p.name).join(", "));
+  set("pf-dob", u.dob); set("pf-anniversary", u.anniversary_date);
+  document.getElementById("pf-dob").max = _isoLocalDate(new Date());
+  document.getElementById("pf-anniversary").max = _isoLocalDate(new Date());
+  document.getElementById("profile-modal").style.display = "flex";
+}
+function closeProfileModal() { document.getElementById("profile-modal").style.display = "none"; }
+async function saveProfileDates() {
+  const body = {
+    dob: document.getElementById("pf-dob").value || null,
+    anniversary_date: document.getElementById("pf-anniversary").value || null,
+  };
+  const res = await authFetch("/auth/me/profile", {
+    method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    let msg = await res.text();
+    try { msg = JSON.parse(msg).detail || msg; } catch (e) {}
+    alert("Couldn't save: " + msg);
+    return;
+  }
+  closeProfileModal();
+  alert("Profile updated.");
 }
 
 
