@@ -395,3 +395,35 @@ class ClientProcessTeamLead(Base):
     client_id = Column(Integer, ForeignKey("clients.id", ondelete="CASCADE"), nullable=False, index=True)
     process_id = Column(Integer, ForeignKey("processes.id"), nullable=False)
     team_lead_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+
+class ImportException(Base):
+    """
+    Rows an inventory import deliberately did NOT bring in and that someone
+    should know about (shown under "Import Exceptions"):
+      unassigned_client   the row's client isn't in the client list, or has no
+                          Team Lead for this process  -> Admin / Super Admin
+      duplicate_completed the EDM was already imported in the last month and
+                          is Completed                 -> Team Lead / Admin / Super Admin
+    One entry per document: the same EDM isn't logged again within 30 days.
+    """
+    __tablename__ = "import_exceptions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    created_at = Column(DateTime, nullable=False, index=True)    # IST, set in code
+    process_id = Column(Integer, nullable=True, index=True)
+    kind = Column(String, nullable=False, index=True)            # unassigned_client | duplicate_completed
+    edm = Column(String, nullable=True, index=True)
+    division_raw = Column(String, nullable=True)                 # what the file's Division column said
+    facility_no = Column(String, nullable=True)                  # matched client, if any
+    client_name = Column(String, nullable=True)
+    def_doc_type = Column(String, nullable=True)
+    amount = Column(Float, nullable=True)
+    reason = Column(String, nullable=True)
+    imported_by_id = Column(Integer, nullable=True)
+    imported_by_name = Column(String, nullable=True)
+    imported_by_role = Column(String, nullable=True)
+    team_lead_id = Column(Integer, nullable=True, index=True)    # the Team Lead this row was meant for (if known)
+    existing_order_id = Column(Integer, nullable=True)           # duplicate_completed: the order already done
+    existing_posted_date = Column(Date, nullable=True)
+    existing_employee_name = Column(String, nullable=True)

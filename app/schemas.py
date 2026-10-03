@@ -514,3 +514,29 @@ class ClientBulkAssign(BaseModel):
 class ClientBulkResult(BaseModel):
     updated: int                              # client x process assignments set / cleared
     skipped_processes: List[str] = []         # processes the Team Lead doesn't work on
+
+
+# ---- Import Exceptions (Team Lead / Admin / Super Admin) ----
+class ImportExceptionOut(BaseModel):
+    id: int
+    created_at: datetime
+    process_id: Optional[int] = None
+    process_name: Optional[str] = None
+    kind: str
+    edm: Optional[str] = None
+    division_raw: Optional[str] = None
+    facility_no: Optional[str] = None
+    client_name: Optional[str] = None
+    def_doc_type: Optional[str] = None
+    amount: Optional[float] = None
+    reason: Optional[str] = None
+    imported_by_name: Optional[str] = None
+    imported_by_role: Optional[str] = None
+    team_lead_id: Optional[int] = None
+    team_lead_name: Optional[str] = None
+    existing_order_id: Optional[int] = None
+    existing_posted_date: Optional[date] = None
+    existing_employee_name: Optional[str] = None
+
+    class Config:
+        from_attributes = True

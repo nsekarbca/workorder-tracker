@@ -1,6 +1,7 @@
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
 from dateutil import parser as date_parser
+from dateutil.relativedelta import relativedelta
 import secrets
 
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Response
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_, and_, false as sa_false, func
 import csv
 import io
+import re
 import base64
 
 import os
@@ -1112,6 +1114,48 @@ def delete_one_order(
 # Inventory import (E-O) — Team Lead bulk-loads from the existing Excel export
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Inventory import rules
+# ---------------------------------------------------------------------------
+
+# EDM process: only these Def Doc Types are imported (compared ignoring case / extra spaces).
+EDM_ALLOWED_DOC_TYPES = {"manual eft eob", "lockbox payment", "insurance credit card pmt only"}
+DUPLICATE_LOOKBACK_MONTHS = 1      # an EDM already imported within this window is not imported again
+EXCEPTION_DEDUPE_DAYS = 30         # the same EDM isn't logged twice as an exception within this many days
+
+
+def _norm_text(v) -> str:
+    return " ".join((v or "").split()).lower()
+
+
+def _norm_edm(v) -> str:
+    return (v or "").strip().upper()
+
+
+def _norm_facility(v) -> str:
+    t = (v or "").strip()
+    return str(int(t)) if t.isdigit() else t
+
+
+def _client_for_row(division, by_no: dict, by_name: dict):
+    """
+    Which client an inventory row belongs to, from its Division column:
+      1. the value is a Facility No ("120", "0120")
+      2. a Facility No appears as a number inside the text ("Facility 120 - ...")
+      3. the value is exactly a client name (only if that name is unique)
+    Returns the Client or None. This is the one place that decides it.
+    """
+    text = (division or "").strip()
+    if not text:
+        return None
+    if _norm_facility(text) in by_no:
+        return by_no[_norm_facility(text)]
+    for tok in re.findall(r"\d+", text):
+        if _norm_facility(tok) in by_no:
+            return by_no[_norm_facility(tok)]
+    return by_name.get(_norm_text(text))
+
+
 @app.post("/orders/import")
 def import_inventory(
     process_id: int,
@@ -1123,20 +1167,35 @@ def import_inventory(
     """
     Accepts a CSV with columns matching E-O:
     edm,status,created,image_count,doc_count,def_doc_type,amount,description,division,deposit_date
-    Creates one unassigned WorkOrder row per line, tagged to this process.
-    Orders imported by a Team Lead are tagged to that Team Lead, so
-    auto-assignment only offers them to colleagues reporting to that same
-    Team Lead. An Admin can import on a specific Team Lead's behalf (e.g.
-    covering for one who's out) by passing on_behalf_of_team_lead_id, which
-    tags the import exactly as if that Team Lead had done it themselves.
-    A Super Admin, or an Admin importing without specifying a Team Lead,
-    leaves the order open to any colleague in the process.
+    Creates one unassigned WorkOrder row per accepted line, tagged to this process.
+
+    Which rows are accepted:
+      * Client: a row is imported only if its client (matched from the
+        Division column) is assigned to a Team Lead for this process.
+        - A Team Lead (or an Admin importing on a Team Lead's behalf) gets
+          only that Team Lead's clients; rows for another Team Lead's
+          clients are skipped quietly (that Team Lead imports them).
+        - A Super Admin, or an Admin with no Team Lead chosen, imports
+          everything that is assigned, each row tagged to ITS client's Team Lead.
+        - A client that isn't in the client list, or has no Team Lead for
+          this process, is NOT imported and is logged under Import
+          Exceptions for Admin / Super Admin.
+      * EDM process only:
+        - Def Doc Type must be Manual Eft Eob, Lockbox Payment or
+          Insurance Credit Card Pmt Only; anything else is skipped.
+        - The EDM must not already exist in this process from the last
+          month. If it exists and is In-Process / Clarification / blank it
+          is skipped quietly; if it is Completed it is skipped AND logged
+          under Import Exceptions for the Team Lead, Admin and Super Admin.
+          A repeat of an EDM inside the same file is skipped too.
+    Orders imported for a Team Lead are tagged to them, so auto-assignment
+    only offers them to colleagues reporting to that Team Lead.
     """
     _require_process_access(current_user, process_id)
 
-    resolved_team_lead_id = None
+    fixed_team_lead_id = None       # set when the whole file is imported for one Team Lead
     if current_user.role == "team_lead":
-        resolved_team_lead_id = current_user.id
+        fixed_team_lead_id = current_user.id
     elif current_user.role == "admin" and on_behalf_of_team_lead_id is not None:
         delegate = (
             db.query(models.User)
@@ -1149,18 +1208,112 @@ def import_inventory(
         )
         if not delegate:
             raise HTTPException(status_code=400, detail="Not a valid Team Lead for this process")
-        resolved_team_lead_id = delegate.id
+        fixed_team_lead_id = delegate.id
 
-    content = file.file.read().decode("utf-8-sig")
-    reader = csv.DictReader(io.StringIO(content))
-    created_count = 0
+    process = db.query(models.Process).filter(models.Process.id == process_id).first()
+    is_edm = bool(process and process.name.strip().upper() == "EDM")
+
+    # Client -> Team Lead for this process
+    clients = db.query(models.Client).all()
+    by_no = {_norm_facility(c.facility_no): c for c in clients}
+    name_counts = {}
+    for c in clients:
+        name_counts[_norm_text(c.client_name)] = name_counts.get(_norm_text(c.client_name), 0) + 1
+    by_name = {_norm_text(c.client_name): c for c in clients if name_counts[_norm_text(c.client_name)] == 1}
+    client_tl = {
+        a.client_id: a.team_lead_id
+        for a in db.query(models.ClientProcessTeamLead).filter(models.ClientProcessTeamLead.process_id == process_id).all()
+    }
+
+    # EDMs already imported in the lookback window (EDM process)
     # IST, not the server's own (UTC) date — see todays_celebrations for
     # why: near IST midnight the two disagree on which calendar day it is.
     today = datetime.now(IST).date()
+    existing = {}
+    if is_edm:
+        cutoff = today - relativedelta(months=DUPLICATE_LOOKBACK_MONTHS)
+        for o in db.query(
+            models.WorkOrder.id, models.WorkOrder.edm, models.WorkOrder.posting_status,
+            models.WorkOrder.posted_date, models.WorkOrder.employee_name,
+        ).filter(
+            models.WorkOrder.process_id == process_id,
+            models.WorkOrder.received_date >= cutoff,
+            models.WorkOrder.edm.isnot(None),
+        ).all():
+            existing.setdefault(_norm_edm(o.edm), []).append(o)
+
+    content = file.file.read().decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(content))
+    counts = {
+        "total_rows": 0, "imported": 0,
+        "skipped_doc_type": 0, "skipped_other_team_lead": 0, "skipped_unassigned_client": 0,
+        "skipped_duplicate_open": 0, "skipped_duplicate_in_file": 0, "skipped_duplicate_completed": 0,
+    }
+    exceptions = []
+    seen_in_file = set()
+    now_ist = datetime.now(IST).replace(tzinfo=None)
+
+    def log_exception(kind, row, client, reason, team_lead_id, existing_order=None):
+        exceptions.append(models.ImportException(
+            created_at=now_ist, process_id=process_id, kind=kind,
+            edm=(row.get("edm") or "").strip() or None,
+            division_raw=(row.get("division") or "").strip() or None,
+            facility_no=client.facility_no if client else None,
+            client_name=client.client_name if client else None,
+            def_doc_type=(row.get("def_doc_type") or "").strip() or None,
+            amount=_parse_float(row.get("amount")),
+            reason=reason,
+            imported_by_id=current_user.id, imported_by_name=current_user.full_name, imported_by_role=current_user.role,
+            team_lead_id=team_lead_id,
+            existing_order_id=existing_order.id if existing_order else None,
+            existing_posted_date=existing_order.posted_date if existing_order else None,
+            existing_employee_name=existing_order.employee_name if existing_order else None,
+        ))
+
     for row in reader:
-        order = models.WorkOrder(
+        counts["total_rows"] += 1
+
+        # 1) EDM process: only the allowed Def Doc Types
+        if is_edm and _norm_text(row.get("def_doc_type")) not in EDM_ALLOWED_DOC_TYPES:
+            counts["skipped_doc_type"] += 1
+            continue
+
+        # 2) the client must be assigned to a Team Lead for this process
+        client = _client_for_row(row.get("division"), by_no, by_name)
+        row_tl = client_tl.get(client.id) if client else None
+        if row_tl is None:
+            counts["skipped_unassigned_client"] += 1
+            log_exception(
+                "unassigned_client", row, client,
+                "No Team Lead assigned for this process" if client else "Client not found in the client list",
+                fixed_team_lead_id,
+            )
+            continue
+        if fixed_team_lead_id is not None and row_tl != fixed_team_lead_id:
+            counts["skipped_other_team_lead"] += 1      # someone else's client; they import it
+            continue
+
+        # 3) EDM process: not already imported in the last month, nor repeated in this file
+        edm_key = _norm_edm(row.get("edm"))
+        if is_edm and edm_key:
+            if edm_key in seen_in_file:
+                counts["skipped_duplicate_in_file"] += 1
+                continue
+            seen_in_file.add(edm_key)
+            prior = existing.get(edm_key)
+            if prior:
+                done = [o for o in prior if o.posting_status == "Completed"]
+                if done:
+                    counts["skipped_duplicate_completed"] += 1
+                    latest = max(done, key=lambda o: (o.posted_date or date.min, o.id))
+                    log_exception("duplicate_completed", row, client, "EDM already Completed", row_tl, existing_order=latest)
+                else:
+                    counts["skipped_duplicate_open"] += 1     # In-Process / Clarification / blank: already in the system
+                continue
+
+        db.add(models.WorkOrder(
             process_id=process_id,
-            team_lead_id=resolved_team_lead_id,
+            team_lead_id=row_tl,
             received_date=today,
             edm=row.get("edm") or None,
             status=row.get("status") or None,
@@ -1173,12 +1326,71 @@ def import_inventory(
             division=row.get("division") or None,
             deposit_date=_parse_date(row.get("deposit_date")),
             last_edited_by=current_user.username,
-        )
-        db.add(order)
-        created_count += 1
+        ))
+        counts["imported"] += 1
+
+    # One exception per document: skip any EDM already logged for this process recently.
+    if exceptions:
+        recent = {
+            (e.kind, _norm_edm(e.edm))
+            for e in db.query(models.ImportException.kind, models.ImportException.edm).filter(
+                models.ImportException.process_id == process_id,
+                models.ImportException.created_at >= now_ist - timedelta(days=EXCEPTION_DEDUPE_DAYS),
+                models.ImportException.edm.isnot(None),
+            ).all()
+        }
+        logged = set()
+        for e in exceptions:
+            key = (e.kind, _norm_edm(e.edm))
+            if e.edm and (key in recent or key in logged):
+                continue
+            logged.add(key)
+            db.add(e)
     db.commit()
     _auto_assign_open_slots(db, process_id)
-    return {"imported": created_count}
+    return counts
+
+
+# Import Exceptions list: Team Leads see their own "already completed" notices;
+# Admin and Super Admin see everything.
+@app.get("/import-exceptions", response_model=List[schemas.ImportExceptionOut])
+def list_import_exceptions(
+    kind: Optional[str] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    process_id: Optional[int] = None,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    Rows the inventory import skipped that someone should know about,
+    newest first (at most 5,000). kind = unassigned_client | duplicate_completed.
+    Team Lead: only "duplicate_completed" for rows meant for them.
+    Admin / Super Admin: both kinds, all Team Leads and processes.
+    """
+    if kind is not None and kind not in ("unassigned_client", "duplicate_completed"):
+        raise HTTPException(status_code=400, detail="Unknown kind")
+    q = db.query(models.ImportException)
+    if current_user.role == "team_lead":
+        q = q.filter(models.ImportException.kind == "duplicate_completed", models.ImportException.team_lead_id == current_user.id)
+    if kind:
+        q = q.filter(models.ImportException.kind == kind)
+    if process_id is not None:
+        q = q.filter(models.ImportException.process_id == process_id)
+    if start_date:
+        q = q.filter(models.ImportException.created_at >= datetime.combine(start_date, datetime.min.time()))
+    if end_date:
+        q = q.filter(models.ImportException.created_at < datetime.combine(end_date + timedelta(days=1), datetime.min.time()))
+    rows = q.order_by(models.ImportException.created_at.desc(), models.ImportException.id.desc()).limit(5000).all()
+    pnames = {p.id: p.name for p in db.query(models.Process).all()}
+    tlnames = {u.id: u.full_name for u in db.query(models.User.id, models.User.full_name).filter(models.User.role == "team_lead").all()}
+    out = []
+    for r in rows:
+        item = schemas.ImportExceptionOut.model_validate(r)
+        item.process_name = pnames.get(r.process_id)
+        item.team_lead_name = tlnames.get(r.team_lead_id)
+        out.append(item)
+    return out
 
 
 def _parse_date(v: Optional[str]) -> Optional[date]:
