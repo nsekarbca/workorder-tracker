@@ -27,6 +27,8 @@
   header .brand .wordmark { font-size: 20px; font-weight: 700; letter-spacing: .5px; color: var(--navy); }
   header .brand .wordmark span { color: var(--accent); }
   header .app-title { font-size: 19px; font-weight: 700; letter-spacing: .3px; color: var(--navy); margin-left: 12px; border-left: 2px solid var(--accent); padding-left: 12px; line-height: 1.2; user-select: none; }
+  header .app-title em { font-style: normal; color: #f26a21; }
+  header .app-title { border-left-color: #f26a21; }
   #login-screen, #change-password-screen, #process-select-screen, #forgot-screen, #reset-token-screen { max-width: 360px; margin: 70px auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.12); }
   #login-screen h2, #change-password-screen h2, #process-select-screen h2, #forgot-screen h2, #reset-token-screen h2 { margin-top: 0; color: var(--navy); }
   #login-screen input, #login-screen select, #change-password-screen input, #forgot-screen input, #reset-token-screen input { width: 100%; padding: 8px; margin: 6px 0 14px; border: 1px solid #ccc; border-radius: 4px; }
@@ -85,6 +87,11 @@
   .clarification-link { font-size: 11px; margin-left: 4px; white-space: nowrap; }
   textarea.cell-comment { width: 200px; min-height: 32px; font-size: 12px; padding: 3px 5px; font-family: inherit; white-space: normal; resize: vertical; }
   #toolbar { margin-bottom: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+
+  .profile-pill { display:inline-flex; align-items:center; gap:8px; padding:4px 16px 4px 4px; margin-right:6px; border:none; border-radius:999px; cursor:pointer; font-size:13px; font-weight:600; color:#fff;
+    background: linear-gradient(180deg, #2f8cf0 0%, #1c5fc4 55%, #0b3b8f 100%); box-shadow: 0 2px 6px rgba(11,59,143,.35), inset 0 1px 0 rgba(255,255,255,.35); transition: transform .12s, box-shadow .12s; vertical-align: middle; }
+  .profile-pill:hover { transform: translateY(-1px); box-shadow: 0 4px 10px rgba(11,59,143,.45), inset 0 1px 0 rgba(255,255,255,.35); }
+  .profile-pill .pp-avatar { width:26px; height:26px; border-radius:50%; background: linear-gradient(180deg,#ffffff,#cfe3ff); color:#1c5fc4; display:inline-flex; align-items:center; justify-content:center; box-shadow: inset 0 -2px 3px rgba(11,59,143,.25); }
   .badge { background: #eee; color: #222; padding: 4px 10px; border-radius: 12px; font-size: 12px; }
   .process-badge { background: var(--accent); color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; }
   #error-msg { color: #c0392b; font-size: 13px; min-height: 18px; }
@@ -207,7 +214,7 @@
         <button id="menu-btn" class="menu-btn" onclick="toggleMenu(event)" aria-label="Menu">☰</button>
         <img src="logo.png" alt="Ventra Health" onerror="this.style.display='none'; document.getElementById('app-wordmark').style.display='block';">
         <div id="app-wordmark" style="display:none;" class="wordmark">VENTRA<span>HEALTH</span></div>
-        <span class="app-title">Work Order Allocation Tracker</span>
+        <span class="app-title">Work Order Allocation <em>Tracker</em></span>
       </div>
       <div id="nav-menu" class="nav-menu" style="display:none;">
         <button class="nav-menu-item" onclick="navTo('home')">🏠 Home</button>
@@ -227,7 +234,7 @@
         <span id="process-badge" class="process-badge" style="display:none;"></span>
         <span id="whoami" class="badge"></span>
         <button class="action-btn" id="admin-btn" style="display:none;" onclick="showAdminView()">Admin</button>
-        <button class="action-btn" id="header-profile-btn" style="display:none; line-height:1.2; align-items:center; gap:6px;" title="My Profile" onclick="openProfileModal()"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" style="vertical-align:-2px; margin-right:5px;"><circle cx="12" cy="8" r="4.5"/><path d="M3.5 21c0-4.6 3.8-8 8.5-8s8.5 3.4 8.5 8z"/></svg>My Profile</button>
+        <button id="header-profile-btn" class="profile-pill" style="display:none;" title="My Profile" onclick="openProfileModal()"><span class="pp-avatar"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="8" r="4.2"/><path d="M4 21c0-4.4 3.6-7.5 8-7.5s8 3.1 8 7.5z"/></svg></span><span>My Profile</span></button>
         <button class="action-btn" onclick="logout()">Log out</button>
       </div>
     </header>
@@ -1289,7 +1296,7 @@ function showApp() {
   }
   // Clients (view-only): colleague, Team Lead, Admin, Super Admin — not the Quality profile.
   document.getElementById("nav-profile-btn").style.display = role === "super_admin" ? "none" : "block";
-  document.getElementById("header-profile-btn").style.display = role === "super_admin" ? "none" : "inline-block";
+  document.getElementById("header-profile-btn").style.display = role === "super_admin" ? "none" : "inline-flex";
   document.getElementById("nav-clients-btn").style.display = role === "quality" ? "none" : "block";
   // Import Exceptions: Team Lead (their "already completed" notices), Admin, Super Admin.
   document.getElementById("nav-import-exc-btn").style.display = (role === "team_lead" || role === "admin" || role === "super_admin") ? "block" : "none";
