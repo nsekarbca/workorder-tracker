@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Date, DateTime, ForeignKey, Boolean, Table, JSON, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Float, Date, DateTime, ForeignKey, Boolean, Table, JSON, UniqueConstraint, Text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from .database import Base
@@ -302,6 +302,16 @@ class WorkOrder(Base):
     clarification_detail = relationship("ClarificationDetail", uselist=False, cascade="all, delete-orphan")
     escalation_detail = relationship("EscalationDetail", uselist=False, cascade="all, delete-orphan")
 
+    # Onshore hand-off (escalation categories Patient not found / Invoice
+    # Creation / Clarification only). onshore_status: NULL = never sent,
+    # "with_onshore" = waiting for the Onshore team, "red" = Onshore answered
+    # (Team Lead review), "yellow" = Onshore needs more information from the
+    # Team Lead, "green" = Team Lead resolved it.
+    onshore_status = Column(String, nullable=True, index=True)
+    onshore_comment = Column(Text, nullable=True)       # Onshore's latest comment / question
+    onshore_tl_reply = Column(Text, nullable=True)      # Team Lead's latest answer to a yellow request
+    onshore_sent_at = Column(DateTime, nullable=True)
+
     # "Time Taken" tracking — active working time only, not wall-clock
     # time since assignment. Starts "not_started" when an order is
     # (auto- or re-)assigned and only runs once the colleague clicks Start; time_taken_seconds accumulates each time the
@@ -438,3 +448,17 @@ class ImportException(Base):
     existing_order_id = Column(Integer, nullable=True)           # duplicate_completed: the order already done
     existing_posted_date = Column(Date, nullable=True)
     existing_employee_name = Column(String, nullable=True)
+
+
+class OnshoreMessage(Base):
+    """History of an order's Onshore hand-off: sent, Onshore replies (red / yellow), Team Lead info, resolved."""
+    __tablename__ = "onshore_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, nullable=False, index=True)     # not a foreign key: survives order deletion
+    created_at = Column(DateTime, nullable=False)              # IST
+    author_id = Column(Integer, nullable=True)
+    author_name = Column(String, nullable=True)
+    author_role = Column(String, nullable=True)
+    kind = Column(String, nullable=False)                      # sent | onshore_red | onshore_yellow | tl_info | resolved
+    text = Column(Text, nullable=True)

@@ -28,6 +28,10 @@ Base.metadata.create_all(bind=engine)
 # start, which means a deploy no longer depends on someone running the ALTER by hand.
 _ADDED_COLUMNS = [
     ("users", "last_login_date", "DATE"),
+    ("work_orders", "onshore_status", "VARCHAR"),
+    ("work_orders", "onshore_comment", "TEXT"),
+    ("work_orders", "onshore_tl_reply", "TEXT"),
+    ("work_orders", "onshore_sent_at", "TIMESTAMP"),
     ("daily_batch_stats", "pending_hours", "DOUBLE PRECISION"),
     ("daily_batch_stats", "hours_status", "VARCHAR"),
     ("daily_batch_stats", "hours_decided_by", "VARCHAR"),
@@ -274,10 +278,12 @@ def login(
     if user.employment_status == "Inactive":
         raise HTTPException(status_code=403, detail="This account is inactive")
     # Quality (view/export Production only) can open any process; everyone else needs it assigned.
-    if process_id is not None and user.role != "quality" and not _user_has_process(user, process_id):
+    if process_id is not None and user.role not in ("quality", "onshore") and not _user_has_process(user, process_id):
         raise HTTPException(status_code=403, detail="You don't have access to that process")
     token = auth.create_access_token({"sub": user.username})
     processes = db.query(models.Process).all() if user.role in ("super_admin", "quality") else user.processes
+    if user.role == "onshore":
+        processes = []          # the Onshore queue spans every process; no process picker
     if user.role == "colleague":
         user.last_login_date = datetime.now(IST).date()     # logged in today -> eligible for auto-assignment
         db.commit()
@@ -317,11 +323,11 @@ def read_me(current_user: models.User = Depends(auth.get_current_user)):
 @app.put("/auth/me/profile", response_model=schemas.UserOut)
 def update_my_profile(
     payload: schemas.ProfileDatesUpdate,
-    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "quality")),
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "quality", "onshore")),
     db: Session = Depends(get_db),
 ):
     """
-    Self-service profile edit for Colleague, Team Lead, Admin and Quality:
+    Self-service profile edit for Colleague, Team Lead, Admin, Quality and Onshore:
     ONLY Date of Birth and Anniversary Date. Everything else on the profile
     (name, role, email, designation, reporting manager, DOJ, processes ...)
     stays Super Admin-only, and no other field is read from this request.
@@ -463,8 +469,8 @@ def create_user(
     for this deployment) — the temporary password is returned in this
     response so the Super Admin can relay it to the new user directly.
     """
-    if payload.role not in ("colleague", "team_lead", "admin", "quality", "super_admin"):
-        raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', 'admin', 'quality', or 'super_admin'")
+    if payload.role not in ("colleague", "team_lead", "admin", "quality", "onshore", "super_admin"):
+        raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', 'admin', 'quality', 'onshore', or 'super_admin'")
     if db.query(models.User).filter(models.User.username == payload.username).first():
         raise HTTPException(status_code=400, detail="username already exists")
 
@@ -505,8 +511,8 @@ def update_user(
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    if payload.role not in ("colleague", "team_lead", "admin", "quality", "super_admin"):
-        raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', 'admin', 'quality', or 'super_admin'")
+    if payload.role not in ("colleague", "team_lead", "admin", "quality", "onshore", "super_admin"):
+        raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', 'admin', 'quality', 'onshore', or 'super_admin'")
 
     user.full_name = payload.full_name
     user.role = payload.role
@@ -1152,6 +1158,7 @@ def delete_all_orders(
     # escalation details) have to go first or Postgres rejects the delete with a
     # foreign-key error (the "Internal Server Error").
     ids = db.query(models.WorkOrder.id).filter(models.WorkOrder.process_id == process_id)
+    db.query(models.OnshoreMessage).filter(models.OnshoreMessage.order_id.in_(ids)).delete(synchronize_session=False)
     db.query(models.ClarificationDetail).filter(models.ClarificationDetail.order_id.in_(ids)).delete(synchronize_session=False)
     db.query(models.EscalationDetail).filter(models.EscalationDetail.order_id.in_(ids)).delete(synchronize_session=False)
     deleted_count = db.query(models.WorkOrder).filter(models.WorkOrder.process_id == process_id).delete(synchronize_session=False)
@@ -2170,6 +2177,8 @@ def _deny_quality(user: models.User):
     """Quality can only view / export Production — nothing else."""
     if user.role == "quality":
         raise HTTPException(status_code=403, detail="The Quality profile can only view Production data")
+    if user.role == "onshore":
+        raise HTTPException(status_code=403, detail="The Onshore profile can only work the Onshore queue")
 
 
 def _attach_team_leads(db: Session, orders: list, prefer: str = "owner") -> list:
@@ -3227,7 +3236,15 @@ def resolve_escalation(
     if not order.escalated:
         raise HTTPException(status_code=400, detail="This order isn't currently escalated")
 
-    comment = payload.ventra_comment.strip()
+    if order.onshore_status in ("with_onshore", "yellow"):
+        raise HTTPException(status_code=400, detail="This escalation is with the Onshore team \u2014 it can be resolved once they respond (red)")
+    if order.onshore_status == "red":
+        # The Onshore team's answer becomes the VENTRA Comment, and their circle turns green.
+        comment = (order.onshore_comment or "").strip()
+        order.onshore_status = "green"
+        _add_onshore_message(db, current_user, order, "resolved", comment)
+    else:
+        comment = (payload.ventra_comment or "").strip()
     if not comment:
         raise HTTPException(status_code=400, detail="VENTRA Comment can't be empty")
 
@@ -3241,6 +3258,149 @@ def resolve_escalation(
     db.commit()
     db.refresh(order)
     return order
+
+
+# ---------------------------------------------------------------------------
+# Onshore team: escalations a Team Lead couldn't resolve (Patient not found,
+# Invoice Creation, Clarification only)
+#   Team Lead  --send-->  Onshore queue (with_onshore)
+#   Onshore    --red-->   back to the Team Lead for review (their comment)
+#   Onshore    --yellow-> needs more information; the Team Lead answers and it
+#                         goes back to Onshore (with_onshore)
+#   Team Lead  --Resolve--> Onshore comment becomes the VENTRA Comment, green
+# ---------------------------------------------------------------------------
+
+ONSHORE_CATEGORIES = ("Patient not found", "Invoice Creation", "Clarification")
+
+
+def _add_onshore_message(db: Session, user: models.User, order: models.WorkOrder, kind: str, text: Optional[str]):
+    db.add(models.OnshoreMessage(
+        order_id=order.id, created_at=datetime.now(IST).replace(tzinfo=None),
+        author_id=user.id, author_name=user.full_name, author_role=user.role, kind=kind, text=text,
+    ))
+
+
+def _lead_escalation_order(db: Session, user: models.User, order_id: int) -> models.WorkOrder:
+    """The escalated order a Team Lead (or Super Admin) is acting on — their own team's only."""
+    order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    _require_process_access(user, order.process_id)
+    if user.role == "team_lead" and order.team_lead_id != user.id:
+        raise HTTPException(status_code=403, detail="This order belongs to another Team Lead")
+    if not order.escalated:
+        raise HTTPException(status_code=400, detail="This order isn't currently escalated")
+    return order
+
+
+@app.post("/orders/{order_id}/send-to-onshore", response_model=schemas.WorkOrderOut)
+def send_to_onshore(
+    order_id: int,
+    payload: schemas.OnshoreSend,
+    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Team Lead couldn't resolve it: move the escalation to the Onshore team's queue."""
+    order = _lead_escalation_order(db, current_user, order_id)
+    if order.escalation_category not in ONSHORE_CATEGORIES:
+        raise HTTPException(status_code=400, detail="Only Patient not found, Invoice Creation and Clarification can go to the Onshore team")
+    if order.onshore_status is not None:
+        raise HTTPException(status_code=400, detail="This escalation has already been sent to the Onshore team")
+    order.onshore_status = "with_onshore"
+    order.onshore_sent_at = datetime.now(IST).replace(tzinfo=None)
+    order.onshore_comment = None
+    order.onshore_tl_reply = None
+    _add_onshore_message(db, current_user, order, "sent", (payload.note or "").strip() or None)
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+@app.post("/orders/{order_id}/onshore-info", response_model=schemas.WorkOrderOut)
+def onshore_info(
+    order_id: int,
+    payload: schemas.OnshoreInfo,
+    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Onshore asked for more information (yellow): the Team Lead answers and it returns to Onshore."""
+    order = _lead_escalation_order(db, current_user, order_id)
+    if order.onshore_status != "yellow":
+        raise HTTPException(status_code=400, detail="The Onshore team hasn't asked for information on this order")
+    text_ = (payload.text or "").strip()
+    if not text_:
+        raise HTTPException(status_code=400, detail="Enter the information the Onshore team asked for")
+    order.onshore_tl_reply = text_
+    order.onshore_status = "with_onshore"
+    _add_onshore_message(db, current_user, order, "tl_info", text_)
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+@app.post("/orders/{order_id}/onshore-respond", response_model=schemas.WorkOrderOut)
+def onshore_respond(
+    order_id: int,
+    payload: schemas.OnshoreRespond,
+    current_user: models.User = Depends(auth.require_role("onshore")),
+    db: Session = Depends(get_db),
+):
+    """Onshore's answer: red = resolved on their side, back to the Team Lead; yellow = needs more information."""
+    order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.onshore_status != "with_onshore":
+        raise HTTPException(status_code=400, detail="This order isn't waiting for an Onshore response")
+    if payload.status not in ("red", "yellow"):
+        raise HTTPException(status_code=400, detail="status must be 'red' or 'yellow'")
+    comment = (payload.comment or "").strip()
+    if not comment:
+        raise HTTPException(status_code=400, detail="Enter a comment")
+    order.onshore_comment = comment
+    order.onshore_status = payload.status
+    _add_onshore_message(db, current_user, order, "onshore_" + payload.status, comment)
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+@app.get("/onshore/queue", response_model=List[schemas.OnshoreItemOut])
+def onshore_queue(
+    tab: str = "pending",
+    current_user: models.User = Depends(auth.require_role("onshore", "super_admin", "admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    tab=pending   : waiting for the Onshore team (with_onshore)
+    tab=awaiting  : answered / needs info — with the Team Lead (red, yellow)
+    tab=completed : resolved by the Team Lead (green)
+    Spans every process and Team Lead. Admin / Super Admin can view it too.
+    """
+    groups = {"pending": ("with_onshore",), "awaiting": ("red", "yellow"), "completed": ("green",)}
+    if tab not in groups:
+        raise HTTPException(status_code=400, detail="tab must be pending, awaiting or completed")
+    orders = (
+        db.query(models.WorkOrder)
+        .options(selectinload(models.WorkOrder.clarification_detail), selectinload(models.WorkOrder.escalation_detail))
+        .filter(models.WorkOrder.onshore_status.in_(groups[tab]))
+        .order_by(models.WorkOrder.onshore_sent_at.asc(), models.WorkOrder.id.asc())
+        .all()
+    )
+    _attach_team_leads(db, orders, prefer="owner")
+    names = {p.id: p.name for p in db.query(models.Process).all()}
+    ids = [o.id for o in orders]
+    msgs = {}
+    if ids:
+        for m in db.query(models.OnshoreMessage).filter(models.OnshoreMessage.order_id.in_(ids)).order_by(models.OnshoreMessage.id.asc()).all():
+            msgs.setdefault(m.order_id, []).append(m)
+    out = []
+    for o in orders:
+        item = schemas.OnshoreItemOut.model_validate(o)
+        item.team_lead_name = getattr(o, "team_lead_name", None)
+        item.process_name = names.get(o.process_id)
+        item.messages = [schemas.OnshoreMessageOut.model_validate(m) for m in msgs.get(o.id, [])]
+        out.append(item)
+    return out
 
 
 ESCALATION_TYPES = (

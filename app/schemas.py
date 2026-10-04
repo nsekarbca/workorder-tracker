@@ -179,7 +179,7 @@ class ResetPasswordWithTokenRequest(BaseModel):
 class CreateUserRequest(BaseModel):
     username: str
     full_name: str
-    role: str  # "colleague", "team_lead", "admin", "quality" or "super_admin"
+    role: str  # "colleague", "team_lead", "admin", "quality", "onshore" or "super_admin"
     email: Optional[str] = None
     dob: Optional[date] = None
     doj: Optional[date] = None
@@ -336,6 +336,10 @@ class WorkOrderOut(BaseModel):
     escalation_category: Optional[str]
     issue_raised_date: Optional[date]
     issue_closed_date: Optional[date]
+    onshore_status: Optional[str] = None
+    onshore_comment: Optional[str] = None
+    onshore_tl_reply: Optional[str] = None
+    onshore_sent_at: Optional[datetime] = None
     posted_date: Optional[date]
     tat_days: Optional[int]
     assigned_to_id: Optional[int]
@@ -357,7 +361,21 @@ class WorkOrderOut(BaseModel):
 
 
 class EscalationResolve(BaseModel):
-    ventra_comment: str
+    # Optional: when the Onshore team has answered, their comment is used.
+    ventra_comment: str = ""
+
+
+class OnshoreSend(BaseModel):
+    note: Optional[str] = None
+
+
+class OnshoreRespond(BaseModel):
+    comment: str
+    status: str            # "red" (answered, back to Team Lead) | "yellow" (needs more information)
+
+
+class OnshoreInfo(BaseModel):
+    text: str
 
 
 # Batch Count Dashboard — one calculated row per colleague / process / date.
@@ -394,6 +412,18 @@ class BatchStatUpdate(BaseModel):
     hours_worked: Optional[float] = None
     accounts_audited: Optional[int] = None
     errors: Optional[int] = None
+
+
+class OnshoreMessageOut(BaseModel):
+    id: int
+    created_at: datetime
+    author_name: Optional[str] = None
+    author_role: Optional[str] = None
+    kind: str
+    text: Optional[str] = None
+
+    class Config:
+        from_attributes = True
 
 
 class HoursApprovalOut(BaseModel):
@@ -446,6 +476,14 @@ class OrdersDashboardTLRow(BaseModel):
     clarification: int
     completed: int
     completed_on_date: int
+
+
+# One row of the Onshore team's queue: the order, its escalation details,
+# process / Team Lead names and the hand-off history.
+class OnshoreItemOut(WorkOrderOut):
+    team_lead_name: Optional[str] = None
+    process_name: Optional[str] = None
+    messages: List[OnshoreMessageOut] = []
 
 
 # Raw-data drill-down: a normal order plus the Team Lead it belongs to.
