@@ -887,7 +887,10 @@ function renderTimeTakenCell(o, locked) {
     return `<td><span class="ttk-live" data-order-id="${o.id}" data-started="${o.timer_started_at || ""}" data-base="${o.time_taken_seconds || 0}">${display}</span> <button class="action-btn" tabindex="-1" style="padding:2px 8px; font-size:11px;" onclick="pauseTimer(${o.id})">\u23f8 Pause</button></td>`;
   }
   if (o.timer_status === "paused") {
-    return `<td>${display} <button class="action-btn" tabindex="-1" style="padding:2px 8px; font-size:11px;" onclick="resumeTimer(${o.id})">\u25b6 Resume</button></td>`;
+    return `<td>${display} <button class="action-btn" tabindex="-1" style="padding:2px 8px; font-size:11px; background:#1c7ed6;" title="Paused time is not counted" onclick="resumeTimer(${o.id})">\u25b6 Restart</button></td>`;
+  }
+  if (o.timer_status === "not_started") {
+    return `<td>${display} <button class="action-btn" tabindex="-1" style="padding:2px 8px; font-size:11px; background:#15803d;" onclick="startTimer(${o.id})">\u25b6 Start</button></td>`;
   }
   return `<td>${display}</td>`;
 }
@@ -900,6 +903,15 @@ setInterval(() => {
     span.textContent = _formatDuration(secs);
   });
 }, 1000);
+
+async function startTimer(orderId) {
+  const res = await authFetch(`/orders/${orderId}/timer/start`, {method: "PATCH"});
+  if (!res.ok) {
+    alert("Couldn't start: " + (await res.text()));
+    return;
+  }
+  loadOrders();
+}
 
 async function pauseTimer(orderId) {
   const res = await authFetch(`/orders/${orderId}/timer/pause`, {method: "PATCH"});
