@@ -249,9 +249,12 @@ def _finalize_timer(order: models.WorkOrder, new_status: str):
 
 
 def _start_timer(order: models.WorkOrder):
-    """Called whenever an order is freshly (re)assigned — resets the clock to zero and starts it running."""
-    order.timer_status = "running"
-    order.timer_started_at = datetime.now(IST).replace(tzinfo=None)
+    """
+    Called whenever an order is freshly (re)assigned — resets the clock to zero
+    but does NOT start it: Time Taken only runs after the colleague clicks Start.
+    """
+    order.timer_status = "not_started"
+    order.timer_started_at = None
     order.time_taken_seconds = 0
 
 
@@ -1988,8 +1991,8 @@ def update_colleague_fields(
 
     # Completing an order freezes its "Time Taken" — stop the clock and
     # roll in whatever time was still running.
-    if order.posting_status == "Completed" and order.timer_status == "running":
-        _finalize_timer(order, "stopped")
+    if order.posting_status == "Completed" and order.timer_status != "stopped":
+        _finalize_timer(order, "stopped")      # time spent paused is never added
 
     # Resolving a Clarification (moving to any other status) auto-stamps
     # Issue Closed Date, mirroring how Issue Raised Date auto-stamps on the
@@ -3078,6 +3081,29 @@ def submit_end_of_day(
     return {"submitted": len(orders)}
 
 
+@app.patch("/orders/{order_id}/timer/start", response_model=schemas.WorkOrderOut)
+def start_timer(
+    order_id: int,
+    current_user: models.User = Depends(auth.require_role("colleague")),
+    db: Session = Depends(get_db),
+):
+    """The colleague's Start button: begins Time Taken on an order that hasn't been started."""
+    order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.assigned_to_id != current_user.id:
+        raise HTTPException(status_code=403, detail="This order is not assigned to you")
+    if order.escalated or order.posting_status == "Completed":
+        raise HTTPException(status_code=400, detail="This order is locked and its timer can't be changed")
+    if order.timer_status != "not_started":
+        raise HTTPException(status_code=400, detail="Timer has already been started")
+    order.timer_status = "running"
+    order.timer_started_at = datetime.now(IST).replace(tzinfo=None)
+    db.commit()
+    db.refresh(order)
+    return order
+
+
 @app.patch("/orders/{order_id}/timer/pause", response_model=schemas.WorkOrderOut)
 def pause_timer(
     order_id: int,
@@ -3202,9 +3228,9 @@ def resolve_escalation(
     order.issue_closed_date = datetime.now(IST).date()
     order.escalated = False
     order.last_edited_by = current_user.username
-    if order.timer_status == "paused":
-        order.timer_status = "running"
-        order.timer_started_at = datetime.now(IST).replace(tzinfo=None)
+    # The clock stays paused after a Team Lead resolves it: the colleague
+    # clicks Restart when they actually pick the order back up, so the waiting
+    # time is never counted.
     db.commit()
     db.refresh(order)
     return order

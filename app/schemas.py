@@ -344,7 +344,7 @@ class WorkOrderOut(BaseModel):
     escalated: bool = False
     clarification_detail: Optional[ClarificationDetailOut] = None
     escalation_detail: Optional[EscalationDetailOut] = None
-    timer_status: str = "running"
+    timer_status: str = "not_started"
     timer_started_at: Optional[datetime] = None
     time_taken_seconds: int = 0
 

@@ -303,12 +303,12 @@ class WorkOrder(Base):
     escalation_detail = relationship("EscalationDetail", uselist=False, cascade="all, delete-orphan")
 
     # "Time Taken" tracking — active working time only, not wall-clock
-    # time since assignment. Starts "running" the moment an order is
-    # (auto- or re-)assigned; time_taken_seconds accumulates each time the
+    # time since assignment. Starts "not_started" when an order is
+    # (auto- or re-)assigned and only runs once the colleague clicks Start; time_taken_seconds accumulates each time the
     # colleague pauses, the row completes, or it gets locked by an
     # escalation. timer_started_at is the wall-clock moment the current
     # running session began (None while paused/stopped).
-    timer_status = Column(String, nullable=False, default="running")  # "running" | "paused" | "stopped"
+    timer_status = Column(String, nullable=False, default="not_started")  # "not_started" | "running" | "paused" | "stopped"
     timer_started_at = Column(DateTime, nullable=True)
     time_taken_seconds = Column(Integer, nullable=False, default=0)
 
