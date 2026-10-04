@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy import or_, and_, false as sa_false, func
+from sqlalchemy import or_, and_, false as sa_false, func, inspect as sa_inspect, text as sa_text
 import csv
 import io
 import re
@@ -21,6 +21,35 @@ from . import models, schemas, auth, email_utils
 from .database import Base, engine, get_db, SessionLocal
 
 Base.metadata.create_all(bind=engine)
+
+
+# Columns added to tables that already exist. create_all() only creates NEW
+# tables, so each of these is added here if it's missing — safe to run on every
+# start, which means a deploy no longer depends on someone running the ALTER by hand.
+_ADDED_COLUMNS = [
+    ("users", "last_login_date", "DATE"),
+    ("daily_batch_stats", "pending_hours", "DOUBLE PRECISION"),
+    ("daily_batch_stats", "hours_status", "VARCHAR"),
+    ("daily_batch_stats", "hours_decided_by", "VARCHAR"),
+    ("daily_batch_stats", "hours_decided_at", "TIMESTAMP"),
+]
+
+
+def _ensure_added_columns():
+    try:
+        insp = sa_inspect(engine)
+        for table, column, ddl in _ADDED_COLUMNS:
+            if table not in insp.get_table_names():
+                continue
+            if column in {c["name"] for c in insp.get_columns(table)}:
+                continue
+            with engine.begin() as conn:
+                conn.execute(sa_text(f'ALTER TABLE {table} ADD COLUMN {column} {ddl}'))
+    except Exception as exc:       # never block startup over this
+        print(f"[startup] could not add missing columns automatically: {exc}")
+
+
+_ensure_added_columns()
 
 app = FastAPI(title="Work Order Allocation Tracker")
 
