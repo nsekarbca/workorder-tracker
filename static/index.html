@@ -4730,6 +4730,17 @@ async function saveRow(orderId, btn) {
     return;
   }
 
+  if (order.timer_status === "not_started") {
+    alert("Click Start on this order before saving.");
+    resetBtn();
+    return;
+  }
+  if (order.timer_status === "paused") {
+    alert("The timer is paused \u2014 click Restart on this order before saving.");
+    resetBtn();
+    return;
+  }
+
   const finalStatus = draft.posting_status !== undefined ? draft.posting_status : order.posting_status;
   const finalPosted = draft.posted_amount !== undefined ? draft.posted_amount : order.posted_amount;
   const finalBar = draft.bar_batch !== undefined ? draft.bar_batch : order.bar_batch;
