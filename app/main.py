@@ -1885,6 +1885,13 @@ def update_colleague_fields(
             detail="This order is escalated to your Team Lead and locked until they resolve it",
         )
 
+    # Time Taken has to be running: Start must be clicked before anything is saved
+    # (and Restart after a pause / resolved clarification).
+    if order.timer_status == "not_started":
+        raise HTTPException(status_code=400, detail="Click Start on this order before saving")
+    if order.timer_status == "paused":
+        raise HTTPException(status_code=400, detail="The timer is paused \u2014 click Restart on this order before saving")
+
     payload_data = payload.dict(exclude_unset=True)
     if "posting_status" in payload_data and payload_data["posting_status"] not in (
         "Completed", "In-Process", "Clarification"
