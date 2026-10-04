@@ -92,6 +92,14 @@
     background: linear-gradient(180deg, #2f8cf0 0%, #1c5fc4 55%, #0b3b8f 100%); box-shadow: 0 2px 6px rgba(11,59,143,.35), inset 0 1px 0 rgba(255,255,255,.35); transition: transform .12s, box-shadow .12s; vertical-align: middle; }
   .profile-pill:hover { transform: translateY(-1px); box-shadow: 0 4px 10px rgba(11,59,143,.45), inset 0 1px 0 rgba(255,255,255,.35); }
   .profile-pill .pp-avatar { width:26px; height:26px; border-radius:50%; background: linear-gradient(180deg,#ffffff,#cfe3ff); color:#1c5fc4; display:inline-flex; align-items:center; justify-content:center; box-shadow: inset 0 -2px 3px rgba(11,59,143,.25); }
+  .header-right { display:flex; align-items:center; gap:8px; flex-wrap:nowrap; white-space:nowrap; }
+  .header-right .action-btn, .header-right .profile-pill { margin:0; flex:0 0 auto; }
+  @media (max-width: 900px) {
+    header { flex-wrap: wrap; gap: 8px; padding: 8px 12px; }
+    header .brand { flex: 1 1 100%; min-width: 0; }
+    header .app-title { font-size: 16px; }
+    .header-right { flex: 1 1 100%; flex-wrap: wrap; white-space: normal; justify-content: flex-start; }
+  }
   .badge { background: #eee; color: #222; padding: 4px 10px; border-radius: 12px; font-size: 12px; }
   .process-badge { background: var(--accent); color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; }
   #error-msg { color: #c0392b; font-size: 13px; min-height: 18px; }
@@ -230,7 +238,7 @@
         <button class="nav-menu-item" id="nav-profile-btn" style="display:none;" onclick="navTo('profile')">👤 My Profile</button>
         <button class="nav-menu-item" id="nav-switch-process-btn" style="display:none;" onclick="navTo('switch')">🔀 Switch Process</button>
       </div>
-      <div>
+      <div class="header-right">
         <span id="process-badge" class="process-badge" style="display:none;"></span>
         <span id="whoami" class="badge"></span>
         <button class="action-btn" id="admin-btn" style="display:none;" onclick="showAdminView()">Admin</button>
