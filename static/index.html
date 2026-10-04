@@ -91,6 +91,8 @@
   .profile-pill { display:inline-flex; align-items:center; gap:8px; padding:4px 16px 4px 4px; margin-right:6px; border:none; border-radius:999px; cursor:pointer; font-size:13px; font-weight:600; color:#fff;
     background: linear-gradient(180deg, #2f8cf0 0%, #1c5fc4 55%, #0b3b8f 100%); box-shadow: 0 2px 6px rgba(11,59,143,.35), inset 0 1px 0 rgba(255,255,255,.35); transition: transform .12s, box-shadow .12s; vertical-align: middle; }
   .profile-pill:hover { transform: translateY(-1px); box-shadow: 0 4px 10px rgba(11,59,143,.45), inset 0 1px 0 rgba(255,255,255,.35); }
+  .profile-pill.logout-pill { background: linear-gradient(180deg, #2a4a7f 0%, #0b2545 60%, #061a33 100%); box-shadow: 0 2px 6px rgba(11,37,69,.4), inset 0 1px 0 rgba(255,255,255,.25); margin-right:0; }
+  .profile-pill.logout-pill .pp-avatar { color:#0b2545; background: linear-gradient(180deg,#ffffff,#d9e2f0); }
   .profile-pill .pp-avatar { width:26px; height:26px; border-radius:50%; background: linear-gradient(180deg,#ffffff,#cfe3ff); color:#1c5fc4; display:inline-flex; align-items:center; justify-content:center; box-shadow: inset 0 -2px 3px rgba(11,59,143,.25); }
   .header-right { display:flex; align-items:center; gap:8px; flex-wrap:nowrap; white-space:nowrap; }
   .header-right .action-btn, .header-right .profile-pill { margin:0; flex:0 0 auto; }
@@ -243,7 +245,7 @@
         <span id="whoami" class="badge"></span>
         <button class="action-btn" id="admin-btn" style="display:none;" onclick="showAdminView()">Admin</button>
         <button id="header-profile-btn" class="profile-pill" style="display:none;" title="My Profile" onclick="openProfileModal()"><span class="pp-avatar"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="8" r="4.2"/><path d="M4 21c0-4.4 3.6-7.5 8-7.5s8 3.1 8 7.5z"/></svg></span><span>My Profile</span></button>
-        <button class="action-btn" onclick="logout()">Log out</button>
+        <button class="profile-pill logout-pill" title="Log out" onclick="logout()"><span class="pp-avatar"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" aria-hidden="true"><path d="M12 3v8"/><path d="M6.4 6.8a8 8 0 1 0 11.2 0"/></svg></span><span>Log out</span></button>
       </div>
     </header>
 
@@ -399,6 +401,7 @@
           <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
         </div>
         <div style="font-size:12px; color:#666;" id="batch-hint"></div>
+        <div id="batch-approvals" style="display:none;"></div>
       </div>
       <div id="share-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px; background:white; padding:12px; border-radius:8px;">
         <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
@@ -2498,6 +2501,7 @@ async function loadBatchDashboard() {
   }
   batchPopulateEmployees();
   renderBatchGrid();
+  loadHoursApprovals();
 }
 
 // Employee list follows the Team Lead filter.
@@ -2620,10 +2624,17 @@ function renderBatchGrid() {
     if (showTl) html += `<td>${_esc(r.team_lead_name)}</td>`;
     if (showEmp) html += `<td>${_esc(r.employee_name)}</td>`;
     html += `<td>${_esc(r.process_name)}</td><td>${r.batches_worked}</td><td>${r.total_trans_count}</td>`;
+    const hrsBadge = r.hours_status === "Pending"
+      ? `<div style="font-size:11px; color:#b45309; font-weight:600;" title="A daily total over 8 hours needs Team Lead approval">\u23f3 ${r.pending_hours}h awaiting approval</div>`
+      : r.hours_status === "Rejected"
+      ? `<div style="font-size:11px; color:#b91c1c; font-weight:600;" title="Your Team Lead rejected the hours you entered">\u2716 Rejected \u2014 re-enter</div>`
+      : r.hours_status === "Approved"
+      ? `<div style="font-size:11px; color:#15803d; font-weight:600;">\u2714 Approved</div>` : "";
     if (showEmp) {
-      html += `<td>${r.hours_worked ?? ""}</td>`;
+      html += `<td>${r.hours_worked ?? ""}${hrsBadge}</td>`;
     } else {
-      html += `<td><input type="number" min="0" max="24" step="0.25" data-bf="hours_worked" value="${r.hours_worked ?? ""}" style="width:80px;" oninput="batchRowDirty(this)"></td>`;
+      const shown = r.hours_status === "Pending" ? r.pending_hours : r.hours_worked;
+      html += `<td><input type="number" min="0" max="24" step="0.25" data-bf="hours_worked" value="${shown ?? ""}" style="width:80px;" oninput="batchRowDirty(this)">${hrsBadge}</td>`;
     }
     html += `<td title="${_esc(prodTip)}">${_fmtPct(r.production_pct)}</td>`;
     if (canEdit) {
@@ -2672,7 +2683,59 @@ async function saveBatchRow(idx, btn) {
     btn.disabled = false; btn.textContent = "Save";
     return;
   }
+  const saved = await res.json().catch(() => null);
+  if (saved && saved.hours_status === "Pending") {
+    alert("Your total for this day is over 8 hours, so it has been sent to your Team Lead for approval. It will count once approved.");
+  }
   await loadBatchDashboard();   // reload so any Overall row is recalculated too
+}
+
+// ---- Hours over 8/day: Team Lead approval ----
+async function loadHoursApprovals() {
+  const box = document.getElementById("batch-approvals");
+  if (role === "colleague" || role === "quality") { box.style.display = "none"; return; }
+  const res = await authFetch("/batch-dashboard/hours-approvals?status=Pending");
+  if (!res.ok) { box.style.display = "none"; return; }
+  const rows = await res.json();
+  if (!rows.length) { box.style.display = "none"; box.innerHTML = ""; return; }
+  const canDecide = isLeadRole();
+  let html = `<div style="border:1px solid #f0c36d; background:#fff8e6; border-radius:8px; padding:10px 12px;">` +
+    `<strong>\u23f3 Hours awaiting approval (${rows.length})</strong> ` +
+    `<span style="font-size:12px; color:#666;">\u2014 daily total over 8 hours${canDecide ? "" : " (view only)"}</span>` +
+    `<table style="margin-top:8px;"><thead><tr><th class="col">Date</th>` +
+    (batchAllTeams() ? `<th class="col">Team Lead</th>` : "") +
+    `<th class="col">Employee</th><th class="col">Process</th><th class="col">Requested Hours</th>` +
+    `<th class="col">Other Processes That Day</th><th class="col">Day Total</th>` +
+    (canDecide ? `<th class="col">Decision</th>` : "") + `</tr></thead><tbody>`;
+  rows.forEach((r, i) => {
+    html += `<tr><td>${_esc(r.work_date)}</td>` + (batchAllTeams() ? `<td>${_esc(r.team_lead_name)}</td>` : "") +
+      `<td>${_esc(r.employee_name)}</td><td>${_esc(r.process_name)}</td><td>${r.requested_hours}</td>` +
+      `<td>${r.other_hours}</td><td><strong>${r.total_hours}</strong></td>` +
+      (canDecide ? `<td><button class="action-btn" style="background:#15803d;" onclick="decideHours(${i}, true, this)">Approve</button> ` +
+        `<button class="action-btn" style="background:#b91c1c;" onclick="decideHours(${i}, false, this)">Reject</button></td>` : "") + `</tr>`;
+  });
+  box.innerHTML = html + `</tbody></table></div>`;
+  box.style.display = "block";
+  window._hoursApprovals = rows;
+}
+
+async function decideHours(i, approve, btn) {
+  const r = (window._hoursApprovals || [])[i];
+  if (!r) return;
+  if (!confirm(`${approve ? "Approve" : "Reject"} ${r.requested_hours}h for ${r.employee_name} on ${r.work_date}?`)) return;
+  btn.disabled = true;
+  const res = await authFetch("/batch-dashboard/hours-approvals/decide", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({user_id: r.user_id, process_id: r.process_id, work_date: r.work_date, approve}),
+  });
+  if (!res.ok) {
+    let msg = await res.text();
+    try { msg = JSON.parse(msg).detail || msg; } catch (_) {}
+    alert("Couldn't save the decision: " + msg);
+    btn.disabled = false;
+    return;
+  }
+  await loadBatchDashboard();
 }
 
 function exportBatchCSV() {
