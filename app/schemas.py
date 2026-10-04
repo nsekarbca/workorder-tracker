@@ -371,6 +371,8 @@ class BatchDashboardRow(BaseModel):
     total_trans_count: int
     daily_target: Optional[int] = None
     hours_worked: Optional[float] = None
+    pending_hours: Optional[float] = None   # requested hours waiting for Team Lead approval (daily total > 8)
+    hours_status: Optional[str] = None      # Pending | Approved | Rejected
     production_pct: Optional[float] = None
     accounts_audited: Optional[int] = None
     errors: Optional[int] = None
@@ -392,6 +394,29 @@ class BatchStatUpdate(BaseModel):
     hours_worked: Optional[float] = None
     accounts_audited: Optional[int] = None
     errors: Optional[int] = None
+
+
+class HoursApprovalOut(BaseModel):
+    user_id: int
+    employee_name: str
+    team_lead_id: int
+    team_lead_name: str
+    process_id: int
+    process_name: str
+    work_date: date
+    requested_hours: Optional[float] = None
+    other_hours: float = 0.0          # approved hours the same day in other processes
+    total_hours: Optional[float] = None
+    status: str
+    decided_by: Optional[str] = None
+    decided_at: Optional[datetime] = None
+
+
+class HoursDecision(BaseModel):
+    user_id: int
+    process_id: int
+    work_date: date
+    approve: bool
 
 
 # Team Lead "Orders Dashboard" — one row per date.

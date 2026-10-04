@@ -339,6 +339,13 @@ class DailyBatchStat(Base):
     accounts_audited = Column(Integer, nullable=True)  # team lead
     errors = Column(Integer, nullable=True)            # team lead
 
+    # Daily total over 8 hours needs Team Lead approval. The requested figure
+    # waits in pending_hours; hours_worked only ever holds approved / normal hours.
+    pending_hours = Column(Float, nullable=True)
+    hours_status = Column(String, nullable=True)       # Pending | Approved | Rejected | NULL
+    hours_decided_by = Column(String, nullable=True)
+    hours_decided_at = Column(DateTime, nullable=True)
+
     updated_by = Column(String, nullable=True)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 

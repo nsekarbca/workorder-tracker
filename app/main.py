@@ -2424,6 +2424,7 @@ def orders_dashboard_details(
 # Production % compares transactions against the process's DAILY target
 # scaled to the hours actually worked: expected = daily_target * hours / this.
 STANDARD_SHIFT_HOURS = 8.0
+HOURS_APPROVAL_THRESHOLD = 8.0     # a daily total above this needs Team Lead approval
 
 
 # ---------------------------------------------------------------------------
@@ -2739,6 +2740,8 @@ def _batch_base_rows(db: Session, current_user: models.User, start_date, end_dat
             "total_trans_count": g["trans"],
             "daily_target": target,
             "hours_worked": hours,
+            "pending_hours": st.pending_hours if st else None,
+            "hours_status": st.hours_status if st else None,
             "production_pct": production_pct,
             "accounts_audited": audited,
             "errors": errs,
@@ -2793,6 +2796,7 @@ def batch_dashboard(
                 "work_date": group[0]["work_date"],
                 "daily_target": None,
                 "is_summary": True,
+                "hours_status": "Pending" if any(r.get("hours_status") == "Pending" for r in group) else None,
                 **_batch_aggregate(group),
             })
         i = j
@@ -2900,7 +2904,29 @@ def save_batch_stat(
         )
         db.add(st)
     for f in sent:
+        if f == "hours_worked":
+            continue            # handled below: may need approval
         setattr(st, f, data[f])
+
+    if "hours_worked" in sent:
+        new_hours = data["hours_worked"]
+        # The day's total across ALL processes (this one replaced by the new figure).
+        others = db.query(func.coalesce(func.sum(models.DailyBatchStat.hours_worked), 0.0)).filter(
+            models.DailyBatchStat.user_id == target_user_id,
+            models.DailyBatchStat.work_date == payload.work_date,
+            models.DailyBatchStat.process_id != payload.process_id,
+        ).scalar() or 0.0
+        if new_hours is not None and new_hours + others > HOURS_APPROVAL_THRESHOLD + 1e-9:
+            # Over 8 hours for the day: hold it for the Team Lead. The approved
+            # figure (hours_worked) is left alone until they decide.
+            st.pending_hours = new_hours
+            st.hours_status = "Pending"
+            st.hours_decided_by = None
+            st.hours_decided_at = None
+        else:
+            st.hours_worked = new_hours
+            st.pending_hours = None
+            st.hours_status = None
 
     if st.accounts_audited is not None and st.errors is not None and st.errors > st.accounts_audited:
         db.rollback()
@@ -2915,6 +2941,80 @@ def save_batch_stat(
         current_user=current_user, db=db,
     )
     return rows[0]
+
+
+def _hours_approval_rows(db: Session, current_user: models.User, status: str):
+    colleagues = {u.id: u for u in _batch_visible_colleagues(db, current_user)}
+    if not colleagues:
+        return []
+    stats = db.query(models.DailyBatchStat).filter(
+        models.DailyBatchStat.user_id.in_(list(colleagues.keys())),
+        models.DailyBatchStat.hours_status == status,
+    ).all()
+    processes = {p.id: p.name for p in db.query(models.Process).all()}
+    tls, members, _o = _tl_membership(db)
+    colleague_tl = {cid: tid for tid, ids in members.items() for cid in ids}
+    out = []
+    for st in stats:
+        others = db.query(func.coalesce(func.sum(models.DailyBatchStat.hours_worked), 0.0)).filter(
+            models.DailyBatchStat.user_id == st.user_id,
+            models.DailyBatchStat.work_date == st.work_date,
+            models.DailyBatchStat.process_id != st.process_id,
+        ).scalar() or 0.0
+        req = st.pending_hours if status == "Pending" else st.hours_worked
+        tid = colleague_tl.get(st.user_id, 0)
+        out.append({
+            "user_id": st.user_id, "employee_name": colleagues[st.user_id].full_name,
+            "team_lead_id": tid, "team_lead_name": tls.get(tid, "No Team Lead"),
+            "process_id": st.process_id, "process_name": processes.get(st.process_id, ""),
+            "work_date": st.work_date, "requested_hours": req, "other_hours": round(float(others), 2),
+            "total_hours": round(float(others) + (req or 0), 2), "status": status,
+            "decided_by": st.hours_decided_by, "decided_at": st.hours_decided_at,
+        })
+    out.sort(key=lambda r: (-r["work_date"].toordinal(), r["employee_name"]))
+    return out
+
+
+@app.get("/batch-dashboard/hours-approvals", response_model=List[schemas.HoursApprovalOut])
+def list_hours_approvals(
+    status: str = "Pending",
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Hours entries over 8 hours/day waiting (or decided). Team Lead: their team; Admin / Super Admin: everyone."""
+    if status not in ("Pending", "Approved", "Rejected"):
+        raise HTTPException(status_code=400, detail="status must be Pending, Approved or Rejected")
+    return _hours_approval_rows(db, current_user, status)
+
+
+@app.post("/batch-dashboard/hours-approvals/decide")
+def decide_hours_approval(
+    payload: schemas.HoursDecision,
+    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Team Lead (or Super Admin) approves or rejects a colleague's over-8-hour entry."""
+    allowed = {u.id for u in _batch_visible_colleagues(db, current_user)}
+    if payload.user_id not in allowed:
+        raise HTTPException(status_code=403, detail="This colleague is not on your team")
+    st = db.query(models.DailyBatchStat).filter(
+        models.DailyBatchStat.user_id == payload.user_id,
+        models.DailyBatchStat.process_id == payload.process_id,
+        models.DailyBatchStat.work_date == payload.work_date,
+        models.DailyBatchStat.hours_status == "Pending",
+    ).first()
+    if not st:
+        raise HTTPException(status_code=404, detail="No pending hours for that row")
+    if payload.approve:
+        st.hours_worked = st.pending_hours
+        st.hours_status = "Approved"
+    else:
+        st.hours_status = "Rejected"
+    st.pending_hours = None
+    st.hours_decided_by = current_user.full_name
+    st.hours_decided_at = datetime.now(IST).replace(tzinfo=None)
+    db.commit()
+    return {"status": st.hours_status}
 
 
 @app.post("/orders/submit-day")
