@@ -2960,9 +2960,11 @@ const DETAIL_COLUMNS = (() => {
 function _detailFieldValue(o, key) {
   if (o.escalation_category === "Clarification") {
     const v = o.clarification_detail && o.clarification_detail[key];
+    if (key === "amount_posted" && v !== null && v !== undefined && v !== "" && !isNaN(parseFloat(v))) return formatCurrency(v);
     return (v === null || v === undefined) ? "" : v;
   }
   const v = o.escalation_detail && o.escalation_detail.data && o.escalation_detail.data[key];
+  if (key === "amount" && v !== null && v !== undefined && v !== "" && !isNaN(parseFloat(v))) return formatCurrency(v);
   return (v === null || v === undefined) ? "" : v;
 }
 
@@ -3105,10 +3107,12 @@ function renderEscalations(list) {
           `<div style="font-size:11px; margin-top:4px;">\uD83D\uDCCE Attachment (optional)<br><input type="file" id="tl-files-${o.id}" multiple style="max-width:190px;"></div></td>` +
           `<td style="white-space:normal;"><button class="action-btn" onclick="sendOnshoreInfo(${o.id}, this)">Send Info to ${tn}</button><br><button class="action-btn" style="background:#888; margin-top:4px;" onclick="showOnshoreHistory(${o.id})">History</button></td>`;
       } else if (st === "red") {
-        html += `<td style="white-space:normal; min-width:200px;"><div style="background:#fdecec; border:1px solid #f1a9a9; border-radius:4px; padding:4px;"><b>${tn} comment</b> (becomes the VENTRA Comment):<br>${_esc(o.onshore_comment || "")}</div></td>` +
+        html += `<td style="white-space:normal; min-width:200px;"><div style="background:#fdecec; border:1px solid #f1a9a9; border-radius:4px; padding:4px;"><b>${tn} comment</b> (becomes the VENTRA Comment):<br>${_esc(o.onshore_comment || "")}</div>` +
+          `<div style="font-size:11px; margin-top:4px;">\uD83D\uDCCE Attachment for colleague (optional)<br><input type="file" id="res-files-${o.id}" multiple style="max-width:190px;"></div></td>` +
           `<td style="white-space:normal;"><button class="action-btn" onclick="resolveEscalation(${o.id}, this)">Resolve</button><br><button class="action-btn" style="background:#888; margin-top:4px;" onclick="showOnshoreHistory(${o.id})">\uD83D\uDCCE History</button></td>`;
       } else {
         html += `<td style="white-space:normal;"><textarea id="resolve-comment-${o.id}" rows="2" style="width:180px; font-family:inherit; padding:4px;"></textarea>` +
+          `<div style="font-size:11px; margin-top:4px;">\uD83D\uDCCE Attachment for colleague (optional)<br><input type="file" id="res-files-${o.id}" multiple style="max-width:190px;"></div>` +
           (eligible ? `<div style="font-size:11px; margin-top:4px;">\uD83D\uDCCE Attachment for ${toTeam === "recon" ? "Recon" : "Onshore"} (optional)<br><input type="file" id="tl-files-${o.id}" multiple style="max-width:190px;"></div>` : "") + `</td>`;
         html += `<td style="white-space:normal;"><button class="action-btn" onclick="resolveEscalation(${o.id}, this)">Resolve</button>` +
           (eligible ? `<br><button class="action-btn" style="background:#6b4c9a; margin-top:4px;" title="Couldn't resolve it \u2014 move to the next team's queue" onclick="sendToOnshore(${o.id}, this)">${toTeam === "recon" ? "\uD83E\uDDFE Send to Recon" : "\uD83D\uDCDE Send to Onshore"}</button>` : "") + `</td>`;
@@ -3342,11 +3346,11 @@ async function resolveEscalation(orderId, btn) {
     return;
   }
   if (btn) { btn.disabled = true; btn.textContent = "Resolving\u2026"; }
-  const res = await authFetch(`/orders/${orderId}/resolve-escalation`, {
-    method: "PATCH",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({ventra_comment: comment})
-  });
+  const fd = new FormData();
+  fd.append("ventra_comment", comment);
+  const fin = document.getElementById(`res-files-${orderId}`);
+  if (fin) Array.from(fin.files || []).forEach(f => fd.append("files", f));
+  const res = await authFetch(`/orders/${orderId}/resolve-escalation`, {method: "PATCH", body: fd});
   if (!res.ok) {
     alert("Couldn't resolve: " + (await res.text()));
     if (btn) { btn.disabled = false; btn.textContent = "Resolve"; }
@@ -4863,7 +4867,7 @@ async function openEscalationCategoryModal(orderId, category) {
       fields.forEach(([key, , kind]) => {
         if (kind === "manual" || kind === "manual_date" || kind === "manual_currency" || kind === "manual_select") {
           const el = document.getElementById(`ecd-field-${key}`);
-          if (el && detail.data && detail.data[key] != null) el.value = detail.data[key];
+          if (el && detail.data && detail.data[key] != null) el.value = (kind === "manual_currency" && detail.data[key] !== "" && !isNaN(parseFloat(detail.data[key]))) ? formatCurrency(detail.data[key]) : detail.data[key];
         }
       });
     }
