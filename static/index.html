@@ -3084,7 +3084,7 @@ function renderEscalations(list) {
     if (byTl) html += `<td>${_esc(tlName(o))}</td>`;
     if (showCat) html += `<td>${o.escalation_category ?? ""}</td>`;
     cols.forEach(([key]) => html += `<td>${_detailFieldValue(o, key)}</td>`);
-    html += `<td style="white-space:normal;">${onshoreBadge(o)}</td>`;
+    html += `<td style="white-space:normal;">${onshoreBadge(o)}${teamFilesHTML(o)}</td>`;
     const toTeam = TEAM_FOR_CATEGORY[o.escalation_category];      // onshore | recon | undefined
     const eligible = !!toTeam;
     const tn = TEAM_LABELS[o.onshore_team] || "Onshore";
@@ -3170,6 +3170,13 @@ function onshoreCircle(o) {
     case "green": return ["\uD83D\uDFE2", "Completed"];
   }
   return null;
+}
+function teamFilesHTML(o) {
+  const fs = o.team_files || [];
+  if (!fs.length) return "";
+  const who = {recon: "Recon", calling: "Calling", onshore: "Onshore", team_lead: "Team Lead"};
+  return `<div style="font-size:12px; margin-top:3px; white-space:normal;">\uD83D\uDCCE ` + fs.map(a =>
+    `<a href="#" title="${_esc((who[a.from_role] || a.from_role || "") + (a.from_name ? " \u00b7 " + a.from_name : ""))}" onclick="viewOnshoreAttachment(${a.id}); return false;">${_esc(a.file_name)}</a>`).join(", ") + `</div>`;
 }
 function onshoreBadge(o) {
   const c = onshoreCircle(o);
@@ -4557,7 +4564,7 @@ function renderGrid(orders) {
       }
 
       if ((c.k === "poster_comment" || c.k === "ventra_comment") && (role === "colleague" || isLeadRole())) {
-        html += `<td><textarea class="cell-edit cell-comment" data-id="${o.id}" data-field="${c.k}" onchange="updateDraft(this)" ${editable ? "" : "disabled"}>${rawVal}</textarea></td>`;
+        html += `<td><textarea class="cell-edit cell-comment" data-id="${o.id}" data-field="${c.k}" onchange="updateDraft(this)" ${editable ? "" : "disabled"}>${rawVal}</textarea>${c.k === "ventra_comment" ? teamFilesHTML(o) : ""}</td>`;
         return;
       }
 
