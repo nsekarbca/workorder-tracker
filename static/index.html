@@ -4846,7 +4846,8 @@ async function openEscalationCategoryModal(orderId, category) {
     } else if (kind === "manual_date") {
       html += `<label>${label} <input type="date" id="ecd-field-${key}" data-key="${key}" ${isLocked ? "disabled" : ""}></label>`;
     } else if (kind === "manual_currency") {
-      html += `<label>${label} <input id="ecd-field-${key}" data-key="${key}" inputmode="decimal" placeholder="$0.00" ${isLocked ? "disabled" : ""}></label>`;
+      const prefill = (key === "amount" && order.amount !== null && order.amount !== undefined) ? formatCurrency(order.amount) : "";
+      html += `<label>${label} <input id="ecd-field-${key}" data-key="${key}" inputmode="decimal" placeholder="$0.00" value="${prefill}" ${isLocked ? "disabled" : ""}></label>`;
     } else if (kind === "manual_select") {
       html += `<label>${label} <select id="ecd-field-${key}" data-key="${key}" ${isLocked ? "disabled" : ""}><option value="">—</option>`;
       UTILITY_CATEGORY_OPTIONS.forEach(opt => html += `<option value="${opt}">${opt}</option>`);
@@ -4867,7 +4868,7 @@ async function openEscalationCategoryModal(orderId, category) {
       fields.forEach(([key, , kind]) => {
         if (kind === "manual" || kind === "manual_date" || kind === "manual_currency" || kind === "manual_select") {
           const el = document.getElementById(`ecd-field-${key}`);
-          if (el && detail.data && detail.data[key] != null) el.value = (kind === "manual_currency" && detail.data[key] !== "" && !isNaN(parseFloat(detail.data[key]))) ? formatCurrency(detail.data[key]) : detail.data[key];
+          if (el && detail.data && detail.data[key] != null && detail.data[key] !== "") el.value = (kind === "manual_currency" && detail.data[key] !== "" && !isNaN(parseFloat(detail.data[key]))) ? formatCurrency(detail.data[key]) : detail.data[key];
         }
       });
     }
