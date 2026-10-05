@@ -598,6 +598,15 @@ class ClientBulkResult(BaseModel):
 
 
 # ---- Import Exceptions (Team Lead / Admin / Super Admin) ----
+class ImportExceptionIds(BaseModel):
+    ids: List[int]
+
+
+class ImportExceptionRelease(BaseModel):
+    ids: List[int]
+    team_lead_id: int
+
+
 class ImportExceptionOut(BaseModel):
     id: int
     created_at: datetime

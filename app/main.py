@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import or_, and_, false as sa_false, func, inspect as sa_inspect, text as sa_text
 import csv
+import json
 import io
 import re
 import base64
@@ -43,6 +44,7 @@ _ADDED_COLUMNS = [
     ("work_orders", "onshore_tl_reply", "TEXT"),
     ("work_orders", "onshore_sent_at", "TIMESTAMP"),
     ("work_orders", "onshore_team", "VARCHAR"),
+    ("import_exceptions", "row_json", "TEXT"),
     ("daily_batch_stats", "pending_hours", "DOUBLE PRECISION"),
     ("daily_batch_stats", "hours_status", "VARCHAR"),
     ("daily_batch_stats", "hours_decided_by", "VARCHAR"),
@@ -1317,6 +1319,26 @@ def _client_for_row(division, by_no: dict, by_name: dict):
     return by_name.get(_norm_text(text))
 
 
+def _order_from_inventory_row(process_id, team_lead_id, received, row, username):
+    """One inventory line -> an unassigned WorkOrder for the given Team Lead."""
+    return models.WorkOrder(
+        process_id=process_id,
+        team_lead_id=team_lead_id,
+        received_date=received,
+        edm=row.get("edm") or None,
+        status=row.get("status") or None,
+        created=_parse_dt(row.get("created")),
+        image_count=_parse_int(row.get("image_count")),
+        doc_count=_parse_int(row.get("doc_count")),
+        def_doc_type=row.get("def_doc_type") or None,
+        amount=_parse_float(row.get("amount")),
+        description=row.get("description") or None,
+        division=row.get("division") or None,
+        deposit_date=_safe_date(row.get("deposit_date")),
+        last_edited_by=username,
+    )
+
+
 @app.post("/orders/import")
 def import_inventory(
     process_id: int,
@@ -1430,6 +1452,7 @@ def import_inventory(
             existing_order_id=existing_order.id if existing_order else None,
             existing_posted_date=existing_order.posted_date if existing_order else None,
             existing_employee_name=existing_order.employee_name if existing_order else None,
+            row_json=json.dumps({k: v for k, v in row.items() if v not in (None, "")}),
         ))
 
     for row in reader:
@@ -1481,22 +1504,7 @@ def import_inventory(
                     counts["skipped_duplicate_open"] += 1     # In-Process / Clarification / blank: already in the system
                 continue
 
-        db.add(models.WorkOrder(
-            process_id=process_id,
-            team_lead_id=row_tl,
-            received_date=today,
-            edm=row.get("edm") or None,
-            status=row.get("status") or None,
-            created=_parse_dt(row.get("created")),
-            image_count=_parse_int(row.get("image_count")),
-            doc_count=_parse_int(row.get("doc_count")),
-            def_doc_type=row.get("def_doc_type") or None,
-            amount=_parse_float(row.get("amount")),
-            description=row.get("description") or None,
-            division=row.get("division") or None,
-            deposit_date=_safe_date(row.get("deposit_date")),
-            last_edited_by=current_user.username,
-        ))
+        db.add(_order_from_inventory_row(process_id, row_tl, today, row, current_user.username))
         counts["imported"] += 1
 
     # One exception per document: skip any EDM already logged for this process recently.
@@ -1561,6 +1569,128 @@ def list_import_exceptions(
         item.team_lead_name = tlnames.get(r.team_lead_id)
         out.append(item)
     return out
+
+
+def _exception_row(e: models.ImportException) -> dict:
+    """The inventory row behind an exception (older entries only kept a few fields)."""
+    if e.row_json:
+        try:
+            return json.loads(e.row_json)
+        except ValueError:
+            pass
+    return {
+        "edm": e.edm, "division": e.division_raw, "def_doc_type": e.def_doc_type,
+        "amount": "" if e.amount is None else str(e.amount),
+    }
+
+
+@app.post("/import-exceptions/delete")
+def delete_import_exceptions(
+    payload: schemas.ImportExceptionIds,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Removes the selected exception entries. A Team Lead may only remove their own 'already completed' notices."""
+    q = db.query(models.ImportException).filter(models.ImportException.id.in_(payload.ids or [0]))
+    if current_user.role == "team_lead":
+        q = q.filter(models.ImportException.kind == "duplicate_completed", models.ImportException.team_lead_id == current_user.id)
+    n = 0
+    for e in q.all():
+        db.delete(e)
+        n += 1
+    db.commit()
+    return {"deleted": n}
+
+
+@app.post("/import-exceptions/release")
+def release_import_exceptions(
+    payload: schemas.ImportExceptionRelease,
+    current_user: models.User = Depends(auth.require_role("super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    Unassigned Clients: assigns each selected row's client to the chosen Team Lead
+    (for that row's process, unless the client already has one there) and moves the
+    row into that Team Lead's Active Queue. Other unassigned rows of the same client
+    in the same process move too. Rows whose client isn't in the client list can't
+    be assigned and stay listed.
+    """
+    tl = _eligible_team_lead(db, payload.team_lead_id)
+    selected = db.query(models.ImportException).filter(
+        models.ImportException.id.in_(payload.ids or [0]), models.ImportException.kind == "unassigned_client",
+    ).all()
+    if not selected:
+        raise HTTPException(status_code=400, detail="Select at least one Unassigned Clients row")
+
+    clients = db.query(models.Client).all()
+    by_no = {_norm_facility(c.facility_no): c for c in clients}
+    name_counts = {}
+    for c in clients:
+        name_counts[_norm_text(c.client_name)] = name_counts.get(_norm_text(c.client_name), 0) + 1
+    by_name = {_norm_text(c.client_name): c for c in clients if name_counts[_norm_text(c.client_name)] == 1}
+
+    def client_of(e):
+        if e.facility_no and _norm_facility(e.facility_no) in by_no:
+            return by_no[_norm_facility(e.facility_no)]
+        return _client_for_row(e.division_raw or _exception_row(e).get("division"), by_no, by_name)
+
+    result = {"clients_assigned": 0, "moved": 0, "already_in_system": 0, "no_client": 0, "other_process": []}
+    tl_procs = {p.id for p in tl.processes}
+    assignment = {}          # (client_id, process_id) -> team_lead_id in force
+    for e in selected:
+        c = client_of(e)
+        if not c or e.process_id is None:
+            result["no_client"] += 1
+            continue
+        key = (c.id, e.process_id)
+        if key in assignment:
+            continue
+        cur = db.query(models.ClientProcessTeamLead).filter_by(client_id=c.id, process_id=e.process_id).first()
+        if cur:
+            assignment[key] = cur.team_lead_id
+        elif e.process_id not in tl_procs:
+            result["other_process"].append(f"{c.client_name} ({(db.query(models.Process).get(e.process_id) or models.Process(name='?')).name})")
+        else:
+            db.add(models.ClientProcessTeamLead(client_id=c.id, process_id=e.process_id, team_lead_id=tl.id))
+            assignment[key] = tl.id
+            result["clients_assigned"] += 1
+    db.flush()
+
+    # every unassigned exception of an assigned client + process moves, not just the ticked ones
+    today = datetime.now(IST).date()
+    cutoff = today - relativedelta(months=DUPLICATE_LOOKBACK_MONTHS)
+    process_ids = {k[1] for k in assignment}
+    pool = db.query(models.ImportException).filter(
+        models.ImportException.kind == "unassigned_client", models.ImportException.process_id.in_(process_ids or [0]),
+    ).all()
+    seen = set()
+    for e in pool:
+        c = client_of(e)
+        if not c or (c.id, e.process_id) not in assignment:
+            continue
+        row = _exception_row(e)
+        edm_key = _norm_edm(row.get("edm"))
+        process = db.query(models.Process).filter(models.Process.id == e.process_id).first()
+        is_edm = bool(process and process.name.strip().upper() == "EDM")
+        dup = False
+        if edm_key and (e.process_id, edm_key) in seen:
+            dup = True
+        elif edm_key and is_edm:
+            dup = db.query(models.WorkOrder.id).filter(
+                models.WorkOrder.process_id == e.process_id, models.WorkOrder.received_date >= cutoff,
+                func.upper(models.WorkOrder.edm) == edm_key,
+            ).first() is not None
+        seen.add((e.process_id, edm_key))
+        if dup:
+            result["already_in_system"] += 1
+        else:
+            db.add(_order_from_inventory_row(e.process_id, assignment[(c.id, e.process_id)], today, row, current_user.username))
+            result["moved"] += 1
+        db.delete(e)
+    db.commit()
+    for pid in process_ids:
+        _auto_assign_open_slots(db, pid)
+    return result
 
 
 def _parse_date(v: Optional[str]) -> Optional[date]:

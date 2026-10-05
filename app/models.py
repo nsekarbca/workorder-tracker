@@ -449,6 +449,7 @@ class ImportException(Base):
     existing_order_id = Column(Integer, nullable=True)           # duplicate_completed: the order already done
     existing_posted_date = Column(Date, nullable=True)
     existing_employee_name = Column(String, nullable=True)
+    row_json = Column(Text, nullable=True)                       # the whole inventory row, so an unassigned one can be moved into a queue later
 
 
 class OnshoreMessage(Base):
