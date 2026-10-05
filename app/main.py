@@ -1930,6 +1930,7 @@ def update_colleague_fields(
     payload_data.pop("posted_date", None)
     payload_data.pop("ventra_comment", None)
     payload_data.pop("issue_closed_date", None)
+    payload_data.pop("issue_raised_date", None)     # auto-stamped when Clarification is first saved
 
     # Final posting_status after this update is applied (may be unchanged).
     final_status = payload_data.get("posting_status", order.posting_status)
@@ -3248,7 +3249,7 @@ def resolve_escalation(
     if not order.escalated:
         raise HTTPException(status_code=400, detail="This order isn't currently escalated")
 
-    if order.onshore_status in ("with_onshore", "yellow", "blue"):
+    if order.onshore_status in ("with_onshore", "yellow", "blue", "orange"):
         raise HTTPException(status_code=400, detail="This escalation is with another team \u2014 it can be resolved once they respond (red)")
     if order.onshore_status == "red":
         # The Onshore team's answer becomes the VENTRA Comment, and their circle turns green.
@@ -3295,6 +3296,29 @@ def _add_onshore_message(db: Session, user: models.User, order: models.WorkOrder
     return msg
 
 
+def _read_onshore_files(files) -> list:
+    """Validates optional uploads (max 5 files, 5 MB each) and returns [(UploadFile, bytes)]."""
+    files = [f for f in (files or []) if f and f.filename]
+    if len(files) > MAX_ATTACHMENTS_PER_UPDATE:
+        raise HTTPException(status_code=400, detail=f"Max {MAX_ATTACHMENTS_PER_UPDATE} attachments")
+    blobs = []
+    for f in files:
+        content = f.file.read()
+        if len(content) > MAX_ATTACHMENT_BYTES:
+            raise HTTPException(status_code=400, detail=f"{f.filename} is over the 5 MB limit")
+        blobs.append((f, content))
+    return blobs
+
+
+def _save_onshore_files(db: Session, user: models.User, order: models.WorkOrder, msg, blobs: list):
+    now = datetime.now(IST).replace(tzinfo=None)
+    for f, content in blobs:
+        db.add(models.OnshoreAttachment(
+            message_id=msg.id, order_id=order.id, file_name=f.filename, content_type=f.content_type,
+            file_data=base64.b64encode(content).decode("ascii"), uploaded_by_name=user.full_name, created_at=now,
+        ))
+
+
 def _lead_escalation_order(db: Session, user: models.User, order_id: int) -> models.WorkOrder:
     """The escalated order a Team Lead (or Super Admin) is acting on — their own team's only."""
     order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
@@ -3311,7 +3335,8 @@ def _lead_escalation_order(db: Session, user: models.User, order_id: int) -> mod
 @app.post("/orders/{order_id}/send-to-onshore", response_model=schemas.WorkOrderOut)
 def send_to_onshore(
     order_id: int,
-    payload: schemas.OnshoreSend,
+    note: str = Form(""),
+    files: List[UploadFile] = File(default=[]),
     current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
     db: Session = Depends(get_db),
 ):
@@ -3325,12 +3350,14 @@ def send_to_onshore(
         raise HTTPException(status_code=400, detail="Only EOB not found (Recon) and Patient not found, Invoice Creation, Clarification (Onshore) can be sent to another team")
     if order.onshore_status is not None:
         raise HTTPException(status_code=400, detail="This escalation has already been sent to another team")
+    blobs = _read_onshore_files(files)
     order.onshore_status = "with_onshore"
     order.onshore_team = team
     order.onshore_sent_at = datetime.now(IST).replace(tzinfo=None)
     order.onshore_comment = None
     order.onshore_tl_reply = None
-    _add_onshore_message(db, current_user, order, "sent", (payload.note or "").strip() or None)
+    msg = _add_onshore_message(db, current_user, order, "sent", (note or "").strip() or None)
+    _save_onshore_files(db, current_user, order, msg, blobs)
     db.commit()
     db.refresh(order)
     return order
@@ -3339,7 +3366,8 @@ def send_to_onshore(
 @app.post("/orders/{order_id}/onshore-info", response_model=schemas.WorkOrderOut)
 def onshore_info(
     order_id: int,
-    payload: schemas.OnshoreInfo,
+    text: str = Form(""),
+    files: List[UploadFile] = File(default=[]),
     current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
     db: Session = Depends(get_db),
 ):
@@ -3347,12 +3375,14 @@ def onshore_info(
     order = _lead_escalation_order(db, current_user, order_id)
     if order.onshore_status != "yellow":
         raise HTTPException(status_code=400, detail="The team hasn't asked for information on this order")
-    text_ = (payload.text or "").strip()
+    text_ = (text or "").strip()
     if not text_:
         raise HTTPException(status_code=400, detail="Enter the information that was asked for")
+    blobs = _read_onshore_files(files)
     order.onshore_tl_reply = text_
     order.onshore_status = "with_onshore"
-    _add_onshore_message(db, current_user, order, "tl_info", text_)
+    msg = _add_onshore_message(db, current_user, order, "tl_info", text_)
+    _save_onshore_files(db, current_user, order, msg, blobs)
     db.commit()
     db.refresh(order)
     return order
@@ -3372,28 +3402,22 @@ def onshore_respond(
       red    = done on our side — back to the Team Lead for review
       yellow = we need more information from the Team Lead
       blue   = (Recon only) unable to resolve — move it to the Calling team's queue
+      orange = (Calling only) an update for the Team Lead; it stays in Calling's queue so they can
+               add an updated comment later and finish with red
     """
     order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    waiting = order.onshore_status == "with_onshore" or (order.onshore_status == "blue" and order.onshore_team == "calling")
+    waiting = order.onshore_status == "with_onshore" or (order.onshore_status in ("blue", "orange") and order.onshore_team == "calling")
     if not waiting or order.onshore_team != current_user.role:
         raise HTTPException(status_code=400, detail="This order isn't waiting for your team's response")
-    allowed = ("red", "yellow", "blue") if current_user.role == "recon" else ("red", "yellow")
+    allowed = {"recon": ("red", "yellow", "blue"), "calling": ("red", "yellow", "orange")}.get(current_user.role, ("red", "yellow"))
     if status not in allowed:
         raise HTTPException(status_code=400, detail="status must be " + " or ".join(f"'{a}'" for a in allowed))
     text_ = (comment or "").strip()
     if not text_:
         raise HTTPException(status_code=400, detail="Enter a comment")
-    files = [f for f in (files or []) if f and f.filename]
-    if len(files) > MAX_ATTACHMENTS_PER_UPDATE:
-        raise HTTPException(status_code=400, detail=f"Max {MAX_ATTACHMENTS_PER_UPDATE} attachments")
-    blobs = []
-    for f in files:
-        content = f.file.read()
-        if len(content) > MAX_ATTACHMENT_BYTES:
-            raise HTTPException(status_code=400, detail=f"{f.filename} is over the 5 MB limit")
-        blobs.append((f, content))
+    blobs = _read_onshore_files(files)
 
     order.onshore_comment = text_
     if status == "blue":
@@ -3402,12 +3426,7 @@ def onshore_respond(
     else:
         order.onshore_status = status
     msg = _add_onshore_message(db, current_user, order, "team_" + status, text_)
-    now = datetime.now(IST).replace(tzinfo=None)
-    for f, content in blobs:
-        db.add(models.OnshoreAttachment(
-            message_id=msg.id, order_id=order.id, file_name=f.filename, content_type=f.content_type,
-            file_data=base64.b64encode(content).decode("ascii"), uploaded_by_name=current_user.full_name, created_at=now,
-        ))
+    _save_onshore_files(db, current_user, order, msg, blobs)
     db.commit()
     db.refresh(order)
     return order
@@ -3481,13 +3500,13 @@ def onshore_queue(
     my_team = current_user.role if current_user.role in TEAM_ROLES else team
     if tab == "pending":
         if my_team == "calling":
-            q = q.filter(models.WorkOrder.onshore_team == "calling", models.WorkOrder.onshore_status.in_(("with_onshore", "blue")))
+            q = q.filter(models.WorkOrder.onshore_team == "calling", models.WorkOrder.onshore_status.in_(("with_onshore", "blue", "orange")))
         elif my_team:
             q = q.filter(models.WorkOrder.onshore_team == my_team, models.WorkOrder.onshore_status == "with_onshore")
         else:
-            q = q.filter(models.WorkOrder.onshore_status.in_(("with_onshore", "blue")))
+            q = q.filter(models.WorkOrder.onshore_status.in_(("with_onshore", "blue", "orange")))
     else:
-        statuses = ("red", "yellow", "blue", "with_onshore") if tab == "awaiting" else ("green",)
+        statuses = ("red", "yellow", "blue", "orange", "with_onshore") if tab == "awaiting" else ("green",)
         q = q.filter(models.WorkOrder.onshore_status.in_(statuses))
         if my_team == "recon":
             q = q.filter(models.WorkOrder.onshore_team.in_(("recon", "calling")))
@@ -3501,7 +3520,7 @@ def onshore_queue(
             else:
                 q = q.filter(models.WorkOrder.onshore_status.in_(("red", "yellow")))
         elif tab == "awaiting":
-            q = q.filter(models.WorkOrder.onshore_status.in_(("red", "yellow", "blue")))
+            q = q.filter(models.WorkOrder.onshore_status.in_(("red", "yellow", "blue", "orange")))
     orders = q.order_by(models.WorkOrder.onshore_sent_at.asc(), models.WorkOrder.id.asc()).all()
     _attach_team_leads(db, orders, prefer="owner")
     names = {p.id: p.name for p in db.query(models.Process).all()}
