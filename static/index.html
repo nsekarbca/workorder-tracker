@@ -2843,7 +2843,7 @@ function showHomeView() {
 
   const proc = myProcesses.find(p => p.id === currentProcessId);
   document.getElementById("under-construction-banner").style.display =
-    (proc && proc.name !== "EDM") ? "block" : "none";
+    (proc && proc.name !== "EDM" && proc.name !== "CB Unmatched Posting") ? "block" : "none";
 
   loadDashboard();
 }
