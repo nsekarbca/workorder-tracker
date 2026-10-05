@@ -179,7 +179,7 @@ class ResetPasswordWithTokenRequest(BaseModel):
 class CreateUserRequest(BaseModel):
     username: str
     full_name: str
-    role: str  # "colleague", "team_lead", "admin", "quality", "onshore" or "super_admin"
+    role: str  # "colleague", "team_lead", "admin", "quality", "onshore", "recon", "calling" or "super_admin"
     email: Optional[str] = None
     dob: Optional[date] = None
     doj: Optional[date] = None
@@ -340,6 +340,7 @@ class WorkOrderOut(BaseModel):
     onshore_comment: Optional[str] = None
     onshore_tl_reply: Optional[str] = None
     onshore_sent_at: Optional[datetime] = None
+    onshore_team: Optional[str] = None
     posted_date: Optional[date]
     tat_days: Optional[int]
     assigned_to_id: Optional[int]
@@ -414,6 +415,15 @@ class BatchStatUpdate(BaseModel):
     errors: Optional[int] = None
 
 
+class OnshoreAttachmentOut(BaseModel):
+    id: int
+    file_name: str
+    content_type: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
 class OnshoreMessageOut(BaseModel):
     id: int
     created_at: datetime
@@ -421,6 +431,7 @@ class OnshoreMessageOut(BaseModel):
     author_role: Optional[str] = None
     kind: str
     text: Optional[str] = None
+    attachments: List[OnshoreAttachmentOut] = []
 
     class Config:
         from_attributes = True

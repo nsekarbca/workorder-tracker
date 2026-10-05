@@ -311,6 +311,7 @@ class WorkOrder(Base):
     onshore_comment = Column(Text, nullable=True)       # Onshore's latest comment / question
     onshore_tl_reply = Column(Text, nullable=True)      # Team Lead's latest answer to a yellow request
     onshore_sent_at = Column(DateTime, nullable=True)
+    onshore_team = Column(String, nullable=True)        # onshore | recon | calling: which team holds it now
 
     # "Time Taken" tracking — active working time only, not wall-clock
     # time since assignment. Starts "not_started" when an order is
@@ -462,3 +463,17 @@ class OnshoreMessage(Base):
     author_role = Column(String, nullable=True)
     kind = Column(String, nullable=False)                      # sent | onshore_red | onshore_yellow | tl_info | resolved
     text = Column(Text, nullable=True)
+
+
+class OnshoreAttachment(Base):
+    """Optional file a Recon / Calling / Onshore user attaches to a reply. Stored inline as base64 (5 MB max each)."""
+    __tablename__ = "onshore_attachments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(Integer, nullable=False, index=True)
+    order_id = Column(Integer, nullable=False, index=True)    # not a foreign key: survives order deletion
+    file_name = Column(String, nullable=False)
+    content_type = Column(String, nullable=True)
+    file_data = Column(Text, nullable=False)                  # base64
+    uploaded_by_name = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=False)
