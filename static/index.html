@@ -321,13 +321,14 @@
       </div>
       <div id="onshore-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px;">
         <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
-          <h3 style="margin:0;">📞 Onshore Queue</h3>
-          <button class="od-tab active" id="on-tab-pending" onclick="onshoreSetTab('pending')">Needs Onshore Response</button>
-          <button class="od-tab" id="on-tab-awaiting" onclick="onshoreSetTab('awaiting')">With Team Lead</button>
+          <h3 style="margin:0;" id="onshore-title">📞 Escalation Queue</h3>
+          <label id="on-team-label" style="display:none;">Team <select id="on-team" onchange="loadOnshoreQueue()"><option value="">All teams</option><option value="onshore">Onshore</option><option value="recon">Recon</option><option value="calling">Calling</option></select></label>
+          <button class="od-tab active" id="on-tab-pending" onclick="onshoreSetTab('pending')">Needs Our Response</button>
+          <button class="od-tab" id="on-tab-awaiting" onclick="onshoreSetTab('awaiting')">Submitted / With Team Lead</button>
           <button class="od-tab" id="on-tab-completed" onclick="onshoreSetTab('completed')">Completed</button>
           <button class="action-btn" onclick="loadOnshoreQueue()">Refresh</button>
         </div>
-        <div style="font-size:12px; color:#666;">⚪ with Onshore &nbsp; 🔴 answered — Team Lead review &nbsp; 🟡 more information needed from the Team Lead &nbsp; 🟢 completed</div>
+        <div style="font-size:12px; color:#666;">⚪ with the team &nbsp; 🔴 answered — Team Lead review &nbsp; 🟡 more information needed from the Team Lead &nbsp; 🔵 Recon passed it to Calling &nbsp; 🟢 completed</div>
       </div>
       <div id="clients-view-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px;">
         <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
@@ -501,6 +502,8 @@
             <option value="admin">Admin</option>
             <option value="quality">Quality</option>
             <option value="onshore">Onshore</option>
+            <option value="recon">Recon</option>
+            <option value="calling">Calling</option>
             <option value="super_admin">Super Admin</option>
           </select>
         </label>
@@ -604,6 +607,14 @@
   </div>
 </div>
 
+<div id="onshore-history-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:100; align-items:center; justify-content:center;">
+  <div style="background:white; border-radius:8px; padding:20px; width:560px; max-width:92vw; max-height:88vh; overflow-y:auto;">
+    <h3 style="margin-top:0;">Escalation hand-off history</h3>
+    <div id="onshore-history-body" style="font-size:13px;"></div>
+    <div style="margin-top:14px;"><button class="action-btn" style="background:#888;" onclick="document.getElementById('onshore-history-modal').style.display='none'">Close</button></div>
+  </div>
+</div>
+
 <div id="client-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:100; align-items:center; justify-content:center;">
   <div style="background:white; border-radius:8px; padding:20px; width:460px; max-width:92vw; max-height:88vh; overflow-y:auto;">
     <h3 id="client-modal-heading" style="margin-top:0;">Add Client</h3>
@@ -664,6 +675,12 @@
 
 <script>
 const API = "";
+// Escalation-team constants (declared early: showApp() runs on page load for a restored session)
+const TEAM_QUEUE_LABEL = {onshore: "\uD83D\uDCDE Onshore Queue", recon: "\uD83E\uDDFE Recon Queue", calling: "\u260E\uFE0F Calling Queue"};
+const TEAM_FOR_CATEGORY = {"Patient not found": "onshore", "Invoice Creation": "onshore", "Clarification": "onshore", "EOB not found": "recon"};
+const TEAM_LABELS = {onshore: "Onshore", recon: "Recon", calling: "Calling"};
+let onshoreTab = "pending";
+let onshoreItems = [];
 let token = sessionStorage.getItem("wot_token") || "";
 let role = sessionStorage.getItem("wot_role") || "";
 let fullName = sessionStorage.getItem("wot_name") || "";
@@ -1317,8 +1334,8 @@ function showApp() {
     document.getElementById("nav-escalations-btn").style.display = "block";   // Escalation queue (all teams, Team Lead-wise, view-only)
     document.getElementById("nav-production-btn").style.display = "block";    // Production (all teams, Team Lead-wise, view-only)
     document.getElementById("active-tl-label").style.display = "inline-block";
-  } else if (role === "onshore") {
-    // Onshore team: only the Onshore queue (all processes, all Team Leads).
+  } else if (isTeamRole()) {
+    // Onshore / Recon / Calling: only their own escalation queue (all processes, all Team Leads).
     document.getElementById("nav-active-btn").style.display = "none";
   } else if (role === "quality") {
     // Quality profile: view / export Production data only (all teams, Team Lead-wise).
@@ -1335,8 +1352,10 @@ function showApp() {
   // Clients (view-only): colleague, Team Lead, Admin, Super Admin — not the Quality profile.
   document.getElementById("nav-profile-btn").style.display = role === "super_admin" ? "none" : "block";
   document.getElementById("header-profile-btn").style.display = role === "super_admin" ? "none" : "inline-flex";
-  document.getElementById("nav-clients-btn").style.display = (role === "quality" || role === "onshore") ? "none" : "block";
-  document.getElementById("nav-onshore-btn").style.display = (role === "onshore" || role === "admin" || role === "super_admin") ? "block" : "none";
+  document.getElementById("nav-clients-btn").style.display = (role === "quality" || isTeamRole()) ? "none" : "block";
+  document.getElementById("nav-onshore-btn").style.display = (isTeamRole() || role === "admin" || role === "super_admin") ? "block" : "none";
+  if (isTeamRole()) document.getElementById("nav-onshore-btn").textContent = TEAM_QUEUE_LABEL[role];
+  else document.getElementById("nav-onshore-btn").textContent = "\uD83D\uDCDE Team Queues";
   // Import Exceptions: Team Lead (their "already completed" notices), Admin, Super Admin.
   document.getElementById("nav-import-exc-btn").style.display = (role === "team_lead" || role === "admin" || role === "super_admin") ? "block" : "none";
   if (role === "super_admin") {
@@ -1347,7 +1366,7 @@ function showApp() {
   if (currentProcessId) {
     if (role === "quality") showProductionView();
     else showHomeView();
-  } else if (role === "onshore") {
+  } else if (isTeamRole()) {
     showOnshoreView();
   } else if (role === "super_admin") {
     showAdminView();
@@ -3066,25 +3085,27 @@ function renderEscalations(list) {
     if (showCat) html += `<td>${o.escalation_category ?? ""}</td>`;
     cols.forEach(([key]) => html += `<td>${_detailFieldValue(o, key)}</td>`);
     html += `<td style="white-space:normal;">${onshoreBadge(o)}</td>`;
-    const eligible = ONSHORE_CATEGORIES.includes(o.escalation_category);
+    const toTeam = TEAM_FOR_CATEGORY[o.escalation_category];      // onshore | recon | undefined
+    const eligible = !!toTeam;
+    const tn = TEAM_LABELS[o.onshore_team] || "Onshore";
     if (resolved) {
       html += `<td style="max-width:220px; white-space:normal;">${o.ventra_comment ?? ""}</td>`;
       html += `<td>${o.issue_closed_date ?? ""}</td>`;
     } else if (canResolve) {
       const st = o.onshore_status;
-      if (st === "with_onshore") {
-        html += `<td style="white-space:normal;"><i style="color:#666;">Waiting for the Onshore team\u2026</i></td><td>\u26AA With Onshore</td>`;
+      if (st === "with_onshore" || st === "blue") {
+        html += `<td style="white-space:normal;"><i style="color:#666;">Waiting for the ${tn} team\u2026</i></td><td><button class="action-btn" style="background:#888;" onclick="showOnshoreHistory(${o.id})">History</button></td>`;
       } else if (st === "yellow") {
-        html += `<td style="white-space:normal; min-width:200px;"><div style="background:#fff8e6; border:1px solid #f0c36d; border-radius:4px; padding:4px; margin-bottom:4px;"><b>Onshore asks:</b> ${_esc(o.onshore_comment || "")}</div>` +
+        html += `<td style="white-space:normal; min-width:200px;"><div style="background:#fff8e6; border:1px solid #f0c36d; border-radius:4px; padding:4px; margin-bottom:4px;"><b>${tn} asks:</b> ${_esc(o.onshore_comment || "")}</div>` +
           `<textarea id="resolve-comment-${o.id}" rows="2" style="width:180px; font-family:inherit; padding:4px;" placeholder="Information for Onshore\u2026"></textarea></td>` +
-          `<td><button class="action-btn" onclick="sendOnshoreInfo(${o.id}, this)">Send Info to Onshore</button></td>`;
+          `<td style="white-space:normal;"><button class="action-btn" onclick="sendOnshoreInfo(${o.id}, this)">Send Info to ${tn}</button><br><button class="action-btn" style="background:#888; margin-top:4px;" onclick="showOnshoreHistory(${o.id})">History</button></td>`;
       } else if (st === "red") {
-        html += `<td style="white-space:normal; min-width:200px;"><div style="background:#fdecec; border:1px solid #f1a9a9; border-radius:4px; padding:4px;"><b>Onshore comment</b> (becomes the VENTRA Comment):<br>${_esc(o.onshore_comment || "")}</div></td>` +
-          `<td><button class="action-btn" onclick="resolveEscalation(${o.id}, this)">Resolve</button></td>`;
+        html += `<td style="white-space:normal; min-width:200px;"><div style="background:#fdecec; border:1px solid #f1a9a9; border-radius:4px; padding:4px;"><b>${tn} comment</b> (becomes the VENTRA Comment):<br>${_esc(o.onshore_comment || "")}</div></td>` +
+          `<td style="white-space:normal;"><button class="action-btn" onclick="resolveEscalation(${o.id}, this)">Resolve</button><br><button class="action-btn" style="background:#888; margin-top:4px;" onclick="showOnshoreHistory(${o.id})">\uD83D\uDCCE History</button></td>`;
       } else {
         html += `<td><textarea id="resolve-comment-${o.id}" rows="2" style="width:180px; font-family:inherit; padding:4px;"></textarea></td>`;
         html += `<td style="white-space:normal;"><button class="action-btn" onclick="resolveEscalation(${o.id}, this)">Resolve</button>` +
-          (eligible ? `<br><button class="action-btn" style="background:#6b4c9a; margin-top:4px;" title="Couldn't resolve it \u2014 move to the Onshore team's queue" onclick="sendToOnshore(${o.id}, this)">\uD83D\uDCDE Send to Onshore</button>` : "") + `</td>`;
+          (eligible ? `<br><button class="action-btn" style="background:#6b4c9a; margin-top:4px;" title="Couldn't resolve it \u2014 move to the next team's queue" onclick="sendToOnshore(${o.id}, this)">${toTeam === "recon" ? "\uD83E\uDDFE Send to Recon" : "\uD83D\uDCDE Send to Onshore"}</button>` : "") + `</td>`;
       }
     } else {
       html += `<td></td><td>\u23f3 Awaiting Team Lead</td>`;
@@ -3130,27 +3151,49 @@ function exportEscalationsCSV() {
 // Onshore team. Circles: white = with Onshore, red = Onshore answered (Team
 // Lead review), yellow = Onshore needs more information, green = completed.
 // ---------------------------------------------------------------------
-const ONSHORE_CATEGORIES = ["Patient not found", "Invoice Creation", "Clarification"];
-const ONSHORE_CIRCLE = {
-  with_onshore: ["\u26AA", "With the Onshore team"],
-  red: ["\uD83D\uDD34", "Onshore answered \u2014 Team Lead review"],
-  yellow: ["\uD83D\uDFE1", "Onshore needs more information"],
-  green: ["\uD83D\uDFE2", "Completed"],
-};
+function isTeamRole() { return role === "onshore" || role === "recon" || role === "calling"; }
+function teamLabel(o) { return TEAM_LABELS[o.onshore_team] || "Onshore"; }
+function onshoreCircle(o) {
+  const team = teamLabel(o);
+  switch (o.onshore_status) {
+    case "with_onshore": return ["\u26AA", `With the ${team} team`];
+    case "red": return ["\uD83D\uDD34", `${team} answered \u2014 Team Lead review`];
+    case "yellow": return ["\uD83D\uDFE1", `${team} needs more information`];
+    case "blue": return ["\uD83D\uDD35", "Recon unable \u2014 with the Calling team"];
+    case "green": return ["\uD83D\uDFE2", "Completed"];
+  }
+  return null;
+}
 function onshoreBadge(o) {
-  const c = ONSHORE_CIRCLE[o.onshore_status];
+  const c = onshoreCircle(o);
   return c ? `<span title="${_esc(c[1])}" style="white-space:nowrap;">${c[0]} <span style="font-size:11px;">${_esc(c[1])}</span></span>` : "";
 }
-const ONSHORE_KIND_LABEL = {sent: "Sent to Onshore", onshore_red: "\uD83D\uDD34 Onshore answered", onshore_yellow: "\uD83D\uDFE1 Onshore needs info", tl_info: "Team Lead info", resolved: "\uD83D\uDFE2 Resolved"};
-function onshoreHistoryHTML(o) {
-  const ms = o.messages || [];
+const ONSHORE_KIND_LABEL = {
+  sent: "Sent to the team", team_red: "\uD83D\uDD34 Answered", team_yellow: "\uD83D\uDFE1 Needs info", team_blue: "\uD83D\uDD35 Passed to Calling",
+  onshore_red: "\uD83D\uDD34 Answered", onshore_yellow: "\uD83D\uDFE1 Needs info", tl_info: "Team Lead info", resolved: "\uD83D\uDFE2 Resolved",
+};
+function onshoreHistoryHTML(o) { return onshoreMessagesHTML(o.messages || []); }
+function onshoreMessagesHTML(ms) {
   if (!ms.length) return `<span style="color:#999;">\u2014</span>`;
-  return ms.map(m => `<div style="margin-bottom:4px;"><b>${ONSHORE_KIND_LABEL[m.kind] || m.kind}</b> <span style="color:#888; font-size:11px;">${_esc(m.author_name || "")} \u00b7 ${_esc(String(m.created_at).replace("T", " ").slice(0, 16))}</span>` +
-    (m.text ? `<div style="white-space:pre-wrap;">${_esc(m.text)}</div>` : "") + `</div>`).join("");
+  return ms.map(m => `<div style="margin-bottom:6px;"><b>${ONSHORE_KIND_LABEL[m.kind] || m.kind}</b> <span style="color:#888; font-size:11px;">${_esc(m.author_name || "")}${m.author_role ? " (" + _esc(m.author_role) + ")" : ""} \u00b7 ${_esc(String(m.created_at).replace("T", " ").slice(0, 16))}</span>` +
+    (m.text ? `<div style="white-space:pre-wrap;">${_esc(m.text)}</div>` : "") +
+    ((m.attachments || []).length ? `<div style="font-size:12px;">\uD83D\uDCCE ` + m.attachments.map(a =>
+      `<a href="#" onclick="viewOnshoreAttachment(${a.id}); return false;">${_esc(a.file_name)}</a>`).join(", ") + `</div>` : "") + `</div>`).join("");
+}
+async function viewOnshoreAttachment(id) {
+  const res = await authFetch(`/onshore/attachments/${id}`);
+  if (!res.ok) { alert("Couldn't load the attachment: " + (await res.text())); return; }
+  const url = URL.createObjectURL(await res.blob());
+  window.open(url, "_blank");
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+async function showOnshoreHistory(orderId) {
+  const res = await authFetch(`/orders/${orderId}/onshore-history`);
+  if (!res.ok) { alert("Couldn't load the history: " + (await res.text())); return; }
+  document.getElementById("onshore-history-body").innerHTML = onshoreMessagesHTML(await res.json());
+  document.getElementById("onshore-history-modal").style.display = "flex";
 }
 
-let onshoreTab = "pending";
-let onshoreItems = [];
 
 async function showOnshoreView() {
   viewMode = "onshore";
@@ -3161,6 +3204,8 @@ async function showOnshoreView() {
   shareMode = false;
   selectedForShare.clear();
   document.getElementById("onshore-bar").style.display = "flex";
+  document.getElementById("onshore-title").textContent = isTeamRole() ? TEAM_QUEUE_LABEL[role] : "\uD83D\uDCDE Team Queues (view only)";
+  document.getElementById("on-team-label").style.display = isTeamRole() ? "none" : "inline-block";
   onshoreTab = "pending";
   onshoreSetTab("pending");
 }
@@ -3174,7 +3219,8 @@ function onshoreSetTab(tab) {
 async function loadOnshoreQueue() {
   const container = document.getElementById("grid-container");
   container.innerHTML = "<p>Loading\u2026</p>";
-  const res = await authFetch("/onshore/queue?tab=" + onshoreTab);
+  const teamSel = document.getElementById("on-team");
+  const res = await authFetch("/onshore/queue?tab=" + onshoreTab + (!isTeamRole() && teamSel && teamSel.value ? "&team=" + teamSel.value : ""));
   if (!res.ok) { container.innerHTML = "<p>Couldn't load the Onshore queue.</p>"; return; }
   onshoreItems = await res.json();
   renderOnshoreQueue();
@@ -3182,22 +3228,24 @@ async function loadOnshoreQueue() {
 
 function renderOnshoreQueue() {
   const container = document.getElementById("grid-container");
-  const canAct = role === "onshore" && onshoreTab === "pending";
+  const canAct = isTeamRole() && onshoreTab === "pending";
   if (!onshoreItems.length) {
-    container.innerHTML = `<p>${onshoreTab === "pending" ? "Nothing is waiting for the Onshore team." : onshoreTab === "awaiting" ? "Nothing is with a Team Lead right now." : "No completed items yet."}</p>`;
+    container.innerHTML = `<p>${onshoreTab === "pending" ? "Nothing is waiting for your team." : onshoreTab === "awaiting" ? "Nothing submitted is with a Team Lead right now." : "No completed items yet."}</p>`;
     return;
   }
-  let html = `<table><thead><tr><th>Sent</th><th>Process</th><th>Team Lead</th><th>EDM</th><th>Category</th><th>Escalation Details</th><th>History</th>` +
+  let html = `<table><thead><tr><th>Sent</th><th>Process</th><th>Team Lead</th><th>EDM</th><th>Category</th><th>Team</th><th>Escalation Details</th><th>History</th>` +
     (canAct ? `<th>Your Response</th><th>Action</th>` : `<th>Status</th><th>VENTRA Comment</th>`) + `</tr></thead><tbody>`;
   onshoreItems.forEach(o => {
     html += `<tr><td>${_esc(String(o.onshore_sent_at || "").replace("T", " ").slice(0, 16))}</td><td>${_esc(o.process_name || "")}</td>` +
-      `<td>${_esc(o.team_lead_name || "")}</td><td>${_esc(o.edm || "")}</td><td>${_esc(o.escalation_category || "")}</td>` +
+      `<td>${_esc(o.team_lead_name || "")}</td><td>${_esc(o.edm || "")}</td><td>${_esc(o.escalation_category || "")}</td><td>${_esc(teamLabel(o))}</td>` +
       `<td style="white-space:normal; min-width:220px;">${_escalationDetailSummaryHTML(o)}</td>` +
       `<td style="white-space:normal; min-width:220px; max-width:320px;">${onshoreHistoryHTML(o)}</td>`;
     if (canAct) {
-      html += `<td><textarea id="on-comment-${o.id}" rows="3" style="width:220px; font-family:inherit; padding:4px;" placeholder="Your comment\u2026"></textarea></td>` +
+      html += `<td style="white-space:normal;"><textarea id="on-comment-${o.id}" rows="3" style="width:220px; font-family:inherit; padding:4px;" placeholder="Your comment\u2026"></textarea>` +
+        `<div style="font-size:11px; margin-top:4px;">\uD83D\uDCCE Attachment (optional)<br><input type="file" id="on-files-${o.id}" multiple style="max-width:220px;"></div></td>` +
         `<td style="white-space:normal;"><button class="action-btn" style="background:#b91c1c; margin-bottom:4px;" title="Done on our side \u2014 back to the Team Lead for review" onclick="onshoreRespond(${o.id}, 'red', this)">\uD83D\uDD34 Send to Team Lead</button><br>` +
-        `<button class="action-btn" style="background:#b45309;" title="We need more information from the Team Lead" onclick="onshoreRespond(${o.id}, 'yellow', this)">\uD83D\uDFE1 Need More Info</button></td>`;
+        `<button class="action-btn" style="background:#b45309; margin-bottom:4px;" title="We need more information from the Team Lead" onclick="onshoreRespond(${o.id}, 'yellow', this)">\uD83D\uDFE1 Need More Info</button>` +
+        (role === "recon" ? `<br><button class="action-btn" style="background:#1d4ed8;" title="Unable to resolve \u2014 move it to the Calling team" onclick="onshoreRespond(${o.id}, 'blue', this)">\uD83D\uDD35 Send to Calling</button>` : "") + `</td>`;
     } else {
       html += `<td>${onshoreBadge(o)}</td><td style="white-space:normal; max-width:260px;">${_esc(o.ventra_comment || "")}</td>`;
     }
@@ -3209,11 +3257,14 @@ function renderOnshoreQueue() {
 async function onshoreRespond(orderId, status, btn) {
   const ta = document.getElementById(`on-comment-${orderId}`);
   const comment = ta ? ta.value.trim() : "";
-  if (!comment) { alert(status === "yellow" ? "Enter the information you need." : "Enter your comment."); return; }
+  if (!comment) { alert(status === "yellow" ? "Enter the information you need." : status === "blue" ? "Enter why you are unable to resolve it." : "Enter your comment."); return; }
+  const fileInput = document.getElementById(`on-files-${orderId}`);
+  const form = new FormData();
+  form.append("comment", comment);
+  form.append("status", status);
+  if (fileInput && fileInput.files) Array.from(fileInput.files).forEach(f => form.append("files", f));
   if (btn) btn.disabled = true;
-  const res = await authFetch(`/orders/${orderId}/onshore-respond`, {
-    method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({comment, status})
-  });
+  const res = await authFetch(`/orders/${orderId}/onshore-respond`, {method: "POST", body: form});
   if (!res.ok) {
     let msg = await res.text();
     try { msg = JSON.parse(msg).detail || msg; } catch (_) {}
@@ -3225,7 +3276,7 @@ async function onshoreRespond(orderId, status, btn) {
 }
 
 async function sendToOnshore(orderId, btn) {
-  const note = prompt("Optional note for the Onshore team (leave blank for none):");
+  const note = prompt("Optional note for the team (leave blank for none):");
   if (note === null) return;
   if (btn) btn.disabled = true;
   const res = await authFetch(`/orders/${orderId}/send-to-onshore`, {
