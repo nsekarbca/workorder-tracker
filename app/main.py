@@ -1171,6 +1171,7 @@ def delete_all_orders(
     # escalation details) have to go first or Postgres rejects the delete with a
     # foreign-key error (the "Internal Server Error").
     ids = db.query(models.WorkOrder.id).filter(models.WorkOrder.process_id == process_id)
+    db.query(models.EscalationEvent).filter(models.EscalationEvent.order_id.in_(ids)).delete(synchronize_session=False)
     db.query(models.OnshoreAttachment).filter(models.OnshoreAttachment.order_id.in_(ids)).delete(synchronize_session=False)
     db.query(models.OnshoreMessage).filter(models.OnshoreMessage.order_id.in_(ids)).delete(synchronize_session=False)
     db.query(models.ClarificationDetail).filter(models.ClarificationDetail.order_id.in_(ids)).delete(synchronize_session=False)
@@ -1982,11 +1983,16 @@ def list_escalations(
     _require_view_access(current_user, process_id)
     query = db.query(models.WorkOrder).filter(models.WorkOrder.process_id == process_id)
     if resolved:
-        query = query.filter(
-            models.WorkOrder.escalation_category.in_(("Clarification", *ESCALATION_CATEGORY_FIELDS.keys())),
-            models.WorkOrder.escalated == False,  # noqa: E712
-            models.WorkOrder.issue_closed_date.isnot(None),
-        )
+        had_queries = db.query(models.EscalationEvent.order_id).filter(
+            models.EscalationEvent.process_id == process_id, models.EscalationEvent.closed_date.isnot(None))
+        query = query.filter(or_(
+            and_(
+                models.WorkOrder.escalation_category.in_(("Clarification", *ESCALATION_CATEGORY_FIELDS.keys())),
+                models.WorkOrder.escalated == False,  # noqa: E712
+                models.WorkOrder.issue_closed_date.isnot(None),
+            ),
+            models.WorkOrder.id.in_(had_queries),
+        ))
     else:
         query = query.filter(
             models.WorkOrder.escalated == True,  # noqa: E712
@@ -1999,7 +2005,43 @@ def list_escalations(
     if current_user.role in ("admin", "super_admin"):
         _attach_team_leads(db, orders, prefer="owner")
     _attach_team_files(db, orders)
+    if resolved:
+        return _resolved_query_rows(db, orders)
     return orders
+
+
+def _resolved_query_rows(db: Session, orders) -> list:
+    """The resolved report lists every query on an order as its own row (own dates, category, comments and details)."""
+    events = {}
+    for e in db.query(models.EscalationEvent).filter(
+        models.EscalationEvent.order_id.in_([o.id for o in orders] or [0]), models.EscalationEvent.closed_date.isnot(None),
+    ).order_by(models.EscalationEvent.closed_date.desc(), models.EscalationEvent.id.desc()).all():
+        events.setdefault(e.order_id, []).append(e)
+    clar_fields = set(schemas.ClarificationDetailOut.model_fields) - {"order_id", "updated_at"}
+    rows = []
+    for o in orders:
+        base = schemas.WorkOrderOut.model_validate(o)
+        evs = events.get(o.id)
+        if not evs:
+            rows.append(base)
+            continue
+        for e in evs:
+            item = base.model_copy(deep=True)
+            item.issue_raised_date, item.issue_closed_date = e.raised_date, e.closed_date
+            item.escalation_category = e.category
+            item.ventra_comment, item.poster_comment = e.ventra_comment, e.poster_comment
+            try:
+                snap = json.loads(e.detail_json or "{}")
+            except ValueError:
+                snap = {}
+            if snap:
+                if e.category == "Clarification":
+                    item.clarification_detail = schemas.ClarificationDetailOut(order_id=o.id, **{k: v for k, v in snap.items() if k in clar_fields})
+                else:
+                    item.escalation_detail = schemas.EscalationDetailOut(order_id=o.id, category=e.category or "", data=snap)
+            rows.append(item)
+    rows.sort(key=lambda r: (r.issue_closed_date or date.min, r.id), reverse=True)
+    return rows
 
 
 @app.get("/orders/{order_id}", response_model=schemas.WorkOrderOut)
@@ -2226,6 +2268,11 @@ def update_colleague_fields(
         detail.amount_posted = str(order.posted_amount) if order.posted_amount is not None else None
         detail.clarification_details = order.poster_comment
         detail.updated_at = datetime.now(IST)
+        if not order.escalated:
+            _open_escalation_event(db, order, current_user, {
+                k: getattr(detail, k) for k in (
+                    "deposit_type", "exchange", "era_check", "edm_batch_number", "bar_batch_number", "batch_description",
+                    "escalation_type", "clarification_details", "team", "poster_login", "amount_posted")})
         order.escalated = True
         if order.timer_status == "running":
             _finalize_timer(order, "paused")
@@ -2252,6 +2299,8 @@ def update_colleague_fields(
         detail.data = merged
         detail.posted_by_name = current_user.full_name
         detail.updated_at = datetime.now(IST)
+        if not order.escalated:
+            _open_escalation_event(db, order, current_user, dict(merged))
         order.escalated = True
         if order.timer_status == "running":
             _finalize_timer(order, "paused")
@@ -2284,9 +2333,7 @@ def update_colleague_fields(
     # minus business days spent in an open Clarification pause window.
     if order.posted_date and order.received_date:
         total_bdays = _count_business_days(order.received_date, order.posted_date)
-        pause_bdays = 0
-        if order.issue_raised_date and order.issue_closed_date:
-            pause_bdays = _count_business_days(order.issue_raised_date, order.issue_closed_date)
+        pause_bdays = _pause_business_days(db, order)
         order.tat_days = total_bdays - pause_bdays
 
     db.commit()
@@ -3375,9 +3422,7 @@ def correct_completed_order(
         order.pending_amount = order.amount - (order.posted_amount or 0)
     if order.posted_date and order.received_date:
         total_bdays = _count_business_days(order.received_date, order.posted_date)
-        pause_bdays = 0
-        if order.issue_raised_date and order.issue_closed_date:
-            pause_bdays = _count_business_days(order.issue_raised_date, order.issue_closed_date)
+        pause_bdays = _pause_business_days(db, order)
         order.tat_days = total_bdays - pause_bdays
 
     if reasons:
@@ -3428,6 +3473,7 @@ def resolve_escalation(
 
     order.ventra_comment = comment
     order.issue_closed_date = datetime.now(IST).date()
+    _close_escalation_event(db, order, current_user, comment)
     order.escalated = False
     order.last_edited_by = current_user.username
     # The clock stays paused after a Team Lead resolves it: the colleague
@@ -3961,6 +4007,49 @@ def save_escalation_detail(
     db.commit()
     db.refresh(detail)
     return detail
+
+
+def _open_escalation_event(db: Session, order: models.WorkOrder, user: models.User, snapshot: dict) -> None:
+    """A colleague raises a (new) query: log it with its own Issue Raised Date and reset the team hand-off."""
+    today = datetime.now(IST).date()
+    db.add(models.EscalationEvent(
+        order_id=order.id, process_id=order.process_id, team_lead_id=order.team_lead_id,
+        category=order.escalation_category, raised_date=today, poster_comment=order.poster_comment,
+        detail_json=json.dumps(snapshot, default=str), raised_by_name=user.full_name,
+        created_at=datetime.now(IST).replace(tzinfo=None),
+    ))
+    order.issue_raised_date = today
+    order.issue_closed_date = None
+    order.onshore_status = None
+    order.onshore_team = None
+    order.onshore_comment = None
+    order.onshore_tl_reply = None
+    order.onshore_sent_at = None
+
+
+def _close_escalation_event(db: Session, order: models.WorkOrder, user: models.User, comment: str) -> None:
+    ev = (
+        db.query(models.EscalationEvent)
+        .filter(models.EscalationEvent.order_id == order.id, models.EscalationEvent.closed_date.is_(None))
+        .order_by(models.EscalationEvent.id.desc()).first()
+    )
+    if ev:
+        ev.closed_date = datetime.now(IST).date()
+        ev.ventra_comment = comment
+        ev.resolved_by_name = user.full_name
+
+
+def _pause_business_days(db: Session, order: models.WorkOrder) -> int:
+    """Business days spent waiting on Team Lead answers: every closed query's raised -> closed window added up."""
+    events = db.query(models.EscalationEvent).filter(
+        models.EscalationEvent.order_id == order.id, models.EscalationEvent.closed_date.isnot(None),
+        models.EscalationEvent.raised_date.isnot(None),
+    ).all()
+    if events:
+        return sum(_count_business_days(e.raised_date, e.closed_date) for e in events)
+    if order.issue_raised_date and order.issue_closed_date:      # orders from before queries were logged
+        return _count_business_days(order.issue_raised_date, order.issue_closed_date)
+    return 0
 
 
 def _count_business_days(start: date, end: date) -> int:

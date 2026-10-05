@@ -452,6 +452,30 @@ class ImportException(Base):
     row_json = Column(Text, nullable=True)                       # the whole inventory row, so an unassigned one can be moved into a queue later
 
 
+class EscalationEvent(Base):
+    """
+    One query (escalation) raised on an order. An order can be escalated more than
+    once — on the same day or on different days — and each one keeps its own Issue
+    Raised / Issue Closed Date, category, comments and a snapshot of its details.
+    TAT's paused time is the sum of the closed ones. order_id is deliberately not an FK.
+    """
+    __tablename__ = "escalation_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, nullable=False, index=True)
+    process_id = Column(Integer, nullable=True, index=True)
+    team_lead_id = Column(Integer, nullable=True, index=True)
+    category = Column(String, nullable=True)
+    raised_date = Column(Date, nullable=True)
+    closed_date = Column(Date, nullable=True)
+    poster_comment = Column(Text, nullable=True)
+    ventra_comment = Column(Text, nullable=True)
+    detail_json = Column(Text, nullable=True)        # the popup's values when it was raised
+    raised_by_name = Column(String, nullable=True)
+    resolved_by_name = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=True)
+
+
 class OnshoreMessage(Base):
     """History of an order's Onshore hand-off: sent, Onshore replies (red / yellow), Team Lead info, resolved."""
     __tablename__ = "onshore_messages"
