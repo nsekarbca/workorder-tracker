@@ -341,6 +341,7 @@ class WorkOrderOut(BaseModel):
     onshore_tl_reply: Optional[str] = None
     onshore_sent_at: Optional[datetime] = None
     onshore_team: Optional[str] = None
+    team_files: List[dict] = []
     posted_date: Optional[date]
     tat_days: Optional[int]
     assigned_to_id: Optional[int]

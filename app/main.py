@@ -1682,6 +1682,26 @@ def _auto_assign_open_slots(db: Session, process_id: int):
 # Read endpoints
 # ---------------------------------------------------------------------------
 
+def _attach_team_files(db: Session, orders) -> None:
+    """Tags each order with `team_files` (id, file name, who sent it) from its Onshore / Recon / Calling / Team Lead hand-off, so rows can show the links."""
+    ids = [o.id for o in orders]
+    by_order = {}
+    if ids:
+        rows = (
+            db.query(models.OnshoreAttachment, models.OnshoreMessage)
+            .join(models.OnshoreMessage, models.OnshoreMessage.id == models.OnshoreAttachment.message_id)
+            .filter(models.OnshoreAttachment.order_id.in_(ids))
+            .order_by(models.OnshoreAttachment.id.asc())
+            .all()
+        )
+        for a, m in rows:
+            by_order.setdefault(a.order_id, []).append(
+                {"id": a.id, "file_name": a.file_name, "from_role": m.author_role, "from_name": m.author_name}
+            )
+    for o in orders:
+        o.team_files = by_order.get(o.id, [])
+
+
 @app.get("/orders", response_model=List[schemas.WorkOrderOut])
 def list_orders(
     process_id: int,
@@ -1712,6 +1732,7 @@ def list_orders(
     orders = query.order_by(models.WorkOrder.id.asc()).all()
     if current_user.role in ("admin", "super_admin"):
         _attach_team_leads(db, orders, prefer="owner")     # so the screen can group by Team Lead
+    _attach_team_files(db, orders)
     return orders
 
 
@@ -1842,6 +1863,7 @@ def list_escalations(
     orders = query.order_by(order_col.desc() if resolved else order_col.asc()).all()
     if current_user.role in ("admin", "super_admin"):
         _attach_team_leads(db, orders, prefer="owner")
+    _attach_team_files(db, orders)
     return orders
 
 
@@ -3435,7 +3457,7 @@ def onshore_respond(
 @app.get("/orders/{order_id}/onshore-history", response_model=List[schemas.OnshoreMessageOut])
 def onshore_history(
     order_id: int,
-    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin", "onshore", "recon", "calling")),
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "super_admin", "onshore", "recon", "calling")),
     db: Session = Depends(get_db),
 ):
     """The hand-off history (messages + attachments) of one escalation, for the Team Lead, Admin / Super Admin and the teams."""
@@ -3444,6 +3466,8 @@ def onshore_history(
         raise HTTPException(status_code=404, detail="Order not found")
     if current_user.role == "team_lead" and order.team_lead_id != current_user.id:
         raise HTTPException(status_code=403, detail="This order belongs to another Team Lead")
+    if current_user.role == "colleague" and order.assigned_to_id != current_user.id:
+        raise HTTPException(status_code=403, detail="This order is assigned to another colleague")
     msgs = db.query(models.OnshoreMessage).filter(models.OnshoreMessage.order_id == order_id).order_by(models.OnshoreMessage.id.asc()).all()
     atts = {}
     for a in db.query(models.OnshoreAttachment).filter(models.OnshoreAttachment.order_id == order_id).all():
@@ -3459,7 +3483,7 @@ def onshore_history(
 @app.get("/onshore/attachments/{attachment_id}")
 def get_onshore_attachment(
     attachment_id: int,
-    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin", "onshore", "recon", "calling")),
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "super_admin", "onshore", "recon", "calling")),
     db: Session = Depends(get_db),
 ):
     """Serves an attachment from the hand-off history to the Team Lead, the teams and Admin / Super Admin."""
@@ -3470,6 +3494,10 @@ def get_onshore_attachment(
         order = db.query(models.WorkOrder).filter(models.WorkOrder.id == att.order_id).first()
         if not order or order.team_lead_id != current_user.id:
             raise HTTPException(status_code=403, detail="This attachment belongs to another Team Lead's order")
+    if current_user.role == "colleague":
+        order = db.query(models.WorkOrder).filter(models.WorkOrder.id == att.order_id).first()
+        if not order or order.assigned_to_id != current_user.id:
+            raise HTTPException(status_code=403, detail="This attachment belongs to another colleague's order")
     return Response(
         content=base64.b64decode(att.file_data),
         media_type=att.content_type or "application/octet-stream",
