@@ -314,6 +314,9 @@
           <span style="flex:1;"></span>
           <button class="od-tab active" id="ie-tab-completed" onclick="ieSetTab('duplicate_completed')">Already Completed</button>
           <button class="od-tab" id="ie-tab-unassigned" style="display:none;" onclick="ieSetTab('unassigned_client')">Unassigned Clients</button>
+          <select id="ie-assign-tl" style="display:none;" title="Team Lead who will get the selected clients"></select>
+          <button class="action-btn" id="ie-assign-btn" style="display:none;" onclick="ieAssignSelected(this)">Assign client &amp; move to Active Queue</button>
+          <button class="action-btn" id="ie-delete-btn" style="background:#b42318;" onclick="ieDeleteSelected(this)">Delete selected</button>
           <button class="action-btn" onclick="ieExportCSV()">Export CSV</button>
           <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
         </div>
@@ -1451,6 +1454,7 @@ async function saveProfileDates() {
 
 let ieRows = [];
 let ieTab = "duplicate_completed";
+const ieSel = new Set();
 
 function ieAllTeams() { return role === "admin" || role === "super_admin"; }
 
@@ -1479,7 +1483,18 @@ async function showImportExceptionsView() {
   document.getElementById("ie-tab-unassigned").style.display = ieAllTeams() ? "inline-block" : "none";
   document.getElementById("ie-team-lead").innerHTML = `<option value="">All</option>`;
   ieTab = "duplicate_completed";
+  ieSel.clear();
   ieSyncTabs();
+  if (role === "super_admin") {
+    try {
+      const cr = await authFetch("/clients");
+      if (cr.ok) {
+        const cd = await cr.json();
+        document.getElementById("ie-assign-tl").innerHTML = `<option value="">Team Lead\u2026</option>` +
+          cd.team_leads.filter(t => t.active).map(t => `<option value="${t.id}">${_esc(t.full_name)}</option>`).join("");
+      }
+    } catch (_) { /* the picker just stays empty */ }
+  }
 
   let procs = myProcesses;
   if (ieAllTeams()) {
@@ -1501,13 +1516,54 @@ function ieQuickRange(days) {
   loadImportExceptions();
 }
 
-function ieSetTab(tab) { ieTab = tab; ieSyncTabs(); renderImportExceptions(); }
+function ieSetTab(tab) { ieTab = tab; ieSel.clear(); ieSyncTabs(); renderImportExceptions(); }
+function ieToggle(id, on) { if (on) ieSel.add(id); else ieSel.delete(id); ieUpdateButtons(); }
+function ieToggleAll(on) { ieVisible().forEach(r => on ? ieSel.add(r.id) : ieSel.delete(r.id)); renderImportExceptions(); }
+function ieUpdateButtons() {
+  const n = ieSel.size;
+  document.getElementById("ie-delete-btn").textContent = n ? `Delete selected (${n})` : "Delete selected";
+  document.getElementById("ie-assign-btn").textContent = n ? `Assign client & move to Active Queue (${n})` : "Assign client & move to Active Queue";
+}
+async function ieDeleteSelected(btn) {
+  const ids = Array.from(ieSel);
+  if (!ids.length) { alert("Tick the row(s) to delete first."); return; }
+  if (!confirm(`Delete ${ids.length} selected row${ids.length === 1 ? "" : "s"} from Import Exceptions?`)) return;
+  btn.disabled = true;
+  const res = await authFetch("/import-exceptions/delete", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ids})});
+  btn.disabled = false;
+  if (!res.ok) { alert("Couldn't delete: " + (await res.text())); return; }
+  ieSel.clear();
+  await loadImportExceptions();
+}
+async function ieAssignSelected(btn) {
+  const ids = Array.from(ieSel);
+  const tlId = parseInt(document.getElementById("ie-assign-tl").value);
+  if (!ids.length) { alert("Tick the row(s) to assign first."); return; }
+  if (!tlId) { alert("Choose the Team Lead first."); return; }
+  const tlName = document.getElementById("ie-assign-tl").selectedOptions[0].textContent;
+  if (!confirm(`Assign the client(s) of ${ids.length} selected row${ids.length === 1 ? "" : "s"} to ${tlName} and move their orders into ${tlName}'s Active Queue?`)) return;
+  btn.disabled = true;
+  const res = await authFetch("/import-exceptions/release", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ids, team_lead_id: tlId})});
+  btn.disabled = false;
+  if (!res.ok) { alert("Couldn't assign: " + (await res.text())); return; }
+  const r = await res.json();
+  let msg = `${r.moved} order${r.moved === 1 ? "" : "s"} moved to ${tlName}'s Active Queue; ${r.clients_assigned} client assignment${r.clients_assigned === 1 ? "" : "s"} added.`;
+  if (r.already_in_system) msg += `\n${r.already_in_system} already in the system (removed from this list).`;
+  if (r.no_client) msg += `\n${r.no_client} row(s) have a client that is not in the client list \u2014 add it under Admin \u2192 Clients first; they stay here.`;
+  if (r.other_process.length) msg += `\n${tlName} doesn't work on the process for: ${r.other_process.join(", ")} \u2014 they stay here.`;
+  alert(msg);
+  ieSel.clear();
+  await loadImportExceptions();
+}
 function ieSyncTabs() {
   document.getElementById("ie-tab-completed").classList.toggle("active", ieTab === "duplicate_completed");
   document.getElementById("ie-tab-unassigned").classList.toggle("active", ieTab === "unassigned_client");
+  const unassigned = ieTab === "unassigned_client" && role === "super_admin";
+  document.getElementById("ie-assign-tl").style.display = unassigned ? "inline-block" : "none";
+  document.getElementById("ie-assign-btn").style.display = unassigned ? "inline-block" : "none";
   document.getElementById("ie-hint").textContent = ieTab === "duplicate_completed"
     ? "These EDMs were in the inventory file but are already Completed (imported within the last month), so they were not imported again."
-    : "These rows were not imported because their client is not in the client list, or has no Team Lead for the process. Assign the client under Admin \u2192 Clients, then import the file again.";
+    : "These rows were not imported because their client is not in the client list, or has no Team Lead for the process. " + (role === "super_admin" ? "Tick the rows, choose a Team Lead and click \u201cAssign client & move to Active Queue\u201d \u2014 the client is assigned to that Team Lead and the orders go straight to their queue." : "Ask the Super Admin to assign the client.");
 }
 
 async function loadImportExceptions() {
@@ -1567,23 +1623,26 @@ function renderImportExceptions() {
     (ieRows.length >= 5000 ? ` <span style="color:#b45309;">\u2014 showing the latest 5,000; narrow the dates to see older ones.</span>` : "") + `</p>`;
   if (ieTab === "duplicate_completed") {
     html += `<div class="od-scroll"><table><thead><tr>` +
-      ["Imported (IST)", "Process", "EDM", "Client", "Def Doc Type", "Amount", "Team Lead", "Imported By", "Completed On", "Completed By"].map(th).join("") + `</tr></thead><tbody>`;
+      [ieAllBox(rows), "Imported (IST)", "Process", "EDM", "Client", "Def Doc Type", "Amount", "Team Lead", "Imported By", "Completed On", "Completed By"].map((h, i) => i ? th(h) : `<th class="col">${h}</th>`).join("") + `</tr></thead><tbody>`;
     rows.forEach(r => {
-      html += `<tr><td style="white-space:nowrap;">${_esc(ieWhen(r.created_at))}</td><td>${_esc(r.process_name)}</td><td>${_esc(r.edm)}</td>` +
+      html += `<tr><td>${ieBox(r)}</td><td style="white-space:nowrap;">${_esc(ieWhen(r.created_at))}</td><td>${_esc(r.process_name)}</td><td>${_esc(r.edm)}</td>` +
         `<td>${_esc(ieClientText(r))}</td><td>${_esc(r.def_doc_type)}</td><td>${_esc(r.amount ?? "")}</td><td>${_esc(r.team_lead_name)}</td>` +
         `<td>${_esc(r.imported_by_name)}</td><td>${_esc(r.existing_posted_date)}</td><td>${_esc(r.existing_employee_name)}</td></tr>`;
     });
   } else {
     html += `<div class="od-scroll"><table><thead><tr>` +
-      ["Imported (IST)", "Process", "EDM", "Division in file", "Client", "Def Doc Type", "Amount", "Reason", "Imported By"].map(th).join("") + `</tr></thead><tbody>`;
+      [ieAllBox(rows), "Imported (IST)", "Process", "EDM", "Division in file", "Client", "Def Doc Type", "Amount", "Reason", "Imported By"].map((h, i) => i ? th(h) : `<th class="col">${h}</th>`).join("") + `</tr></thead><tbody>`;
     rows.forEach(r => {
-      html += `<tr><td style="white-space:nowrap;">${_esc(ieWhen(r.created_at))}</td><td>${_esc(r.process_name)}</td><td>${_esc(r.edm)}</td>` +
+      html += `<tr><td>${ieBox(r)}</td><td style="white-space:nowrap;">${_esc(ieWhen(r.created_at))}</td><td>${_esc(r.process_name)}</td><td>${_esc(r.edm)}</td>` +
         `<td>${_esc(r.division_raw)}</td><td>${_esc(ieClientText(r))}</td><td>${_esc(r.def_doc_type)}</td><td>${_esc(r.amount ?? "")}</td>` +
         `<td>${_esc(r.reason)}</td><td>${_esc(r.imported_by_name)}</td></tr>`;
     });
   }
   box.innerHTML = html + `</tbody></table></div>`;
+  ieUpdateButtons();
 }
+function ieBox(r) { return `<input type="checkbox" ${ieSel.has(r.id) ? "checked" : ""} onchange="ieToggle(${r.id}, this.checked)">`; }
+function ieAllBox(rows) { return `<input type="checkbox" title="Select all" ${rows.length && rows.every(r => ieSel.has(r.id)) ? "checked" : ""} onchange="ieToggleAll(this.checked)">`; }
 
 function ieExportCSV() {
   const rows = ieVisible();
