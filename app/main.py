@@ -3255,7 +3255,8 @@ def correct_completed_order(
 @app.patch("/orders/{order_id}/resolve-escalation", response_model=schemas.WorkOrderOut)
 def resolve_escalation(
     order_id: int,
-    payload: schemas.EscalationResolve,
+    ventra_comment: str = Form(""),
+    files: List[UploadFile] = File(default=[]),
     current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
     db: Session = Depends(get_db),
 ):
@@ -3263,6 +3264,7 @@ def resolve_escalation(
     A Team Lead's VENTRA Comment resolves the escalation: it auto-stamps
     Issue Closed Date and unlocks the row back to the colleague — Posting
     Status stays 'Clarification' so they can finish posting it themselves.
+    Optional attachments (multipart) are kept with the order and shown to the colleague.
     """
     order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
     if not order:
@@ -3270,6 +3272,7 @@ def resolve_escalation(
     _require_process_access(current_user, order.process_id)
     if not order.escalated:
         raise HTTPException(status_code=400, detail="This order isn't currently escalated")
+    blobs = _read_onshore_files(files)
 
     if order.onshore_status in ("with_onshore", "yellow", "blue", "orange"):
         raise HTTPException(status_code=400, detail="This escalation is with another team \u2014 it can be resolved once they respond (red)")
@@ -3277,11 +3280,16 @@ def resolve_escalation(
         # The Onshore team's answer becomes the VENTRA Comment, and their circle turns green.
         comment = (order.onshore_comment or "").strip()
         order.onshore_status = "green"
-        _add_onshore_message(db, current_user, order, "resolved", comment)
+        res_msg = _add_onshore_message(db, current_user, order, "resolved", comment)
     else:
-        comment = (payload.ventra_comment or "").strip()
+        comment = (ventra_comment or "").strip()
+        res_msg = None
     if not comment:
         raise HTTPException(status_code=400, detail="VENTRA Comment can't be empty")
+    if blobs:
+        if res_msg is None:
+            res_msg = _add_onshore_message(db, current_user, order, "resolved", comment)
+        _save_onshore_files(db, current_user, order, res_msg, blobs)
 
     order.ventra_comment = comment
     order.issue_closed_date = datetime.now(IST).date()
