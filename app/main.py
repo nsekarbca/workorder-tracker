@@ -1206,6 +1206,7 @@ def delete_one_order(
 # ---------------------------------------------------------------------------
 
 # EDM process: only these Def Doc Types are imported (compared ignoring case / extra spaces).
+CB_UNMATCHED_ALLOWED_DOC_TYPES = {"unmatched eob"}
 EDM_ALLOWED_DOC_TYPES = {"manual eft eob", "lockbox payment", "insurance credit card pmt only", "insurance credit card pmt"}
 # Rows in this Bar Grp are never imported (any process).
 SKIP_BAR_GRPS = {"grp - 4 gottlieb-sound phys"}
@@ -1373,6 +1374,7 @@ def import_inventory(
 
     process = db.query(models.Process).filter(models.Process.id == process_id).first()
     is_edm = bool(process and process.name.strip().upper() == "EDM")
+    is_cb_unmatched = bool(process and process.name.strip().lower() == "cb unmatched posting")
 
     # Client -> Team Lead for this process
     clients = db.query(models.Client).all()
@@ -1440,6 +1442,9 @@ def import_inventory(
 
         # 1) EDM process: only the allowed Def Doc Types
         if is_edm and _norm_text(row.get("def_doc_type")) not in EDM_ALLOWED_DOC_TYPES:
+            counts["skipped_doc_type"] += 1
+            continue
+        if is_cb_unmatched and _norm_text(row.get("def_doc_type")) not in CB_UNMATCHED_ALLOWED_DOC_TYPES:
             counts["skipped_doc_type"] += 1
             continue
 
