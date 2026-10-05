@@ -3807,6 +3807,9 @@ def save_escalation_detail(
         if key in payload.data:
             merged[key] = payload.data[key]
 
+    if "amount" in manual_keys and merged.get("amount") in (None, "") and order.amount is not None:
+        merged["amount"] = str(order.amount)      # Amount defaults to the order's own Amount
+
     if "utility_category" in manual_keys and merged.get("utility_category"):
         if merged["utility_category"] not in UTILITY_CATEGORY_OPTIONS:
             raise HTTPException(status_code=400, detail=f"utility_category must be one of {UTILITY_CATEGORY_OPTIONS}")
