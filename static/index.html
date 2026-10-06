@@ -420,6 +420,9 @@
       </div>
       <div id="share-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px; background:white; padding:12px; border-radius:8px;">
         <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
+          <label id="share-from-label" style="display:none;">Transfer From
+            <select id="share-from-team-lead"></select>
+          </label>
           <label>Transfer To
             <select id="share-to-team-lead"></select>
           </label>
@@ -800,6 +803,7 @@ const ESCALATION_CATEGORY_FIELDS = {
 };
 
 function isLeadRole() { return role === "team_lead" || role === "super_admin"; }
+function canShareOrders() { return role === "team_lead" || role === "admin" || role === "super_admin"; }
 
 // ---------------------------------------------------------------------
 // Team Lead-wise views (Admin / Super Admin): Active Queue, Escalation
@@ -1319,7 +1323,7 @@ function showApp() {
     document.getElementById("nav-batch-btn").style.display = "block";
     document.getElementById("import-file").addEventListener("change", importCSV);
     if (currentProcessId) loadColleagueList();
-    if (role === "team_lead") {
+    if (canShareOrders()) {
       document.getElementById("share-btn").style.display = "inline-block";
     }
     if (role === "super_admin") {
@@ -1330,7 +1334,8 @@ function showApp() {
     // delegation) — not the rest of the Team Lead toolset yet.
     document.getElementById("import-btn").style.display = "inline-block";
     document.getElementById("import-file").addEventListener("change", importCSV);
-    if (currentProcessId) loadImportOnBehalfDropdown();
+    if (currentProcessId) { loadImportOnBehalfDropdown(); loadColleagueList(); }
+    document.getElementById("share-btn").style.display = "inline-block";      // Share Orders (Team Lead to Team Lead)
     document.getElementById("nav-orders-dash-btn").style.display = "block";   // Orders Dashboard (all teams, Team Lead-wise)
     document.getElementById("nav-batch-btn").style.display = "block";         // Batch Dashboard (all teams, Team Lead-wise, view-only)
     document.getElementById("nav-audit-btn").style.display = "block";         // Team Lead Change Log
@@ -4084,9 +4089,10 @@ function exportProductionCSV() {
   URL.revokeObjectURL(url);
 }
 
+let colleagueListProcess = null;
 async function loadColleagueList() {
   const res = await authFetch(withProcess("/users/colleagues"));
-  if (res.ok) colleagueList = await res.json();
+  if (res.ok) { colleagueList = await res.json(); colleagueListProcess = currentProcessId; }
 }
 
 async function loadImportOnBehalfDropdown() {
@@ -4126,6 +4132,7 @@ async function reassignOrder(orderId, newColleagueId) {
 
 async function loadOrders() {
   if (!currentProcessId) return;
+  if (role === "admin" && colleagueListProcess !== currentProcessId) await loadColleagueList();
   document.getElementById("admin-panel").style.display = "none";
   document.getElementById("toolbar").style.display = "flex";
   document.getElementById("active-tl-label").style.display = tlAllTeams() ? "inline-block" : "none";
@@ -4458,11 +4465,19 @@ async function toggleShareMode() {
 
   const res = await authFetch(withProcess("/users/team-leads"));
   const sel = document.getElementById("share-to-team-lead");
+  const fromSel = document.getElementById("share-from-team-lead");
+  const onBehalf = role !== "team_lead";                  // Admin / Super Admin move orders between any two Team Leads
+  document.getElementById("share-from-label").style.display = onBehalf ? "inline-block" : "none";
   sel.innerHTML = "";
+  fromSel.innerHTML = `<option value="">Choose\u2026</option>`;
   if (res.ok) {
     const leads = await res.json();
     leads.forEach(l => {
-      if (l.full_name === fullName) return; // exclude self
+      if (onBehalf) {
+        const f = document.createElement("option");
+        f.value = l.id; f.textContent = l.full_name;
+        fromSel.appendChild(f);
+      } else if (l.full_name === fullName) return; // a Team Lead excludes self
       const opt = document.createElement("option");
       opt.value = l.id; opt.textContent = l.full_name;
       sel.appendChild(opt);
@@ -4494,20 +4509,47 @@ async function doTransfer(orderIds) {
     return;
   }
   const toName = sel.options[sel.selectedIndex].textContent;
-  const payload = { to_team_lead_id: parseInt(toId) };
-  if (orderIds) payload.order_ids = orderIds;
-
-  const res = await authFetch(withProcess("/orders/transfer"), {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(payload)
-  });
-  if (!res.ok) {
-    alert("Transfer failed: " + (await res.text()));
-    return;
+  const post = async (payload) => {
+    const res = await authFetch(withProcess("/orders/transfer"), {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) { alert("Transfer failed: " + (await res.text())); return null; }
+    return (await res.json()).transferred;
+  };
+  let total = 0;
+  if (role === "team_lead") {
+    const payload = { to_team_lead_id: parseInt(toId) };
+    if (orderIds) payload.order_ids = orderIds;
+    const n = await post(payload);
+    if (n === null) return;
+    total = n;
+  } else {
+    // Admin / Super Admin: orders move out of the Team Lead who owns them.
+    const groups = new Map();                       // from Team Lead id -> order ids (null = whole queue)
+    if (orderIds) {
+      orderIds.forEach(id => {
+        const o = currentOrders.find(x => x.id === id);
+        if (!o || !o.team_lead_id) return;
+        if (!groups.has(o.team_lead_id)) groups.set(o.team_lead_id, []);
+        groups.get(o.team_lead_id).push(id);
+      });
+    } else {
+      const f = document.getElementById("share-from-team-lead").value;
+      if (!f) { alert("Choose the Team Lead to transfer from."); return; }
+      groups.set(parseInt(f), null);
+    }
+    for (const [fromId, ids] of groups) {
+      if (fromId === parseInt(toId)) continue;
+      const payload = { to_team_lead_id: parseInt(toId), from_team_lead_id: fromId };
+      if (ids) payload.order_ids = ids;
+      const n = await post(payload);
+      if (n === null) return;
+      total += n;
+    }
   }
-  const data = await res.json();
-  alert(`${data.transferred} order(s) shared with ${toName}.`);
+  alert(`${total} order(s) shared with ${toName}.`);
   cancelShareMode();
   loadOrders();
 }
@@ -4519,7 +4561,10 @@ function transferWholeQueue() {
     return;
   }
   const toName = sel.options[sel.selectedIndex].textContent;
-  const sure = confirm(`Transfer your ENTIRE eligible queue (not yet Completed or submitted) to ${toName}?`);
+  const fromSel = document.getElementById("share-from-team-lead");
+  const whose = role === "team_lead" ? "your" : (fromSel.value ? fromSel.options[fromSel.selectedIndex].textContent + "'s" : "");
+  if (!whose) { alert("Choose the Team Lead to transfer from."); return; }
+  const sure = confirm(`Transfer ${whose} ENTIRE eligible queue (not yet Completed or submitted) to ${toName}?`);
   if (!sure) return;
   doTransfer(null);
 }
@@ -4547,7 +4592,7 @@ function visibleColumns() {
 
 function renderGrid(orders) {
   const cols = visibleColumns();
-  const hasActionCol = role === "colleague" || isLeadRole();
+  const hasActionCol = role === "colleague" || isLeadRole() || role === "admin";
   let activeTl = "";
   if (tlAllTeams()) {
     // Team Lead dropdown (options from everything loaded), then group the rows by Team Lead.
@@ -4585,7 +4630,7 @@ function renderGrid(orders) {
 
     html += `<tr data-row-id="${o.id}"${isEscalated ? ' class="row-escalated"' : ""}>`;
     if (shareMode) {
-      const shareable = o.team_lead_id === myUserId && !savedCompleted;
+      const shareable = (role === "team_lead" ? o.team_lead_id === myUserId : !!o.team_lead_id) && !savedCompleted;
       html += `<td>${shareable ? `<input type="checkbox" onchange="toggleShareRow(${o.id}, this.checked)" ${selectedForShare.has(o.id) ? "checked" : ""}>` : ""}</td>`;
     }
     cols.forEach(c => {
@@ -4683,6 +4728,19 @@ function renderGrid(orders) {
           html += `<option value="${c.id}" ${isCurrent ? "selected" : ""}>${c.full_name}${isCurrent ? " (current)" : ""}</option>`;
         });
         html += `</select> <button class="action-btn" style="background:var(--red); padding:4px 8px; font-size:11px;" onclick="clearOneOrder(${o.id})">\ud83d\uddd1</button></td>`;
+      }
+    }
+    else if (role === "admin") {
+      const delBtn = `<button class="action-btn" style="background:var(--red); padding:4px 8px; font-size:11px;" onclick="clearOneOrder(${o.id})">\ud83d\uddd1</button>`;
+      if (savedCompleted) {
+        html += `<td>${delBtn}</td>`;
+      } else {
+        html += `<td><select onchange="reassignOrder(${o.id}, this.value)"><option value="">Reassign\u2026</option>`;
+        colleagueList.forEach(c => {
+          const isCurrent = c.id === o.assigned_to_id;
+          html += `<option value="${c.id}" ${isCurrent ? "selected" : ""}>${c.full_name}${isCurrent ? " (current)" : ""}</option>`;
+        });
+        html += `</select> ${delBtn}</td>`;
       }
     }
     html += `</tr>`;
