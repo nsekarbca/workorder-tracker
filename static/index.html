@@ -3504,7 +3504,7 @@ async function loadUserList() {
   const res = await authFetch("/users");
   if (!res.ok) return;
   allUsers = await res.json();
-  let html = "<table><thead><tr><th>Full Name</th><th>Username</th><th>Role</th><th>Email</th><th>Status</th><th>Processes</th><th>Action</th></tr></thead><tbody>";
+  let html = '<div class="od-scroll"><table><thead><tr><th>Full Name</th><th>Username</th><th>Role</th><th>Email</th><th>Status</th><th>Processes</th><th>Action</th></tr></thead><tbody>';
   allUsers.forEach(u => {
     html += `<tr><td>${u.full_name}</td><td>${u.username}</td><td>${u.role}</td><td>${u.email || ""}</td><td>${u.employment_status}</td><td>${u.processes.map(p=>p.name).join(", ")}</td>`;
     html += `<td>
@@ -3512,7 +3512,7 @@ async function loadUserList() {
       <button class="action-btn" onclick="resetUserPassword(${u.id})">Reset Password</button>
     </td></tr>`;
   });
-  html += "</tbody></table>";
+  html += "</tbody></table></div>";
   document.getElementById("user-list").innerHTML = html;
 }
 
