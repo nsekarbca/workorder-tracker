@@ -45,6 +45,7 @@ _ADDED_COLUMNS = [
     ("work_orders", "onshore_sent_at", "TIMESTAMP"),
     ("work_orders", "onshore_team", "VARCHAR"),
     ("import_exceptions", "row_json", "TEXT"),
+    ("daily_batch_stats", "comment", "TEXT"),
     ("daily_batch_stats", "pending_hours", "DOUBLE PRECISION"),
     ("daily_batch_stats", "hours_status", "VARCHAR"),
     ("daily_batch_stats", "hours_decided_by", "VARCHAR"),
@@ -1784,7 +1785,8 @@ def _auto_assign_open_slots(db: Session, process_id: int):
     candidates = (
         db.query(models.WorkOrder)
         .filter(models.WorkOrder.process_id == process_id, models.WorkOrder.assigned_to_id.is_(None))
-        .order_by(models.WorkOrder.id.asc())
+        # Oldest Deposit Date first (blank ones last), then the order they came in.
+        .order_by(models.WorkOrder.deposit_date.is_(None), models.WorkOrder.deposit_date.asc(), models.WorkOrder.id.asc())
         .all()
     )
     if not candidates:
@@ -2338,10 +2340,10 @@ def update_colleague_fields(
                 detail=f"Cannot mark Completed — missing: {', '.join(missing)}",
             )
 
-    # TAT = business days (Mon-Fri) between Received Date and Posted Date,
-    # minus business days spent in an open Clarification pause window.
-    if order.posted_date and order.received_date:
-        total_bdays = _count_business_days(order.received_date, order.posted_date)
+    # TAT = business days (Mon-Fri) between the Created date and Posted Date,
+    # minus business days spent waiting on escalations.
+    if order.posted_date and _tat_start(order):
+        total_bdays = _count_business_days(_tat_start(order), order.posted_date)
         pause_bdays = _pause_business_days(db, order)
         order.tat_days = total_bdays - pause_bdays
 
@@ -3016,6 +3018,7 @@ def _batch_base_rows(db: Session, current_user: models.User, start_date, end_dat
             "hours_worked": hours,
             "pending_hours": st.pending_hours if st else None,
             "hours_status": st.hours_status if st else None,
+            "comment": st.comment if st else None,
             "production_pct": production_pct,
             "accounts_audited": audited,
             "errors": errs,
@@ -3127,7 +3130,7 @@ def save_batch_stat(
     if current_user.role == "admin":
         raise HTTPException(status_code=403, detail="Admin can view the Batch Dashboard but not edit it")
     data = payload.dict(exclude_unset=True)
-    colleague_fields = {"hours_worked"}
+    colleague_fields = {"hours_worked", "comment"}
     lead_fields = {"accounts_audited", "errors"}
     sent = set(data.keys()) & (colleague_fields | lead_fields)
     if not sent:
@@ -3180,6 +3183,9 @@ def save_batch_stat(
     for f in sent:
         if f == "hours_worked":
             continue            # handled below: may need approval
+        if f == "comment":
+            st.comment = (data[f] or "").strip() or None
+            continue
         setattr(st, f, data[f])
 
     if "hours_worked" in sent:
@@ -3201,6 +3207,12 @@ def save_batch_stat(
             st.hours_worked = new_hours
             st.pending_hours = None
             st.hours_status = None
+            if new_hours is not None and new_hours + others < STANDARD_SHIFT_HOURS - 1e-9 and not (st.comment or "").strip():
+                db.rollback()
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Comment is required when the total hours worked for the day are less than {STANDARD_SHIFT_HOURS:g}",
+                )
 
     if st.accounts_audited is not None and st.errors is not None and st.errors > st.accounts_audited:
         db.rollback()
@@ -3429,13 +3441,58 @@ def correct_completed_order(
     # Keep derived figures consistent with whatever the Team Lead just fixed.
     if order.amount is not None:
         order.pending_amount = order.amount - (order.posted_amount or 0)
-    if order.posted_date and order.received_date:
-        total_bdays = _count_business_days(order.received_date, order.posted_date)
+    if order.posted_date and _tat_start(order):
+        total_bdays = _count_business_days(_tat_start(order), order.posted_date)
         pause_bdays = _pause_business_days(db, order)
         order.tat_days = total_bdays - pause_bdays
 
     if reasons:
         _log_order_change(db, current_user, order, "correction", reasons, before)
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+@app.patch("/orders/{order_id}/production-edit", response_model=schemas.WorkOrderOut)
+def production_edit(
+    order_id: int,
+    payload: schemas.ProductionEdit,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    Edit a row that is already in Production. Team Leads: their own team's
+    rows only; Admin / Super Admin: any row. Every change (who, when, old and
+    new value) is recorded in the change log.
+    """
+    q = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id)
+    if current_user.role == "team_lead":
+        cond = _team_orders_condition(db, current_user)
+        if cond is not None:
+            q = q.filter(cond)
+    order = q.first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if current_user.role != "admin":
+        _require_process_access(current_user, order.process_id)
+    if not order.submitted:
+        raise HTTPException(status_code=400, detail="Only rows already submitted to Production can be edited here")
+
+    data = payload.dict(exclude_unset=True)
+    if "posting_status" in data and data["posting_status"] not in ("Completed", "In-Process", "Clarification"):
+        raise HTTPException(status_code=400, detail="posting_status must be 'Completed', 'In-Process', or 'Clarification'")
+
+    before = _order_snapshot(order)
+    reasons = ["Production edit"] + _order_lock_reasons(order)
+    for field, value in data.items():
+        setattr(order, field, value)
+    order.last_edited_by = current_user.username
+    if order.amount is not None:
+        order.pending_amount = order.amount - (order.posted_amount or 0)
+    if order.posted_date and _tat_start(order):
+        order.tat_days = _count_business_days(_tat_start(order), order.posted_date) - _pause_business_days(db, order)
+
+    _log_order_change(db, current_user, order, "production_edit", reasons, before)
     db.commit()
     db.refresh(order)
     return order
@@ -4059,6 +4116,13 @@ def _pause_business_days(db: Session, order: models.WorkOrder) -> int:
     if order.issue_raised_date and order.issue_closed_date:      # orders from before queries were logged
         return _count_business_days(order.issue_raised_date, order.issue_closed_date)
     return 0
+
+
+def _tat_start(order) -> Optional[date]:
+    """TAT starts on the Created date of the inventory line (falls back to Received Date if there isn't one)."""
+    if order.created:
+        return order.created.date() if isinstance(order.created, datetime) else order.created
+    return order.received_date
 
 
 def _count_business_days(start: date, end: date) -> int:

@@ -356,6 +356,7 @@ class DailyBatchStat(Base):
     hours_status = Column(String, nullable=True)       # Pending | Approved | Rejected | NULL
     hours_decided_by = Column(String, nullable=True)
     hours_decided_at = Column(DateTime, nullable=True)
+    comment = Column(Text, nullable=True)              # colleague's note for the day (required when the day's hours are under 8)
 
     updated_by = Column(String, nullable=True)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

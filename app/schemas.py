@@ -311,6 +311,27 @@ class TeamLeadCorrection(BaseModel):
     posted_date: Optional[date] = None
 
 
+# Fields a Team Lead / Admin / Super Admin may edit on a row already in
+# Production. Every change is written to the change log.
+class ProductionEdit(BaseModel):
+    received_date: Optional[date] = None
+    deposit_date: Optional[date] = None
+    status: Optional[str] = None
+    description: Optional[str] = None
+    division: Optional[str] = None
+    amount: Optional[float] = None
+    posted_amount: Optional[float] = None
+    bar_batch: Optional[str] = None
+    trans_count: Optional[int] = None
+    posting_status: Optional[str] = None
+    poster_comment: Optional[str] = None
+    ventra_comment: Optional[str] = None
+    escalation_category: Optional[str] = None
+    issue_raised_date: Optional[date] = None
+    issue_closed_date: Optional[date] = None
+    posted_date: Optional[date] = None
+
+
 class WorkOrderOut(BaseModel):
     id: int
     process_id: Optional[int]
@@ -397,6 +418,7 @@ class BatchDashboardRow(BaseModel):
     hours_worked: Optional[float] = None
     pending_hours: Optional[float] = None   # requested hours waiting for Team Lead approval (daily total > 8)
     hours_status: Optional[str] = None      # Pending | Approved | Rejected
+    comment: Optional[str] = None           # colleague's note; required when the day's total hours are under 8
     production_pct: Optional[float] = None
     accounts_audited: Optional[int] = None
     errors: Optional[int] = None
@@ -418,6 +440,7 @@ class BatchStatUpdate(BaseModel):
     hours_worked: Optional[float] = None
     accounts_audited: Optional[int] = None
     errors: Optional[int] = None
+    comment: Optional[str] = None
 
 
 class OnshoreAttachmentOut(BaseModel):
