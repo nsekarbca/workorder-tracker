@@ -986,7 +986,7 @@ def get_process_update_attachment(
 @app.get("/users/colleagues", response_model=List[schemas.UserOut])
 def list_colleagues(
     process_id: int,
-    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -1024,7 +1024,7 @@ def run_assignment(
 def reassign_order(
     order_id: int,
     payload: schemas.ReassignRequest,
-    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -1080,7 +1080,7 @@ def reassign_order(
 def transfer_orders(
     process_id: int,
     payload: schemas.TransferOrdersRequest,
-    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -1099,7 +1099,7 @@ def transfer_orders(
         from_team_lead_id = current_user.id
     else:
         if not payload.from_team_lead_id:
-            raise HTTPException(status_code=400, detail="from_team_lead_id is required for a Super Admin transfer")
+            raise HTTPException(status_code=400, detail="from_team_lead_id is required for an Admin / Super Admin transfer")
         from_team_lead_id = payload.from_team_lead_id
 
     to_lead = (
@@ -1184,7 +1184,7 @@ def delete_all_orders(
 @app.delete("/orders/{order_id}")
 def delete_one_order(
     order_id: int,
-    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """Deletes a single order — for cleaning up a bad test/import row without wiping the whole queue."""
