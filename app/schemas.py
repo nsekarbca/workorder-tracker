@@ -194,11 +194,15 @@ class CreateUserRequest(BaseModel):
 class CreateUserResponse(BaseModel):
     user: UserOut
     temporary_password: str
+    email_sent: bool = False
+    email_note: Optional[str] = None
 
 
 class ResetPasswordResponse(BaseModel):
     username: str
     temporary_password: str
+    email_sent: bool = False
+    email_note: Optional[str] = None
 
 
 class ClarificationDetailOut(BaseModel):

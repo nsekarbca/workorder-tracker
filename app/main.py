@@ -471,6 +471,17 @@ def list_users(
     return db.query(models.User).order_by(models.User.full_name.asc()).all()
 
 
+def _send_account_email(user: models.User, temp_password: str):
+    """(sent?, why not) — so the screen can say what actually happened instead of guessing."""
+    if not user.email:
+        return False, "this profile has no email address"
+    if not email_utils.is_configured():
+        return False, "email is not configured on the server"
+    if email_utils.send_new_account_email(user.email, user.full_name, user.username, temp_password):
+        return True, None
+    return False, "the email server refused or could not be reached \u2014 see the Render logs"
+
+
 @app.post("/users", response_model=schemas.CreateUserResponse)
 def create_user(
     payload: schemas.CreateUserRequest,
@@ -508,9 +519,8 @@ def create_user(
     db.add(user)
     db.commit()
     db.refresh(user)
-    if user.email:
-        email_utils.send_new_account_email(user.email, user.full_name, user.username, temp_password)
-    return {"user": user, "temporary_password": temp_password}
+    sent, note = _send_account_email(user, temp_password)
+    return {"user": user, "temporary_password": temp_password, "email_sent": sent, "email_note": note}
 
 
 @app.patch("/users/{user_id}", response_model=schemas.UserOut)
@@ -556,9 +566,8 @@ def reset_password(
     user.password_hash = auth.hash_password(temp_password)
     user.must_change_password = True
     db.commit()
-    if user.email:
-        email_utils.send_new_account_email(user.email, user.full_name, user.username, temp_password)
-    return {"username": user.username, "temporary_password": temp_password}
+    sent, note = _send_account_email(user, temp_password)
+    return {"username": user.username, "temporary_password": temp_password, "email_sent": sent, "email_note": note}
 
 @app.get("/processes/public", response_model=List[schemas.ProcessOut])
 def list_processes_public(db: Session = Depends(get_db)):

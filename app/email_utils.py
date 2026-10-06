@@ -40,6 +40,10 @@ def _config():
     }
 
 
+def is_configured() -> bool:
+    return _config() is not None
+
+
 def get_base_url() -> str:
     return os.getenv("APP_BASE_URL", "").rstrip("/")
 
