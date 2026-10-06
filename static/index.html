@@ -261,6 +261,14 @@
         <button class="action-btn" id="share-btn" style="display:none;" onclick="toggleShareMode()">Share Orders</button>
         <label id="active-tl-label" style="display:none; font-size:14px;">Team Lead <select id="active-team-lead" onchange="renderGrid(currentOrders)"></select></label>
         <button class="action-btn" onclick="loadOrders()">Refresh</button>
+        <span id="aq-controls" style="display:inline-flex; gap:6px; align-items:center; flex-wrap:wrap;">
+          <input id="aq-search" placeholder="Search rows\u2026" oninput="renderGrid(currentOrders)" style="width:150px; padding:6px;">
+          <select id="aq-col" onchange="aqRefreshValues()" title="Filter by column" style="padding:6px;"></select>
+          <select id="aq-val" style="padding:6px; max-width:170px;"></select>
+          <button class="action-btn" onclick="aqAddFilter()">Add filter</button>
+          <button class="action-btn" style="background:#888;" onclick="aqClear()" title="Clear search, filters and sorting">Clear</button>
+        </span>
+        <span id="aq-chips" style="display:inline-flex; gap:6px; flex-wrap:wrap;"></span>
         <button class="action-btn" id="submit-day-btn" style="display:none; background:var(--green);" onclick="submitEndOfDay()">Submit End of Day</button>
         <button class="action-btn" id="switch-process-btn" style="display:none;" onclick="showProcessSwitcher()">Switch Process</button>
       </div>
@@ -359,7 +367,7 @@
           <label>Process <select id="audit-process"></select></label>
           <label>Team Lead <select id="audit-team-lead" onchange="renderAudit()"></select></label>
           <label>Action <select id="audit-action" onchange="renderAudit()">
-            <option value="">All</option><option value="correction">Correction</option><option value="edit">Assignment edit</option>
+            <option value="">All</option><option value="correction">Correction</option><option value="edit">Assignment edit</option><option value="production_edit">Production edit</option>
             <option value="reassign">Reassigned</option><option value="delete">Deleted</option></select></label>
           <label>Search <input type="text" id="audit-search" placeholder="EDM, employee or value" oninput="renderAudit()" style="width:160px;"></label>
         </div>
@@ -374,7 +382,7 @@
           <button class="action-btn" onclick="showActiveView()">Back to Active Queue</button>
         </div>
         <div style="font-size:12px; color:#666;">Every change a Team Lead makes to an order that is <strong>Completed</strong>, <strong>escalated &amp; locked</strong> or
-          <strong>submitted to Production</strong> is recorded here with what it was before and after — corrections, assignment edits, reassignments and deletions.
+          <strong>submitted to Production</strong> is recorded here with what it was before and after — corrections, assignment edits, reassignments, deletions and Production row edits (by Team Leads, Admin or Super Admin).
           Times are IST.</div>
       </div>
       <div id="orders-dash-bar" style="display:none; flex-direction:column; gap:10px; margin-bottom:12px;">
@@ -880,9 +888,10 @@ function renderTATCell(o) {
   if (o.tat_days !== null && o.tat_days !== undefined) {
     return `<td>${o.tat_days}</td>`;
   }
-  if (o.received_date && o.assigned_to_id) {
-    const elapsed = countBusinessDaysJS(o.received_date, todayStr());
-    return `<td style="color:#888; font-style:italic;" title="Running count since Received Date \u2014 not final until Completed">${elapsed}</td>`;
+  const tatStart = o.created ? String(o.created).slice(0, 10) : o.received_date;
+  if (tatStart && o.assigned_to_id) {
+    const elapsed = countBusinessDaysJS(tatStart, todayStr());
+    return `<td style="color:#888; font-style:italic;" title="Running count since the Created date \u2014 not final until Completed">${elapsed}</td>`;
   }
   return `<td></td>`;
 }
@@ -2062,6 +2071,7 @@ let auditRows = [];
 const AUDIT_ACTIONS = {
   correction: {label: "Correction",      color: "#2563eb"},
   edit:       {label: "Assignment edit", color: "#7c3aed"},
+  production_edit: {label: "Production edit", color: "#0d9488"},
   reassign:   {label: "Reassigned",      color: "#d97706"},
   delete:     {label: "Deleted",         color: "#dc2626"},
 };
@@ -2187,12 +2197,12 @@ function renderAudit() {
   let html = `<p style="margin:0 0 8px; color:#555;"><strong>${rows.length}</strong> change${rows.length === 1 ? "" : "s"} by <strong>${tls}</strong> Team Lead${tls === 1 ? "" : "s"}` +
     (auditRows.length >= 5000 ? ` <span style="color:#b45309;">\u2014 showing the latest 5,000; narrow the dates to see older ones.</span>` : "") + `</p>`;
   html += `<div class="od-scroll"><table><thead><tr>` +
-    ["When (IST)", "Team Lead", "Process", "EDM", "Employee", "Action", "Order State", "What changed"].map(h => `<th class="col">${h}</th>`).join("") +
+    ["When (IST)", "Changed By", "Process", "EDM", "Employee", "Action", "Order State", "What changed"].map(h => `<th class="col">${h}</th>`).join("") +
     `</tr></thead><tbody>`;
   rows.forEach(r => {
     const a = AUDIT_ACTIONS[r.action] || {label: r.action, color: "#555"};
     html += `<tr><td style="white-space:nowrap;">${_esc(auditWhen(r.created_at))}</td>` +
-      `<td>${_esc(r.actor_name || r.actor_username)}</td><td>${_esc(r.process_name)}</td><td>${_esc(r.edm)}</td><td>${_esc(r.employee_name)}</td>` +
+      `<td>${_esc(r.actor_name || r.actor_username)}${r.actor_role && r.actor_role !== "team_lead" ? ` <span style="color:#888; font-size:11px;">(${_esc(r.actor_role.replace("_", " "))})</span>` : ""}</td><td>${_esc(r.process_name)}</td><td>${_esc(r.edm)}</td><td>${_esc(r.employee_name)}</td>` +
       `<td><span style="display:inline-block; padding:2px 10px; border-radius:12px; color:#fff; font-size:12px; background:${a.color};">${_esc(a.label)}</span></td>` +
       `<td>${_esc(r.order_state)}</td><td style="white-space:pre-line; min-width:280px;">${_esc(auditChangeText(r))}</td></tr>`;
   });
@@ -2715,7 +2725,7 @@ function renderBatchGrid() {
   if (showEmp) html += `<th class="col">Employee Name</th>`;
   html += `<th class="col">Process Name</th><th class="col"># of Batches Worked</th><th class="col">Total Transaction Counts</th>` +
           `<th class="col">Total Hours Worked</th><th class="col">Production %</th>` +
-          `<th class="col"># of Accounts Audited</th><th class="col"># of Errors</th><th class="col">Quality %</th>` +
+          `<th class="col"># of Accounts Audited</th><th class="col"># of Errors</th><th class="col">Quality %</th><th class="col">Comment</th>` +
           (showAction ? `<th class="col">Action</th>` : "") + `</tr></thead><tbody>`;
   rows.forEach((r, i) => {
     const idx = currentBatchRows.indexOf(r);
@@ -2728,7 +2738,7 @@ function renderBatchGrid() {
       html += cell(_esc(r.process_name)) + cell(r.batches_worked) + cell(r.total_trans_count) + cell(r.hours_worked) +
         `<td title="Transactions of the processes with a daily target and hours entered \u00f7 their combined expected output"><strong>${_fmtPct(r.production_pct)}</strong></td>` +
         cell(r.accounts_audited) + cell(r.errors) +
-        `<td title="Based on the rows that have both Accounts Audited and Errors entered"><strong>${_fmtPct(r.quality_pct)}</strong></td>` +
+        `<td title="Based on the rows that have both Accounts Audited and Errors entered"><strong>${_fmtPct(r.quality_pct)}</strong></td><td></td>` +
         (showAction ? `<td></td>` : "") + `</tr>`;
       return;
     }
@@ -2759,6 +2769,11 @@ function renderBatchGrid() {
       html += `<td>${r.accounts_audited ?? ""}</td><td>${r.errors ?? ""}</td>`;
     }
     html += `<td title="(Accounts Audited \u2212 Errors) \u00f7 Accounts Audited">${_fmtPct(r.quality_pct)}</td>`;
+    if (showEmp) {
+      html += `<td style="white-space:normal; min-width:160px; max-width:260px;">${_esc(r.comment || "")}</td>`;
+    } else {
+      html += `<td><textarea data-bf="comment" rows="2" placeholder="Required if total hours are under 8" style="width:190px; font-family:inherit; padding:4px;" oninput="batchRowDirty(this)">${_esc(r.comment || "")}</textarea></td>`;
+    }
     if (showAction) html += `<td><button class="action-btn" disabled onclick="saveBatchRow(${idx}, this)">Save</button></td>`;
     html += `</tr>`;
   });
@@ -2784,6 +2799,7 @@ async function saveBatchRow(idx, btn) {
   } else {
     const h = val("hours_worked");
     body.hours_worked = h === "" ? null : parseFloat(h);
+    body.comment = val("comment") || "";
   }
   btn.disabled = true; btn.textContent = "Saving\u2026";
   const res = await authFetch("/batch-dashboard", {
@@ -2869,10 +2885,10 @@ function exportBatchCSV() {
     const showEmp = batchShowEmployee(), showTl = batchAllTeams();
     headers = ["Date"].concat(showTl ? ["Team Lead"] : []).concat(showEmp ? ["Employee Name"] : []).concat([
       "Process Name", "# of Batches Worked", "Total Transaction Counts", "Total Hours Worked",
-      "Production %", "# of Accounts Audited", "# of Errors", "Quality %"]);
+      "Production %", "# of Accounts Audited", "# of Errors", "Quality %", "Comment"]);
     lines = rows.map(r => ["" + r.work_date].concat(showTl ? [r.team_lead_name] : []).concat(showEmp ? [r.employee_name] : []).concat([
       r.process_name, r.batches_worked, r.total_trans_count, r.hours_worked ?? "",
-      pct(r.production_pct), r.accounts_audited ?? "", r.errors ?? "", pct(r.quality_pct)]));
+      pct(r.production_pct), r.accounts_audited ?? "", r.errors ?? "", pct(r.quality_pct), r.comment ?? ""]));
     name = `batch_dashboard_${stamp}.csv`;
   }
   if (!lines.length) { alert("Nothing to export \u2014 load a date range first."); return; }
@@ -4029,11 +4045,13 @@ function renderProductionGrid(orders) {
   let html = "<table><thead><tr>";
   cols.forEach(c => html += `<th class="${c.group}">${c.label}</th>`);
   html += `<th class="col">Submitted At</th>`;
+  const canEditProd = canEditProduction();
+  if (canEditProd) html += `<th class="col">Edit</th>`;
   html += "</tr></thead><tbody>";
   orders.forEach(o => {
     if (groupCounts && tlName(o) !== lastGroup) {
       lastGroup = tlName(o);
-      html += tlGroupRow(lastGroup, groupCounts.get(lastGroup), cols.length + 1, "record");
+      html += tlGroupRow(lastGroup, groupCounts.get(lastGroup), cols.length + 1 + (canEditProd ? 1 : 0), "record");
     }
     html += "<tr>";
     cols.forEach(c => {
@@ -4049,6 +4067,7 @@ function renderProductionGrid(orders) {
       html += `<td>${c.currency ? formatCurrency(val) : val}</td>`;
     });
     html += `<td>${formatIST(o.submitted_at)}</td>`;
+    if (canEditProd) html += `<td><button class="action-btn" onclick="openProdEdit(${o.id})">Edit</button></td>`;
     html += "</tr>";
   });
   html += "</tbody></table>";
@@ -4057,6 +4076,84 @@ function renderProductionGrid(orders) {
   if (orders.length === 0) {
     document.getElementById("grid-container").innerHTML = "<p>No production records in this range.</p>";
   }
+}
+
+// ---------------------------------------------------------------------
+// Production row edit (Team Lead / Admin / Super Admin). Saved through
+// PATCH /orders/{id}/production-edit; the server writes the change log.
+// ---------------------------------------------------------------------
+function canEditProduction() { return role === "team_lead" || role === "admin" || role === "super_admin"; }
+
+const PROD_EDIT_FIELDS = [
+  ["received_date", "Received Date", "date"], ["deposit_date", "Deposit Date", "date"],
+  ["status", "Status", "text"], ["description", "Description", "text"], ["division", "Division", "text"],
+  ["amount", "Amount", "number"], ["posted_amount", "Posted $", "number"],
+  ["bar_batch", "BAR Batch", "text"], ["trans_count", "Trans Count", "number"],
+  ["posting_status", "Posting Status", "select"],
+  ["poster_comment", "Poster Comment", "textarea"], ["ventra_comment", "VENTRA Comment", "textarea"],
+  ["escalation_category", "Escalation Category", "text"],
+  ["issue_raised_date", "Issue Raised Date", "date"], ["issue_closed_date", "Issue Closed Date", "date"],
+  ["posted_date", "Posted Date", "date"],
+];
+
+function openProdEdit(id) {
+  const o = currentProduction.find(x => x.id === id);
+  if (!o) return;
+  closeProdEdit();
+  let h = `<div id="prod-edit-modal" style="position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:9999; display:flex; align-items:center; justify-content:center;">` +
+    `<div style="background:#fff; border-radius:8px; padding:18px 22px; width:560px; max-width:94vw; max-height:90vh; overflow:auto;">` +
+    `<h3 style="margin:0 0 4px;">Edit Production row</h3>` +
+    `<div style="font-size:12px; color:#666; margin-bottom:12px;">EDM ${_esc(o.edm)} \u00b7 ${_esc(o.employee_name)}. Every change is recorded in the Team Lead Change Log.</div>` +
+    `<div style="display:grid; grid-template-columns:150px 1fr; gap:8px 10px; align-items:center;">`;
+  PROD_EDIT_FIELDS.forEach(([k, label, type]) => {
+    const v = o[k] === null || o[k] === undefined ? "" : o[k];
+    let inp;
+    if (type === "select") {
+      inp = `<select id="pe-${k}">` + POSTING_STATUS_OPTIONS.map(x => `<option ${x === v ? "selected" : ""}>${x}</option>`).join("") + `</select>`;
+    } else if (type === "textarea") {
+      inp = `<textarea id="pe-${k}" rows="2" style="width:100%;">${_esc(v)}</textarea>`;
+    } else {
+      inp = `<input id="pe-${k}" type="${type}" ${type === "number" ? 'step="any"' : ""} value="${_esc(v)}" style="width:100%;">`;
+    }
+    h += `<label style="font-size:13px;">${label}</label>${inp}`;
+  });
+  h += `</div><div style="margin-top:14px; display:flex; gap:8px; justify-content:flex-end;">` +
+    `<button class="action-btn" style="background:#888;" onclick="closeProdEdit()">Cancel</button>` +
+    `<button class="action-btn" id="pe-save" onclick="saveProdEdit(${id})">Save</button></div></div></div>`;
+  document.body.insertAdjacentHTML("beforeend", h);
+}
+
+function closeProdEdit() {
+  const m = document.getElementById("prod-edit-modal");
+  if (m) m.remove();
+}
+
+async function saveProdEdit(id) {
+  const o = currentProduction.find(x => x.id === id);
+  const payload = {};
+  PROD_EDIT_FIELDS.forEach(([k, , type]) => {
+    const el = document.getElementById("pe-" + k);
+    if (!el) return;
+    let v = el.value;
+    const old = o[k] === null || o[k] === undefined ? "" : String(o[k]);
+    if (String(v) === old) return;                 // unchanged
+    if (v === "") v = null;
+    else if (type === "number") v = Number(v);
+    payload[k] = v;
+  });
+  if (!Object.keys(payload).length) { closeProdEdit(); return; }
+  const btn = document.getElementById("pe-save");
+  if (btn) { btn.disabled = true; btn.textContent = "Saving\u2026"; }
+  const res = await authFetch(`/orders/${id}/production-edit`, {
+    method: "PATCH", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)
+  });
+  if (!res.ok) {
+    alert("Save failed: " + (await res.text()));
+    if (btn) { btn.disabled = false; btn.textContent = "Save"; }
+    return;
+  }
+  closeProdEdit();
+  loadProduction();
 }
 
 function exportProductionCSV() {
@@ -4590,8 +4687,95 @@ function visibleColumns() {
   return tlAllTeams() ? [TL_COLUMN, ...COLUMNS] : COLUMNS;
 }
 
+// ---- Active Queue: search, column filters and sorting (screen only; nothing is saved) ----
+let aqFilters = [];            // [{key, label, value}]
+let aqSort = {key: null, dir: 1};
+function aqCell(o, k) {
+  if (k === "team_lead_name") return tlName(o);
+  const v = o[k];
+  return (v === null || v === undefined) ? "" : v;
+}
+function aqText(o, k) {
+  const v = aqCell(o, k);
+  const col = COLUMNS.find(c => c.k === k);
+  return (col && col.currency && v !== "") ? formatCurrency(v) : String(v);
+}
+function aqSyncControls(cols) {
+  const sel = document.getElementById("aq-col");
+  if (!sel) return;
+  document.getElementById("aq-controls").style.display = role === "colleague" ? "none" : "inline-flex";
+  const sig = cols.map(c => c.k).join(",");
+  if (sel.dataset.sig !== sig) {
+    const keep = sel.value;
+    sel.innerHTML = cols.filter(c => c.k !== "time_taken").map(c => `<option value="${c.k}">${_esc(c.label)}</option>`).join("");
+    if (keep && cols.some(c => c.k === keep)) sel.value = keep;
+    sel.dataset.sig = sig;
+    aqRefreshValues();
+  }
+}
+function aqRefreshValues() {
+  const k = document.getElementById("aq-col").value;
+  const vsel = document.getElementById("aq-val");
+  const keep = vsel.value;
+  const vals = Array.from(new Set((currentOrders || []).map(o => aqText(o, k)))).sort((a, b) => a.localeCompare(b, undefined, {numeric: true}));
+  vsel.innerHTML = vals.map(v => `<option value="${_esc(v)}">${v === "" ? "(blank)" : _esc(v)}</option>`).join("");
+  if (vals.includes(keep)) vsel.value = keep;
+}
+function aqAddFilter() {
+  const k = document.getElementById("aq-col").value;
+  const vsel = document.getElementById("aq-val");
+  if (!k || vsel.selectedIndex < 0) return;
+  const value = vsel.value;
+  if (aqFilters.some(f => f.key === k && f.value === value)) return;
+  const label = document.getElementById("aq-col").selectedOptions[0].textContent;
+  aqFilters.push({key: k, label, value});
+  aqRenderChips();
+  renderGrid(currentOrders);
+}
+function aqRemoveFilter(i) { aqFilters.splice(i, 1); aqRenderChips(); renderGrid(currentOrders); }
+function aqRenderChips() {
+  document.getElementById("aq-chips").innerHTML = aqFilters.map((f, i) =>
+    `<span style="background:#e8eefc; border:1px solid #b9c8f0; border-radius:12px; padding:3px 10px; font-size:12px;">${_esc(f.label)}: ${f.value === "" ? "(blank)" : _esc(f.value)} <a href="#" onclick="aqRemoveFilter(${i}); return false;" style="text-decoration:none; color:#b23b3b;">\u2715</a></span>`).join("");
+}
+function aqClear() {
+  aqFilters = []; aqSort = {key: null, dir: 1};
+  document.getElementById("aq-search").value = "";
+  aqRenderChips();
+  renderGrid(currentOrders);
+}
+function aqSortBy(k) {
+  aqSort = aqSort.key === k ? {key: k, dir: -aqSort.dir} : {key: k, dir: 1};
+  renderGrid(currentOrders);
+}
+function aqApply(orders, cols) {
+  const q = (document.getElementById("aq-search").value || "").trim().toLowerCase();
+  let rows = orders;
+  if (q) rows = rows.filter(o => cols.some(c => aqText(o, c.k).toLowerCase().includes(q)));
+  if (aqFilters.length) {
+    const byKey = {};
+    aqFilters.forEach(f => { (byKey[f.key] = byKey[f.key] || []).push(f.value); });     // same column = OR, different columns = AND
+    rows = rows.filter(o => Object.keys(byKey).every(k => byKey[k].includes(aqText(o, k))));
+  }
+  if (aqSort.key) {
+    const k = aqSort.key, d = aqSort.dir;
+    const col = COLUMNS.find(c => c.k === k);
+    const numeric = !!(col && col.currency) || k === "tat_days" || k === "image_count" || k === "doc_count" || k === "trans_count";
+    rows = rows.slice().sort((a, b) => {
+      const x = aqCell(a, k), y = aqCell(b, k);
+      if (x === "" && y === "") return 0;
+      if (x === "") return 1;           // blanks always last
+      if (y === "") return -1;
+      const r = numeric ? (parseFloat(x) - parseFloat(y)) : String(x).localeCompare(String(y), undefined, {numeric: true});
+      return r * d;
+    });
+  }
+  return rows;
+}
+
 function renderGrid(orders) {
   const cols = visibleColumns();
+  aqSyncControls(cols);
+  orders = aqApply(orders, cols);
   const hasActionCol = role === "colleague" || isLeadRole() || role === "admin";
   let activeTl = "";
   if (tlAllTeams()) {
@@ -4610,7 +4794,11 @@ function renderGrid(orders) {
   let lastGroup = null;
   let html = "<table><thead><tr>";
   if (shareMode) html += `<th class="col">Share</th>`;
-  cols.forEach(c => html += `<th class="${c.group}">${c.label}</th>`);
+  cols.forEach(c => {
+    const arrow = aqSort.key === c.k ? (aqSort.dir === 1 ? " \u25b2" : " \u25bc") : "";
+    html += c.k === "time_taken" ? `<th class="${c.group}">${c.label}</th>`
+      : `<th class="${c.group}" style="cursor:pointer;" title="Click to sort" onclick="aqSortBy('${c.k}')">${c.label}${arrow}</th>`;
+  });
   if (hasActionCol) html += `<th class="col">Action</th>`;
   html += "</tr></thead><tbody>";
 
