@@ -3618,7 +3618,7 @@ async function saveUser() {
     return;
   }
   const data = await res.json();
-  alert(`User created.\n\nUsername: ${data.user.username}\nTemporary Password: ${data.temporary_password}\n\nPlease share these with the user securely \u2014 no email was sent.`);
+  alert(`User created.\n\nUsername: ${data.user.username}\nTemporary Password: ${data.temporary_password}\n\n${data.email_sent ? `An email with these details was sent to ${data.user.email}.` : `Please share these with the user securely \u2014 no email was sent (${data.email_note || "unknown reason"}).`}`);
   clearUserForm();
   loadUserList();
 }
@@ -3632,7 +3632,7 @@ async function resetUserPassword(userId) {
     return;
   }
   const data = await res.json();
-  alert(`Password reset.\n\nUsername: ${data.username}\nTemporary Password: ${data.temporary_password}\n\nPlease share these with the user securely.`);
+  alert(`Password reset.\n\nUsername: ${data.username}\nTemporary Password: ${data.temporary_password}\n\n${data.email_sent ? "An email with these details was sent to the user." : `Please share these with the user securely \u2014 no email was sent (${data.email_note || "unknown reason"}).`}`);
 }
 
 // ---------------------------------------------------------------------
