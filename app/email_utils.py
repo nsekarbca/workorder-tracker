@@ -72,12 +72,12 @@ def send_email(to_email: str, subject: str, body: str) -> bool:
 
 
 def send_new_account_email(to_email: str, full_name: str, username: str, temp_password: str) -> bool:
-    subject = "Your Work Order Tracker account"
+    subject = "Your WorkFlow Hub account"
     base_url = get_base_url()
-    login_line = f"Log in here: {base_url}" if base_url else "Log in at the Work Order Tracker URL your Team Lead shared."
+    login_line = f"Log in here: {base_url}" if base_url else "Log in at the WorkFlow Hub URL your Team Lead shared."
     body = (
         f"Hi {full_name},\n\n"
-        f"An account has been created for you on the Work Order Allocation Tracker.\n\n"
+        f"An account has been created for you on the WorkFlow Hub.\n\n"
         f"Username: {username}\n"
         f"Temporary password: {temp_password}\n\n"
         f"{login_line}\n\n"
@@ -88,10 +88,10 @@ def send_new_account_email(to_email: str, full_name: str, username: str, temp_pa
 
 
 def send_username_reminder_email(to_email: str, username: str) -> bool:
-    subject = "Your Work Order Tracker username"
+    subject = "Your WorkFlow Hub username"
     body = (
         f"Hi,\n\n"
-        f"You requested a reminder of your username for the Work Order Allocation Tracker.\n\n"
+        f"You requested a reminder of your username for the WorkFlow Hub.\n\n"
         f"Username: {username}\n\n"
         f"If you didn't request this, you can safely ignore this email."
     )
@@ -99,12 +99,12 @@ def send_username_reminder_email(to_email: str, username: str) -> bool:
 
 
 def send_password_reset_email(to_email: str, username: str, reset_token: str) -> bool:
-    subject = "Reset your Work Order Tracker password"
+    subject = "Reset your WorkFlow Hub password"
     base_url = get_base_url()
     reset_link = f"{base_url}/?reset_token={reset_token}" if base_url else f"(open the app and use this code): {reset_token}"
     body = (
         f"Hi {username},\n\n"
-        f"You requested a password reset for the Work Order Allocation Tracker.\n\n"
+        f"You requested a password reset for the WorkFlow Hub.\n\n"
         f"Reset link (valid for 1 hour): {reset_link}\n\n"
         f"If you didn't request this, you can safely ignore this email — your password won't change."
     )

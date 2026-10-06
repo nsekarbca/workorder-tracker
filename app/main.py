@@ -68,7 +68,7 @@ def _ensure_added_columns():
 
 _ensure_added_columns()
 
-app = FastAPI(title="Work Order Allocation Tracker")
+app = FastAPI(title="WorkFlow Hub")
 
 app.add_middleware(
     CORSMiddleware,
