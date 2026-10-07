@@ -84,6 +84,7 @@
   tr:nth-child(even) { background: #fafafa; }
   input.cell-edit { width: 90px; font-size: 12px; padding: 2px 4px; }
   tr.row-escalated td { background: #fff3e0 !important; }
+  tr.row-late td { background: #fde8e8 !important; }
   .clarification-link { font-size: 11px; margin-left: 4px; white-space: nowrap; }
   textarea.cell-comment { width: 200px; min-height: 32px; font-size: 12px; padding: 3px 5px; font-family: inherit; white-space: normal; resize: vertical; }
   #toolbar { margin-bottom: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
@@ -234,7 +235,7 @@
         <button class="nav-menu-item" id="nav-clients-btn" style="display:none;" onclick="navTo('clients')">📇 Clients</button>
         <button class="nav-menu-item" id="nav-audit-btn" style="display:none;" onclick="navTo('audit')">🛡️ Team Lead Change Log</button>
         <button class="nav-menu-item" id="nav-orders-dash-btn" style="display:none;" onclick="navTo('orders-dash')">📈 Orders Dashboard</button>
-        <button class="nav-menu-item" id="nav-batch-btn" style="display:none;" onclick="navTo('batch')">📊 Batch Dashboard</button>
+        <button class="nav-menu-item" id="nav-batch-btn" style="display:none;" onclick="navTo('batch')">📊 Batch Count Dashboard</button>
         <button class="nav-menu-item" id="nav-production-btn" style="display:none;" onclick="navTo('production')">📦 Production</button>
         <button class="nav-menu-item" id="nav-escalations-btn" style="display:none;" onclick="navTo('escalations')">🚨 Escalations</button>
         <button class="nav-menu-item" id="nav-admin-btn" style="display:none;" onclick="navTo('admin')">⚙️ Admin</button>
@@ -262,11 +263,9 @@
         <label id="active-tl-label" style="display:none; font-size:14px;">Team Lead <select id="active-team-lead" onchange="renderGrid(currentOrders)"></select></label>
         <button class="action-btn" onclick="loadOrders()">Refresh</button>
         <span id="aq-controls" style="display:inline-flex; gap:6px; align-items:center; flex-wrap:wrap;">
-          <input id="aq-search" placeholder="Search rows\u2026" oninput="renderGrid(currentOrders)" style="width:150px; padding:6px;">
-          <select id="aq-col" onchange="aqRefreshValues()" title="Filter by column" style="padding:6px;"></select>
-          <select id="aq-val" style="padding:6px; max-width:170px;"></select>
-          <button class="action-btn" onclick="aqAddFilter()">Add filter</button>
-          <button class="action-btn" style="background:#888;" onclick="aqClear()" title="Clear search, filters and sorting">Clear</button>
+          <select id="aq-col" onchange="renderGrid(currentOrders)" title="Field to search in" style="padding:6px;"></select>
+          <input id="aq-search" placeholder="Type value to filter&hellip;" oninput="renderGrid(currentOrders)" style="width:170px; padding:6px;">
+          <button class="action-btn" style="background:#888;" onclick="aqClear()" title="Clear the filter and sorting">Clear</button>
         </span>
         <span id="aq-chips" style="display:inline-flex; gap:6px; flex-wrap:wrap;"></span>
         <button class="action-btn" id="submit-day-btn" style="display:none; background:var(--green);" onclick="submitEndOfDay()">Submit End of Day</button>
@@ -884,16 +883,20 @@ function todayStr() {
   return d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") + "-" + String(d.getDate()).padStart(2,"0");
 }
 
+// TAT shown for a row: the final figure once it's set, otherwise a running
+// count (weekends excluded) from the Created date to today -- assigned or not.
+function tatValue(o) {
+  if (o.tat_days !== null && o.tat_days !== undefined) return {n: o.tat_days, final: true};
+  const start = o.created ? String(o.created).slice(0, 10) : o.received_date;
+  if (!start) return null;
+  return {n: countBusinessDaysJS(start, todayStr()), final: false};
+}
+function tatIsLate(o) { const t = tatValue(o); return !!t && t.n > 2; }
 function renderTATCell(o) {
-  if (o.tat_days !== null && o.tat_days !== undefined) {
-    return `<td>${o.tat_days}</td>`;
-  }
-  const tatStart = o.created ? String(o.created).slice(0, 10) : o.received_date;
-  if (tatStart && o.assigned_to_id) {
-    const elapsed = countBusinessDaysJS(tatStart, todayStr());
-    return `<td style="color:#888; font-style:italic;" title="Running count since the Created date \u2014 not final until Completed">${elapsed}</td>`;
-  }
-  return `<td></td>`;
+  const t = tatValue(o);
+  if (!t) return `<td></td>`;
+  if (t.final) return `<td>${t.n}</td>`;
+  return `<td style="color:#888; font-style:italic;" title="Running count since the Created date (weekends excluded) \u2014 not final until Completed">${t.n}</td>`;
 }
 
 // timer_started_at is stored as a naive IST wall-clock timestamp (no
@@ -2549,6 +2552,10 @@ function _fmtPct(v) { return (v === null || v === undefined) ? "\u2014" : `${Num
 function batchAllTeams() { return role === "admin" || role === "super_admin"; }
 function batchCanAudit() { return isLeadRole(); }
 function batchShowEmployee() { return isLeadRole() || role === "admin"; }
+// Saved rows are locked: colleague / Team Lead can't change them, Admin and Super Admin can.
+function batchOverride() { return role === "admin" || role === "super_admin"; }
+function batchHoursLocked(r) { return (r.hours_worked !== null && r.hours_worked !== undefined || r.hours_status === "Pending") && r.hours_status !== "Rejected"; }
+function batchAuditLocked(r) { return (r.accounts_audited !== null && r.accounts_audited !== undefined) || (r.errors !== null && r.errors !== undefined); }
 
 let currentBatchTL = [];      // Team Lead-wise rows (Admin / Super Admin)
 let batchTab = "detail";      // "detail" | "tl"
@@ -2612,7 +2619,7 @@ async function loadBatchDashboard() {
   if (batchAllTeams()) reqs.push(authFetch("/batch-dashboard/by-team-lead?" + params.toString()));
   const res = await Promise.all(reqs);
   for (const r of res) {
-    if (!r.ok) { alert("Couldn't load the Batch Dashboard: " + (await r.text())); return; }
+    if (!r.ok) { alert("Couldn't load the Batch Count Dashboard: " + (await r.text())); return; }
   }
   currentBatchRows = await res[0].json();
   currentBatchTL = batchAllTeams() ? await res[1].json() : [];
@@ -2712,9 +2719,8 @@ function renderBatchGrid() {
   if (batchAllTeams() && batchTab === "tl") { renderBatchTeamLeadGrid(); return; }
   const rows = _batchVisibleRows();
   const showEmp = batchShowEmployee();
-  const canEdit = batchCanAudit();
   const showTl = batchAllTeams();
-  const showAction = canEdit || !showEmp;      // Admin is view-only: no Save column
+  const showAction = role !== "quality";
   if (!rows.length) {
     document.getElementById("grid-container").innerHTML =
       "<p>No completed work found for this date range. A row appears for each date you mark an order Completed.</p>";
@@ -2755,26 +2761,31 @@ function renderBatchGrid() {
       ? `<div style="font-size:11px; color:#b91c1c; font-weight:600;" title="Your Team Lead rejected the hours you entered">\u2716 Rejected \u2014 re-enter</div>`
       : r.hours_status === "Approved"
       ? `<div style="font-size:11px; color:#15803d; font-weight:600;">\u2714 Approved</div>` : "";
-    if (showEmp) {
-      html += `<td>${r.hours_worked ?? ""}${hrsBadge}</td>`;
-    } else {
-      const shown = r.hours_status === "Pending" ? r.pending_hours : r.hours_worked;
+    const ovr = batchOverride();
+    const hrsEdit = ovr || (role === "colleague" && !batchHoursLocked(r));
+    const audEdit = ovr || (role === "team_lead" && !batchAuditLocked(r));
+    if (hrsEdit) {
+      const shown = (!ovr && r.hours_status === "Pending") ? r.pending_hours : r.hours_worked;
       html += `<td><input type="number" min="0" max="24" step="0.25" data-bf="hours_worked" value="${shown ?? ""}" style="width:80px;" oninput="batchRowDirty(this)">${hrsBadge}</td>`;
+    } else {
+      html += `<td>${r.hours_worked ?? (r.hours_status === "Pending" ? "" : "")}${hrsBadge}</td>`;
     }
     html += `<td title="${_esc(prodTip)}">${_fmtPct(r.production_pct)}</td>`;
-    if (canEdit) {
+    if (audEdit) {
       html += `<td><input type="number" min="0" step="1" data-bf="accounts_audited" value="${r.accounts_audited ?? ""}" style="width:80px;" oninput="batchRowDirty(this)"></td>`;
       html += `<td><input type="number" min="0" step="1" data-bf="errors" value="${r.errors ?? ""}" style="width:80px;" oninput="batchRowDirty(this)"></td>`;
     } else {
       html += `<td>${r.accounts_audited ?? ""}</td><td>${r.errors ?? ""}</td>`;
     }
     html += `<td title="(Accounts Audited \u2212 Errors) \u00f7 Accounts Audited">${_fmtPct(r.quality_pct)}</td>`;
-    if (showEmp) {
-      html += `<td style="white-space:normal; min-width:160px; max-width:260px;">${_esc(r.comment || "")}</td>`;
-    } else {
+    if (hrsEdit) {
       html += `<td><textarea data-bf="comment" rows="2" placeholder="Required if total hours are under 8" style="width:190px; font-family:inherit; padding:4px;" oninput="batchRowDirty(this)">${_esc(r.comment || "")}</textarea></td>`;
+    } else {
+      html += `<td style="white-space:normal; min-width:160px; max-width:260px;">${_esc(r.comment || "")}</td>`;
     }
-    if (showAction) html += `<td><button class="action-btn" disabled onclick="saveBatchRow(${idx}, this)">Save</button></td>`;
+    if (showAction) html += (hrsEdit || audEdit)
+      ? `<td><button class="action-btn" disabled onclick="saveBatchRow(${idx}, this)">Save</button></td>`
+      : `<td title="Saved \u2014 only an Admin or Super Admin can change it">\ud83d\udd12 Locked</td>`;
     html += `</tr>`;
   });
   html += "</tbody></table>";
@@ -2791,16 +2802,11 @@ async function saveBatchRow(idx, btn) {
   const tr = btn.closest("tr");
   const val = f => { const el = tr.querySelector(`[data-bf="${f}"]`); return el ? el.value.trim() : undefined; };
   const body = { process_id: r.process_id, work_date: r.work_date };
-  if (isLeadRole()) {
-    body.user_id = r.user_id;
-    const a = val("accounts_audited"), e = val("errors");
-    body.accounts_audited = a === "" ? null : parseInt(a, 10);
-    body.errors = e === "" ? null : parseInt(e, 10);
-  } else {
-    const h = val("hours_worked");
-    body.hours_worked = h === "" ? null : parseFloat(h);
-    body.comment = val("comment") || "";
-  }
+  if (role !== "colleague") body.user_id = r.user_id;
+  const num = (f, int) => { const v = val(f); if (v === undefined) return; body[f] = v === "" ? null : (int ? parseInt(v, 10) : parseFloat(v)); };
+  num("accounts_audited", true); num("errors", true); num("hours_worked", false);
+  const cm = val("comment");
+  if (cm !== undefined) body.comment = cm;
   btn.disabled = true; btn.textContent = "Saving\u2026";
   const res = await authFetch("/batch-dashboard", {
     method: "PUT",
@@ -4053,7 +4059,7 @@ function renderProductionGrid(orders) {
       lastGroup = tlName(o);
       html += tlGroupRow(lastGroup, groupCounts.get(lastGroup), cols.length + 1 + (canEditProd ? 1 : 0), "record");
     }
-    html += "<tr>";
+    html += tatIsLate(o) ? `<tr class="row-late">` : "<tr>";
     cols.forEach(c => {
       if (c.k === "team_lead_name") {
         html += `<td>${_esc(tlName(o))}</td>`;
@@ -4186,6 +4192,13 @@ function exportProductionCSV() {
   URL.revokeObjectURL(url);
 }
 
+// Reassign list for one order: only the colleagues of the order's own Team Lead
+// (plus whoever holds it now). Team Leads already get just their own team from the server.
+function reassignChoices(o) {
+  const tl = tlAllTeams() ? (o.team_lead_name || "") : "";
+  if (!tl || tl === "No Team Lead") return colleagueList;
+  return colleagueList.filter(c => c.reporting_manager === tl || c.id === o.assigned_to_id);
+}
 let colleagueListProcess = null;
 async function loadColleagueList() {
   const res = await authFetch(withProcess("/users/colleagues"));
@@ -4692,6 +4705,7 @@ let aqFilters = [];            // [{key, label, value}]
 let aqSort = {key: null, dir: 1};
 function aqCell(o, k) {
   if (k === "team_lead_name") return tlName(o);
+  if (k === "tat_days") { const t = tatValue(o); return t ? t.n : ""; }
   const v = o[k];
   return (v === null || v === undefined) ? "" : v;
 }
@@ -4707,30 +4721,10 @@ function aqSyncControls(cols) {
   const sig = cols.map(c => c.k).join(",");
   if (sel.dataset.sig !== sig) {
     const keep = sel.value;
-    sel.innerHTML = cols.filter(c => c.k !== "time_taken").map(c => `<option value="${c.k}">${_esc(c.label)}</option>`).join("");
+    sel.innerHTML = `<option value="">All fields</option>` + cols.filter(c => c.k !== "time_taken").map(c => `<option value="${c.k}">${_esc(c.label)}</option>`).join("");
     if (keep && cols.some(c => c.k === keep)) sel.value = keep;
     sel.dataset.sig = sig;
-    aqRefreshValues();
   }
-}
-function aqRefreshValues() {
-  const k = document.getElementById("aq-col").value;
-  const vsel = document.getElementById("aq-val");
-  const keep = vsel.value;
-  const vals = Array.from(new Set((currentOrders || []).map(o => aqText(o, k)))).sort((a, b) => a.localeCompare(b, undefined, {numeric: true}));
-  vsel.innerHTML = vals.map(v => `<option value="${_esc(v)}">${v === "" ? "(blank)" : _esc(v)}</option>`).join("");
-  if (vals.includes(keep)) vsel.value = keep;
-}
-function aqAddFilter() {
-  const k = document.getElementById("aq-col").value;
-  const vsel = document.getElementById("aq-val");
-  if (!k || vsel.selectedIndex < 0) return;
-  const value = vsel.value;
-  if (aqFilters.some(f => f.key === k && f.value === value)) return;
-  const label = document.getElementById("aq-col").selectedOptions[0].textContent;
-  aqFilters.push({key: k, label, value});
-  aqRenderChips();
-  renderGrid(currentOrders);
 }
 function aqRemoveFilter(i) { aqFilters.splice(i, 1); aqRenderChips(); renderGrid(currentOrders); }
 function aqRenderChips() {
@@ -4740,6 +4734,7 @@ function aqRenderChips() {
 function aqClear() {
   aqFilters = []; aqSort = {key: null, dir: 1};
   document.getElementById("aq-search").value = "";
+  document.getElementById("aq-col").value = "";
   aqRenderChips();
   renderGrid(currentOrders);
 }
@@ -4750,7 +4745,9 @@ function aqSortBy(k) {
 function aqApply(orders, cols) {
   const q = (document.getElementById("aq-search").value || "").trim().toLowerCase();
   let rows = orders;
-  if (q) rows = rows.filter(o => cols.some(c => aqText(o, c.k).toLowerCase().includes(q)));
+  const fk = document.getElementById("aq-col").value;
+  if (q) rows = rows.filter(o => fk ? aqText(o, fk).toLowerCase().includes(q)
+                                    : cols.some(c => aqText(o, c.k).toLowerCase().includes(q)));
   if (aqFilters.length) {
     const byKey = {};
     aqFilters.forEach(f => { (byKey[f.key] = byKey[f.key] || []).push(f.value); });     // same column = OR, different columns = AND
@@ -4816,7 +4813,8 @@ function renderGrid(orders) {
     const effStatus = effectiveValue(o, "posting_status");
     const hasDraft = drafts[o.id] && Object.keys(drafts[o.id]).length > 0;
 
-    html += `<tr data-row-id="${o.id}"${isEscalated ? ' class="row-escalated"' : ""}>`;
+    const lateCls = (!isEscalated && tatIsLate(o)) ? ' class="row-late"' : "";
+    html += `<tr data-row-id="${o.id}"${isEscalated ? ' class="row-escalated"' : lateCls}>`;
     if (shareMode) {
       const shareable = (role === "team_lead" ? o.team_lead_id === myUserId : !!o.team_lead_id) && !savedCompleted;
       html += `<td>${shareable ? `<input type="checkbox" onchange="toggleShareRow(${o.id}, this.checked)" ${selectedForShare.has(o.id) ? "checked" : ""}>` : ""}</td>`;
@@ -4911,7 +4909,7 @@ function renderGrid(orders) {
       } else {
         html += `<td><select onchange="reassignOrder(${o.id}, this.value)">`;
         html += `<option value="">Reassign\u2026</option>`;
-        colleagueList.forEach(c => {
+        reassignChoices(o).forEach(c => {
           const isCurrent = c.id === o.assigned_to_id;
           html += `<option value="${c.id}" ${isCurrent ? "selected" : ""}>${c.full_name}${isCurrent ? " (current)" : ""}</option>`;
         });
@@ -4924,7 +4922,7 @@ function renderGrid(orders) {
         html += `<td>${delBtn}</td>`;
       } else {
         html += `<td><select onchange="reassignOrder(${o.id}, this.value)"><option value="">Reassign\u2026</option>`;
-        colleagueList.forEach(c => {
+        reassignChoices(o).forEach(c => {
           const isCurrent = c.id === o.assigned_to_id;
           html += `<option value="${c.id}" ${isCurrent ? "selected" : ""}>${c.full_name}${isCurrent ? " (current)" : ""}</option>`;
         });
