@@ -1,6 +1,6 @@
 from datetime import date, datetime
 from typing import Optional, List, Dict
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
 
 
 class UserLogin(BaseModel):
@@ -382,6 +382,10 @@ class WorkOrderOut(BaseModel):
     # Filled in for Admin / Super Admin on the Active Queue, Escalation queue
     # and Production lists so those screens can be shown Team Lead-wise.
     team_lead_name: Optional[str] = None
+
+    @field_serializer("created")
+    def _created_date_only(self, v):
+        return v.date().isoformat() if v else None   # shown as 2026-09-29
 
     class Config:
         from_attributes = True

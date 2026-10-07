@@ -3124,24 +3124,24 @@ def save_batch_stat(
     """
     Saves the manual inputs for one colleague / process / date.
     Colleague -> Total Hours Worked on their own rows only.
-    Team Lead / Super Admin -> # of Accounts Audited and # of Errors, for
-    colleagues in their team (Super Admin: anyone).
+    Team Lead -> # of Accounts Audited and # of Errors for their team.
+    Once saved, a row is locked: only Admin / Super Admin (any field, any
+    colleague) can change it.
     """
-    if current_user.role == "admin":
-        raise HTTPException(status_code=403, detail="Admin can view the Batch Dashboard but not edit it")
     data = payload.dict(exclude_unset=True)
     colleague_fields = {"hours_worked", "comment"}
     lead_fields = {"accounts_audited", "errors"}
     sent = set(data.keys()) & (colleague_fields | lead_fields)
     if not sent:
         raise HTTPException(status_code=400, detail="Nothing to save")
+    is_override = current_user.role in ("admin", "super_admin")   # may edit saved rows and every field
 
     if current_user.role == "colleague":
         if sent & lead_fields:
             raise HTTPException(status_code=403, detail="Accounts Audited and Errors are entered by your Team Lead")
         target_user_id = current_user.id
     else:
-        if sent & colleague_fields:
+        if current_user.role == "team_lead" and sent & colleague_fields:
             raise HTTPException(status_code=403, detail="Total Hours Worked is entered by the colleague")
         if payload.user_id is None:
             raise HTTPException(status_code=400, detail="user_id is required")
@@ -3180,6 +3180,14 @@ def save_batch_stat(
             user_id=target_user_id, process_id=payload.process_id, work_date=payload.work_date,
         )
         db.add(st)
+    elif not is_override:
+        # Saved rows are locked; only Admin / Super Admin can change them.
+        if sent & colleague_fields and (
+            (st.hours_worked is not None or st.hours_status == "Pending") and st.hours_status != "Rejected"
+        ):
+            raise HTTPException(status_code=403, detail="These hours are already saved and locked. Ask an Admin to change them.")
+        if sent & lead_fields and (st.accounts_audited is not None or st.errors is not None):
+            raise HTTPException(status_code=403, detail="Audit figures are already saved and locked. Ask an Admin to change them.")
     for f in sent:
         if f == "hours_worked":
             continue            # handled below: may need approval
@@ -3196,7 +3204,7 @@ def save_batch_stat(
             models.DailyBatchStat.work_date == payload.work_date,
             models.DailyBatchStat.process_id != payload.process_id,
         ).scalar() or 0.0
-        if new_hours is not None and new_hours + others > HOURS_APPROVAL_THRESHOLD + 1e-9:
+        if new_hours is not None and new_hours + others > HOURS_APPROVAL_THRESHOLD + 1e-9 and not is_override:
             # Over 8 hours for the day: hold it for the Team Lead. The approved
             # figure (hours_worked) is left alone until they decide.
             st.pending_hours = new_hours
