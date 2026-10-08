@@ -567,6 +567,14 @@
       </label>
       <button class="action-btn" onclick="saveSessionTimeout()">Save Timeout</button>
       <hr style="margin:20px 0;">
+      <h3>Business Day (night shift)</h3>
+      <label style="max-width:340px;">Day changes at (IST)
+        <input id="business-day-input" type="time" value="03:30">
+      </label>
+      <p style="font-size:12px; color:#666; max-width:520px; margin:4px 0 8px;">Work done between midnight and this time still counts as the previous day's date
+        (login, assignment, posting, escalation, Production, dashboards). Use 00:00 for a normal midnight change. Allowed: 00:00 to 12:00.</p>
+      <button class="action-btn" onclick="saveBusinessDay()">Save Day Change Time</button>
+      <hr style="margin:20px 0;">
       <h3 id="process-form-heading">Create Process</h3>
       <div class="form-grid">
         <label>Process Name <input id="np-name"></label>
@@ -894,9 +902,22 @@ function countBusinessDaysJS(startStr, endStr) {
   return count;
 }
 
+// Night shift: the business date changes at the time the Super Admin sets (default 03:30 IST), not at midnight.
+let rolloverMinutes = 210;
+function _hhmmToMinutes(t) { const [h, m] = String(t).split(":").map(Number); return (h || 0) * 60 + (m || 0); }
+async function loadBusinessDaySetting() {
+  try {
+    const res = await authFetch("/settings/business-day");
+    if (res.ok) rolloverMinutes = _hhmmToMinutes((await res.json()).rollover_time);
+  } catch (e) { /* keep the default */ }
+}
 function todayStr() {
-  const d = new Date();
-  return d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") + "-" + String(d.getDate()).padStart(2,"0");
+  // IST = UTC+5:30; subtract the day-change time, then read the calendar date
+  return new Date(Date.now() + (330 - rolloverMinutes) * 60000).toISOString().slice(0, 10);
+}
+function _workToday() {
+  const [y, m, d] = todayStr().split("-").map(Number);
+  return new Date(y, m - 1, d);
 }
 
 // TAT shown for a row: the final figure once it's set, otherwise a running
@@ -1292,6 +1313,7 @@ function stopIdleTimer() {
 let idleTimerListenersAttached = false;
 
 async function startIdleTimer() {
+  loadBusinessDaySetting();
   try {
     const res = await authFetch("/settings/session-timeout");
     if (res.ok) {
@@ -1507,8 +1529,8 @@ async function showImportExceptionsView() {
   document.getElementById("share-bar").style.display = "none";
   document.getElementById("import-exc-bar").style.display = "flex";
 
-  const today = new Date();
-  const from = new Date(); from.setDate(today.getDate() - 29);
+  const today = _workToday();
+  const from = _workToday(); from.setDate(today.getDate() - 29);
   document.getElementById("ie-date-from").value = _isoLocalDate(from);
   document.getElementById("ie-date-to").value = _isoLocalDate(today);
   document.getElementById("ie-search").value = "";
@@ -1542,8 +1564,8 @@ async function showImportExceptionsView() {
 }
 
 function ieQuickRange(days) {
-  const today = new Date();
-  const from = new Date(); from.setDate(today.getDate() - (days - 1));
+  const today = _workToday();
+  const from = _workToday(); from.setDate(today.getDate() - (days - 1));
   document.getElementById("ie-date-from").value = _isoLocalDate(from);
   document.getElementById("ie-date-to").value = _isoLocalDate(today);
   loadImportExceptions();
@@ -2146,8 +2168,8 @@ async function showAuditView() {
   document.getElementById("share-bar").style.display = "none";
   document.getElementById("audit-bar").style.display = "flex";
 
-  const today = new Date();
-  const from = new Date(); from.setDate(today.getDate() - 29);
+  const today = _workToday();
+  const from = _workToday(); from.setDate(today.getDate() - 29);
   document.getElementById("audit-date-from").value = _isoLocalDate(from);
   document.getElementById("audit-date-to").value = _isoLocalDate(today);
   document.getElementById("audit-action").value = "";
@@ -2165,8 +2187,8 @@ async function showAuditView() {
 }
 
 function auditQuickRange(days) {
-  const today = new Date();
-  const from = new Date(); from.setDate(today.getDate() - (days - 1));
+  const today = _workToday();
+  const from = _workToday(); from.setDate(today.getDate() - (days - 1));
   document.getElementById("audit-date-from").value = _isoLocalDate(from);
   document.getElementById("audit-date-to").value = _isoLocalDate(today);
   loadAudit();
@@ -2311,8 +2333,8 @@ async function showOrdersDashboardView() {
   document.getElementById("orders-dash-bar").style.display = "flex";
 
   odState = {rows: [], tlRows: [], tab: "date", drill: null};
-  const today = new Date();
-  const from = new Date(); from.setDate(today.getDate() - 13);
+  const today = _workToday();
+  const from = _workToday(); from.setDate(today.getDate() - 13);
   document.getElementById("od-date-from").value = _isoLocalDate(from);
   document.getElementById("od-date-to").value = _isoLocalDate(today);
   // Admin / Super Admin see every process; a Team Lead only their own.
@@ -2332,8 +2354,8 @@ async function showOrdersDashboardView() {
 }
 
 function odQuickRange(days) {
-  const today = new Date();
-  const from = new Date(); from.setDate(today.getDate() - (days - 1));
+  const today = _workToday();
+  const from = _workToday(); from.setDate(today.getDate() - (days - 1));
   document.getElementById("od-date-from").value = _isoLocalDate(from);
   document.getElementById("od-date-to").value = _isoLocalDate(today);
   loadOrdersDashboard();
@@ -2594,8 +2616,8 @@ async function showBatchDashboardView() {
 
   batchTab = "detail";
   currentBatchTL = [];
-  const today = new Date();
-  const from = new Date(); from.setDate(today.getDate() - 13);
+  const today = _workToday();
+  const from = _workToday(); from.setDate(today.getDate() - 13);
   document.getElementById("batch-date-from").value = _isoLocalDate(from);
   document.getElementById("batch-date-to").value = _isoLocalDate(today);
 
@@ -3514,8 +3536,32 @@ async function showAdminView() {
     document.getElementById("session-timeout-input").value = data.minutes;
   }
 
+  const bdRes = await authFetch("/settings/business-day");
+  if (bdRes.ok) {
+    const bd = await bdRes.json();
+    document.getElementById("business-day-input").value = bd.rollover_time;
+  }
+
   await loadUserList();
   populateReportingManagerDropdown();
+}
+
+async function saveBusinessDay() {
+  const t = document.getElementById("business-day-input").value;
+  if (!t) { alert("Pick a time between 00:00 and 12:00."); return; }
+  const res = await authFetch("/settings/business-day", {
+    method: "PUT",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({rollover_time: t})
+  });
+  if (!res.ok) {
+    let msg = await res.text();
+    try { msg = JSON.parse(msg).detail || msg; } catch (_) {}
+    alert("Failed to save: " + msg);
+    return;
+  }
+  rolloverMinutes = _hhmmToMinutes(t);
+  alert(`Business day now changes at ${t} IST.`);
 }
 
 async function saveSessionTimeout() {
