@@ -495,6 +495,22 @@
           <button class="action-btn" id="pu-submit-btn" onclick="postProcessUpdate()" style="margin-top:8px;">Post Update</button>
           <button class="action-btn" id="pu-cancel-btn" style="margin-top:8px; display:none; background:#888;" onclick="cancelEditProcessUpdate()">Cancel</button>
         </div>
+        <div id="pu-search-bar" style="display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-bottom:10px;">
+          <input id="pu-search" type="search" placeholder="Search updates (comment, from, verified by, posted by, file)" oninput="renderProcessUpdates()" style="flex:1 1 220px; padding:6px; border:1px solid #ccc; border-radius:4px;">
+          <select id="pu-f-mode" onchange="renderProcessUpdates()" title="Mode" style="padding:6px;">
+            <option value="">All modes</option><option>Team message</option><option>Email</option><option>Smartsheet</option><option>Call</option>
+          </select>
+          <select id="pu-f-category" onchange="renderProcessUpdates()" title="Category" style="padding:6px;">
+            <option value="">All categories</option><option>Payer</option><option>Adjustment</option><option>Generic</option>
+          </select>
+          <select id="pu-f-status" onchange="renderProcessUpdates()" title="Status" style="padding:6px;">
+            <option value="">All statuses</option><option>Active</option><option>Inactive</option>
+          </select>
+          <label style="font-size:12px;">From <input id="pu-f-from" type="date" onchange="renderProcessUpdates()"></label>
+          <label style="font-size:12px;">To <input id="pu-f-to" type="date" onchange="renderProcessUpdates()"></label>
+          <button class="action-btn" style="background:#888;" onclick="puClearSearch()">Clear</button>
+          <span id="pu-count" style="font-size:12px; color:#666;"></span>
+        </div>
         <div id="updates-list"><p style="color:#888; font-size:13px; margin:0;">Loading...</p></div>
       </div>
     </div>
@@ -4382,10 +4398,42 @@ async function loadProcessUpdates() {
     container.innerHTML = '<p style="color:#888; font-size:13px; margin:0;">Couldn\'t load updates.</p>';
     return;
   }
-  const updates = await res.json();
-  currentProcessUpdates = updates;
-  if (!updates.length) {
+  currentProcessUpdates = await res.json();
+  renderProcessUpdates();
+}
+
+function puClearSearch() {
+  ["pu-search", "pu-f-mode", "pu-f-category", "pu-f-status", "pu-f-from", "pu-f-to"].forEach(id => { document.getElementById(id).value = ""; });
+  renderProcessUpdates();
+}
+
+function renderProcessUpdates() {
+  const container = document.getElementById("updates-list");
+  const canPost = (role === "team_lead" || role === "admin" || role === "super_admin");
+  const all = currentProcessUpdates || [];
+  const q = document.getElementById("pu-search").value.trim().toLowerCase();
+  const fm = document.getElementById("pu-f-mode").value, fc = document.getElementById("pu-f-category").value, fs = document.getElementById("pu-f-status").value;
+  const ff = document.getElementById("pu-f-from").value, ft = document.getElementById("pu-f-to").value;
+  const updates = all.filter(u => {
+    if (fm && u.mode !== fm) return false;
+    if (fc && u.category !== fc) return false;
+    if (fs && u.status !== fs) return false;
+    if (ff && (!u.received_date || u.received_date < ff)) return false;
+    if (ft && (!u.received_date || u.received_date > ft)) return false;
+    if (q) {
+      const hay = [u.message, u.received_from, u.verified_by, u.posted_by_name, u.mode, u.category, u.received_date,
+        ...(u.attachments || []).map(a => a.file_name)].join(" ").toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+  document.getElementById("pu-count").textContent = all.length ? `${updates.length} of ${all.length}` : "";
+  if (!all.length) {
     container.innerHTML = '<p style="color:#888; font-size:13px; margin:0;">No updates posted yet.</p>';
+    return;
+  }
+  if (!updates.length) {
+    container.innerHTML = '<p style="color:#888; font-size:13px; margin:0;">No updates match your search.</p>';
     return;
   }
   let html = "";
