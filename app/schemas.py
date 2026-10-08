@@ -161,6 +161,10 @@ class ChangePasswordRequest(BaseModel):
 
 class SessionTimeoutSetting(BaseModel):
     minutes: int
+
+
+class BusinessDaySetting(BaseModel):
+    rollover_time: str    # "HH:MM" IST, e.g. "03:30"
     
 class ForgotUsernameRequest(BaseModel):
     email: str

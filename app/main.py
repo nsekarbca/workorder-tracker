@@ -299,7 +299,7 @@ def login(
     if user.role in TEAM_ROLES:
         processes = []          # these queues span every process; no process picker
     if user.role == "colleague":
-        user.last_login_date = datetime.now(IST).date()     # logged in today -> eligible for auto-assignment
+        user.last_login_date = _work_today()     # logged in today -> eligible for auto-assignment
         db.commit()
         for p in processes:
             _auto_assign_open_slots(db, p.id)
@@ -640,10 +640,67 @@ def update_process(
 # ---------------------------------------------------------------------------
 
 IST = timezone(timedelta(hours=5, minutes=30))
-REACTION_TYPES = ("like", "heart")
-UPDATE_MODES = ("Team message", "Email", "Smartsheet", "Call")
-UPDATE_CATEGORIES = ("Payer", "Adjustment", "Generic")
-UPDATE_STATUSES = ("Active", "Inactive")
+
+# Night shift: the business date rolls over at a configurable time (default 3:30 AM IST, set by the
+# Super Admin under Admin > Business Day), so work done between midnight and that time still belongs
+# to the day the shift started on.
+BUSINESS_DAY_SETTING_KEY = "business_day_rollover_minutes"      # minutes after midnight IST
+DEFAULT_ROLLOVER_MINUTES = 210                                    # 03:30
+_rollover_cache = {"minutes": DEFAULT_ROLLOVER_MINUTES, "at": 0.0}
+
+
+def _rollover_minutes() -> int:
+    import time as _time
+    if _time.time() - _rollover_cache["at"] > 30:                # re-read now and then (other workers may change it)
+        db = SessionLocal()
+        try:
+            row = db.query(models.AppSetting).filter(models.AppSetting.key == BUSINESS_DAY_SETTING_KEY).first()
+            _rollover_cache["minutes"] = int(row.value) if row and str(row.value).isdigit() else DEFAULT_ROLLOVER_MINUTES
+        except Exception:
+            pass
+        finally:
+            db.close()
+        _rollover_cache["at"] = _time.time()
+    return _rollover_cache["minutes"]
+
+
+def _work_today() -> date:
+    """Today's business date (IST, rolling over at the configured time instead of midnight)."""
+    return (datetime.now(IST) - timedelta(minutes=_rollover_minutes())).date()
+
+
+def _fmt_hhmm(minutes: int) -> str:
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+@app.get("/settings/business-day", response_model=schemas.BusinessDaySetting)
+def get_business_day(current_user: models.User = Depends(auth.get_current_user)):
+    """Any logged-in user can read this: the screens use it to work out 'today'."""
+    return {"rollover_time": _fmt_hhmm(_rollover_minutes())}
+
+
+@app.put("/settings/business-day", response_model=schemas.BusinessDaySetting)
+def set_business_day(
+    payload: schemas.BusinessDaySetting,
+    current_user: models.User = Depends(auth.require_role("super_admin")),
+    db: Session = Depends(get_db),
+):
+    try:
+        hh, mm = payload.rollover_time.split(":")
+        minutes = int(hh) * 60 + int(mm)
+        assert 0 <= int(hh) <= 23 and 0 <= int(mm) <= 59
+    except Exception:
+        raise HTTPException(status_code=400, detail="Enter the time as HH:MM, e.g. 03:30")
+    if minutes > 12 * 60:
+        raise HTTPException(status_code=400, detail="The day change time must be between 00:00 and 12:00")
+    row = db.query(models.AppSetting).filter(models.AppSetting.key == BUSINESS_DAY_SETTING_KEY).first()
+    if row:
+        row.value = str(minutes)
+    else:
+        db.add(models.AppSetting(key=BUSINESS_DAY_SETTING_KEY, value=str(minutes)))
+    db.commit()
+    _rollover_cache.update(minutes=minutes, at=__import__("time").time())
+    return {"rollover_time": _fmt_hhmm(minutes)}
 
 
 @app.get("/celebrations/today", response_model=List[schemas.CelebrationPerson])
@@ -1074,7 +1131,7 @@ def reassign_order(
     before = _order_snapshot(order) if reasons else None
 
     order.assigned_to_id = new_colleague.id
-    order.assigned_date = datetime.now(IST).date()
+    order.assigned_date = _work_today()
     order.employee_id = new_colleague.employee_id or new_colleague.username
     order.employee_name = new_colleague.full_name
     order.last_edited_by = current_user.username
@@ -1424,7 +1481,7 @@ def import_inventory(
     # EDMs already imported in the lookback window (EDM process)
     # IST, not the server's own (UTC) date — see todays_celebrations for
     # why: near IST midnight the two disagree on which calendar day it is.
-    today = datetime.now(IST).date()
+    today = _work_today()
     existing = {}
     if is_edm:
         cutoff = today - relativedelta(months=DUPLICATE_LOOKBACK_MONTHS)
@@ -1668,7 +1725,7 @@ def release_import_exceptions(
     db.flush()
 
     # every unassigned exception of an assigned client + process moves, not just the ticked ones
-    today = datetime.now(IST).date()
+    today = _work_today()
     cutoff = today - relativedelta(months=DUPLICATE_LOOKBACK_MONTHS)
     process_ids = {k[1] for k in assignment}
     pool = db.query(models.ImportException).filter(
@@ -1763,7 +1820,7 @@ def _auto_assign_open_slots(db: Session, process_id: int):
             models.User.role == "colleague",
             models.User.processes.any(models.Process.id == process_id),
             # Orders are only handed out to colleagues who have logged in today (IST).
-            models.User.last_login_date == datetime.now(IST).date(),
+            models.User.last_login_date == _work_today(),
         )
         .all()
     )
@@ -1815,7 +1872,7 @@ def _auto_assign_open_slots(db: Session, process_id: int):
             continue
         next_order = remaining.pop(match_index)
         next_order.assigned_to_id = colleague.id
-        next_order.assigned_date = datetime.now(IST).date()
+        next_order.assigned_date = _work_today()
         next_order.employee_id = colleague.employee_id or colleague.username
         next_order.employee_name = colleague.full_name
         next_order.posting_status = "In-Process"
@@ -2219,12 +2276,12 @@ def update_colleague_fields(
     # Auto-set Issue Raised Date the moment a colleague flags Clarification,
     # if it isn't already set.
     if order.posting_status == "Clarification" and not order.issue_raised_date:
-        order.issue_raised_date = datetime.now(IST).date()
+        order.issue_raised_date = _work_today()
 
     # Auto-set Posted Date the moment a colleague marks Completed — no manual
     # entry needed, and it guarantees TAT can always be calculated below.
     if order.posting_status == "Completed" and not order.posted_date:
-        order.posted_date = datetime.now(IST).date()
+        order.posted_date = _work_today()
 
     # Completing an order freezes its "Time Taken" — stop the clock and
     # roll in whatever time was still running.
@@ -2237,7 +2294,7 @@ def update_colleague_fields(
     # NOT cleared anymore — they're kept as history so the TAT pause-window
     # calculation at Completion stays accurate.
     if previous_status == "Clarification" and order.posting_status != "Clarification" and not order.issue_closed_date:
-        order.issue_closed_date = datetime.now(IST).date()
+        order.issue_closed_date = _work_today()
 
     # Saving with Escalation Category = "Clarification" hands the row off
     # to the Team Lead: it locks for the colleague (still visible, read-
@@ -3546,7 +3603,7 @@ def resolve_escalation(
         _save_onshore_files(db, current_user, order, res_msg, blobs)
 
     order.ventra_comment = comment
-    order.issue_closed_date = datetime.now(IST).date()
+    order.issue_closed_date = _work_today()
     _close_escalation_event(db, order, current_user, comment)
     order.escalated = False
     order.last_edited_by = current_user.username
@@ -4085,7 +4142,7 @@ def save_escalation_detail(
 
 def _open_escalation_event(db: Session, order: models.WorkOrder, user: models.User, snapshot: dict) -> None:
     """A colleague raises a (new) query: log it with its own Issue Raised Date and reset the team hand-off."""
-    today = datetime.now(IST).date()
+    today = _work_today()
     db.add(models.EscalationEvent(
         order_id=order.id, process_id=order.process_id, team_lead_id=order.team_lead_id,
         category=order.escalation_category, raised_date=today, poster_comment=order.poster_comment,
@@ -4108,7 +4165,7 @@ def _close_escalation_event(db: Session, order: models.WorkOrder, user: models.U
         .order_by(models.EscalationEvent.id.desc()).first()
     )
     if ev:
-        ev.closed_date = datetime.now(IST).date()
+        ev.closed_date = _work_today()
         ev.ventra_comment = comment
         ev.resolved_by_name = user.full_name
 
