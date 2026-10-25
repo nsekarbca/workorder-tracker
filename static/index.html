@@ -13,6 +13,7 @@
   #theme-toggle { position:fixed; right:14px; bottom:14px; z-index:9999; width:40px; height:40px; border-radius:50%; border:1px solid #c9d2e3; background:#fff; color:#0b2545; font-size:19px; line-height:1; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,.25); padding:0; }
   #theme-toggle:hover { background:#f4f4f6; }
   @media print { #theme-toggle { display:none; } html[data-theme="dark"] { filter:none; } }
+.nav-sub-item{padding-left:34px !important;font-size:13px;background:rgba(0,0,0,.03);}
 </style>
 <style>
   :root {
@@ -521,8 +522,11 @@ td.not-started{color:#9aa3b2;background:#eceff3;opacity:.75;user-select:none;poi
         <button class="nav-menu-item" id="nav-admin-btn" style="display:none;" onclick="navTo('admin')">⚙️ Admin</button>
         <button class="nav-menu-item" id="nav-835-btn" style="display:none;" onclick="navTo('p835')">&#128179; 835 Posting Queue</button>
         <button class="nav-menu-item" id="nav-performance-btn" style="display:none;" onclick="navTo('performance')">&#127942; Performance</button>
-        <button class="nav-menu-item" id="nav-away-btn" style="display:none;" onclick="navTo('away')">&#128064; Away Now</button>
-        <button class="nav-menu-item" id="nav-breaks-btn" style="display:none;" onclick="navTo('breaks')">&#9749; Break Tracker</button>
+        <button class="nav-menu-item" id="nav-break-group-btn" style="display:none;" onclick="toggleBreakSub(event)">&#9749; Break Tracker <span id="nav-break-caret" style="float:right;">&#9662;</span></button>
+        <div id="nav-break-sub" style="display:none;">
+          <button class="nav-menu-item nav-sub-item" id="nav-breaks-btn" style="display:none;" onclick="navTo('breaks')">Break Tracker</button>
+          <button class="nav-menu-item nav-sub-item" id="nav-away-btn" style="display:none;" onclick="navTo('away')">Away Now</button>
+        </div>
         <button class="nav-menu-item" id="nav-holidays-btn" onclick="navTo('holidays')">📅 Holidays</button>
         <button class="nav-menu-item" id="nav-profile-btn" style="display:none;" onclick="navTo('profile')">👤 My Profile</button>
         <button class="nav-menu-item" id="nav-switch-process-btn" style="display:none;" onclick="navTo('switch')">Switch Process</button>
@@ -3506,6 +3510,7 @@ function showApp() {
   }
 
   applyProcessMenu();
+  syncBreakGroup();
   if (noProcessUser()) { showBreaksView(); return; }
   if (currentProcessId) {
     if (role === "quality") showProductionView();
@@ -3524,13 +3529,23 @@ function showApp() {
 const PROCESS_MENU_IDS = ["nav-active-btn", "nav-onshore-btn", "nav-import-exc-btn", "nav-clients-btn", "nav-audit-btn",
   "nav-orders-dash-btn", "nav-batch-btn", "nav-production-btn", "nav-escalations-btn", "nav-835-btn"];
 // A colleague / Team Lead / Admin created without any process only gets Break Tracker (+ Away Now for leads/admins).
+function toggleBreakSub(event) {
+  if (event) event.stopPropagation();
+  const sub = document.getElementById("nav-break-sub");
+  sub.style.display = sub.style.display === "block" ? "none" : "block";
+  document.getElementById("nav-break-caret").innerHTML = sub.style.display === "block" ? "&#9652;" : "&#9662;";
+}
+function syncBreakGroup() {
+  const vis = id => { const e = document.getElementById(id); return e && e.style.display !== "none"; };
+  document.getElementById("nav-break-group-btn").style.display = (vis("nav-breaks-btn") || vis("nav-away-btn")) ? "block" : "none";
+}
 function noProcessUser() {
   return myProcesses.length === 0 && (role === "colleague" || role === "team_lead" || role === "admin");
 }
 function applyProcessMenu() {
   if (noProcessUser()) {
     document.querySelectorAll("#nav-menu .nav-menu-item").forEach(e => {
-      if (e.id !== "nav-breaks-btn" && e.id !== "nav-away-btn") e.style.display = "none";
+      if (!e.classList.contains("nav-sub-item") && e.id !== "nav-break-group-btn") e.style.display = "none";
     });
     ["import-btn","run-assign-btn","clear-data-btn","production-btn","share-btn","submit-day-btn","active-tl-label"].forEach(id => { const e = document.getElementById(id); if (e) e.style.display = "none"; });
     return;
