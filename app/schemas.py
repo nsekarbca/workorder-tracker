@@ -14,6 +14,7 @@ class CelebrationCommentOut(BaseModel):
     message: str
     posted_by_name: str
     created_at: datetime
+    has_image: bool = False
     reaction_counts: dict = {}  # e.g. {"like": 2, "heart": 1}
     my_reactions: List[str] = []  # reaction types the current user already gave this comment
 
@@ -22,7 +23,8 @@ class CelebrationCommentOut(BaseModel):
 
 
 class CelebrationCommentCreate(BaseModel):
-    message: str
+    message: str = ""
+    image: Optional[str] = None      # data URL (data:image/gif;base64,...) — picture, GIF or poster
 
 
 class CelebrationReactRequest(BaseModel):
@@ -69,6 +71,11 @@ class ProcessUpdateOut(BaseModel):
     updated_by_name: Optional[str] = None
     updated_by_role: Optional[str] = None
     attachments: List[ProcessUpdateAttachmentOut] = []
+    ack_required: bool = False
+    acknowledged: Optional[bool] = None     # colleague: have I acknowledged it?
+    acknowledged_at: Optional[datetime] = None
+    ack_count: Optional[int] = None         # Team Lead / Admin / Super Admin: how many colleagues acknowledged
+    ack_total: Optional[int] = None         # ...out of how many in scope
 
     class Config:
         from_attributes = True
@@ -137,6 +144,7 @@ class UserOut(BaseModel):
     anniversary_date: Optional[date] = None
     designation: Optional[str] = None
     reporting_manager: Optional[str] = None
+    shift: Optional[str] = None
     employment_status: str = "Active"
     must_change_password: bool = True
     processes: List[ProcessOut] = []
@@ -190,6 +198,7 @@ class CreateUserRequest(BaseModel):
     anniversary_date: Optional[date] = None
     designation: Optional[str] = None
     reporting_manager: Optional[str] = None
+    shift: Optional[str] = None
     employment_status: str = "Active"
     employee_id: Optional[str] = None
     process_ids: List[int] = []
@@ -288,6 +297,7 @@ class InventoryImportRow(BaseModel):
 # Fields a Colleague may set (P-Z)
 class ColleagueUpdate(BaseModel):
     posted_amount: Optional[float] = None
+    posted_835_amount: Optional[float] = None
     pending_amount: Optional[float] = None
     bar_batch: Optional[str] = None
     trans_count: Optional[int] = None
@@ -323,6 +333,15 @@ class ProductionEdit(BaseModel):
     status: Optional[str] = None
     description: Optional[str] = None
     division: Optional[str] = None
+    division_name: Optional[str] = None
+    run: Optional[str] = None
+    inits: Optional[str] = None
+    ecom_type: Optional[str] = None
+    eobs: Optional[int] = None
+    checks: Optional[int] = None
+    not_posted: Optional[int] = None
+    not_posted_amount: Optional[float] = None
+    offset_amount: Optional[float] = None
     amount: Optional[float] = None
     posted_amount: Optional[float] = None
     bar_batch: Optional[str] = None
@@ -355,7 +374,17 @@ class WorkOrderOut(BaseModel):
     description: Optional[str]
     division: Optional[str]
     deposit_date: Optional[date]
+    division_name: Optional[str] = None
+    run: Optional[str] = None
+    inits: Optional[str] = None
+    ecom_type: Optional[str] = None
+    eobs: Optional[int] = None
+    checks: Optional[int] = None
+    not_posted: Optional[int] = None
+    not_posted_amount: Optional[float] = None
+    offset_amount: Optional[float] = None
     posted_amount: Optional[float]
+    posted_835_amount: Optional[float] = None
     pending_amount: Optional[float]
     bar_batch: Optional[str]
     trans_count: Optional[int]
@@ -424,6 +453,7 @@ class BatchDashboardRow(BaseModel):
     total_trans_count: int
     daily_target: Optional[int] = None
     hours_worked: Optional[float] = None
+    hours_auto: Optional[float] = None      # Total Time Taken of that day's orders, in hours (auto-captured; Team Lead / Admin / Super Admin only)
     pending_hours: Optional[float] = None   # requested hours waiting for Team Lead approval (daily total > 8)
     hours_status: Optional[str] = None      # Pending | Approved | Rejected
     comment: Optional[str] = None           # colleague's note; required when the day's total hours are under 8
@@ -662,6 +692,44 @@ class ImportExceptionOut(BaseModel):
     existing_order_id: Optional[int] = None
     existing_posted_date: Optional[date] = None
     existing_employee_name: Optional[str] = None
+    details: Optional[dict] = None          # the imported file row (ECOM shows Run, Division Name, Type, NotPosted$, Offset $)
 
     class Config:
         from_attributes = True
+
+
+class HolidayIn(BaseModel):
+    holiday_date: date
+    name: str
+
+
+class HolidayOut(BaseModel):
+    id: int
+    holiday_date: date
+    name: str
+    created_by_name: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class BreakIn(BaseModel):
+    break_type: str
+    started_at: Optional[str] = None      # ISO timestamp (UTC) of when the screen locked / break began
+    source: Optional[str] = "auto"
+    process_id: Optional[int] = None
+    comment: Optional[str] = None
+
+
+class BreakIdleSetting(BaseModel):
+    minutes: int
+    lock_system: Optional[bool] = True
+
+
+class PhotoIn(BaseModel):
+    photo: Optional[str] = None
+
+
+class AwayIn(BaseModel):
+    started_at: Optional[str] = None
+    source: Optional[str] = "auto"

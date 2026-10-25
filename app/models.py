@@ -51,6 +51,9 @@ class CelebrationComment(Base):
     target_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     occasion_date = Column(Date, nullable=True)
     message = Column(String, nullable=False)
+    # Optional picture / GIF / generated poster, stored inline as base64 (like Process Update attachments).
+    image_b64 = Column(Text, nullable=True)
+    image_type = Column(String, nullable=True)
     posted_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     posted_by_name = Column(String, nullable=False)
     created_at = Column(DateTime, server_default=func.now())
@@ -101,6 +104,8 @@ class ProcessUpdate(Base):
     updated_at = Column(DateTime, nullable=True)
     updated_by_name = Column(String, nullable=True)
     updated_by_role = Column(String, nullable=True)
+    # True for updates posted once acknowledgements existed: the process's colleagues must review and acknowledge them.
+    ack_required = Column(Boolean, nullable=False, default=False)
 
     attachments = relationship(
         "ProcessUpdateAttachment",
@@ -216,10 +221,12 @@ class User(Base):
     anniversary_date = Column(Date, nullable=True)
     designation = Column(String, nullable=True)
     reporting_manager = Column(String, nullable=True)
+    shift = Column(String, nullable=True)        # Day / Mid / Night shift with its timings (set by Super Admin)
     employment_status = Column(String, nullable=False, default="Active")  # "Active" or "Inactive"
 
     # IST date of the colleague's most recent login. Auto-assignment only offers
     # orders to colleagues who have logged in today.
+    photo = Column(Text, nullable=True)      # small profile picture as a data: URL (set from My Profile)
     last_login_date = Column(Date, nullable=True)
 
     # Forgot-password flow: a short-lived token emailed to the user, cleared
@@ -267,8 +274,20 @@ class WorkOrder(Base):
     division = Column(String)             # N
     deposit_date = Column(Date)           # O
 
+    # --- ECOM process only (imported from the ECOM active-queue file) ---
+    division_name = Column(String)
+    run = Column(String)
+    inits = Column(String)
+    ecom_type = Column(String)            # "Type"
+    eobs = Column(Integer)
+    checks = Column(Integer)              # "Check(s)"
+    not_posted = Column(Integer)          # NotPosted
+    not_posted_amount = Column(Float)     # NotPosted$
+    offset_amount = Column(Float)         # Offset $
+
     # --- P-Z: Colleague-filled fields ---
-    posted_amount = Column(Float)         # P: Posted $
+    posted_amount = Column(Float)         # P: Posted $ (EDM: "Manual Posted $")
+    posted_835_amount = Column(Float)     # EDM only: 835 Posted $ (Pending $ = Amount - Posted $ - 835 Posted $)
     pending_amount = Column(Float)        # Q: Pending $
     bar_batch = Column(String)            # R: BAR Batch
     trans_count = Column(Integer)         # S: Trans Count
@@ -503,3 +522,119 @@ class OnshoreAttachment(Base):
     file_data = Column(Text, nullable=False)                  # base64
     uploaded_by_name = Column(String, nullable=True)
     created_at = Column(DateTime, nullable=False)
+
+
+class Holiday(Base):
+    """Company holidays. Excluded from TAT business-day counts; shown on the home screen."""
+    __tablename__ = "holidays"
+
+    id = Column(Integer, primary_key=True, index=True)
+    holiday_date = Column(Date, nullable=False, unique=True, index=True)
+    name = Column(String, nullable=False)
+    created_by_name = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=True)
+
+
+class LoginDay(Base):
+    """One row per user per day they logged in. Attendance 'Worked Days' = login days."""
+    __tablename__ = "login_days"
+    __table_args__ = (UniqueConstraint("user_id", "login_date", name="uq_login_day"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    login_date = Column(Date, nullable=False, index=True)
+
+
+class PerformanceRating(Base):
+    """Manual 1-5 ratings (Process Knowledge, Shift Adherence, Flexibility, Monthend Support) per colleague per month."""
+    __tablename__ = "performance_ratings"
+    __table_args__ = (UniqueConstraint("user_id", "year", "month", name="uq_perf_rating"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    year = Column(Integer, nullable=False)
+    month = Column(Integer, nullable=False)          # 0 = Jan ... 11 = Dec
+    pk = Column(Integer, nullable=True)
+    shift = Column(Integer, nullable=True)
+    flex = Column(Integer, nullable=True)
+    me = Column(Integer, nullable=True)
+    updated_by = Column(String, nullable=True)
+    updated_at = Column(DateTime, nullable=True)
+
+
+class Posting835Line(Base):
+    """
+    One line of the 835 details form. An EDM order whose 835 Posted $ is above
+    zero has one or more lines; their amounts add up to that 835 Posted $.
+    Team Lead / Admin / Super Admin read them under the "835 Postings" menu.
+    """
+    __tablename__ = "posting_835_lines"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("work_orders.id", ondelete="CASCADE"), nullable=False, index=True)
+    process_id = Column(Integer, index=True)
+    line_no = Column(Integer, default=1)
+    edm = Column(String)
+    division = Column(String)
+    exchange = Column(String)
+    check_number_edm = Column(String)
+    check_number_835 = Column(String)
+    amount = Column(Float)
+    edm_description = Column(String)
+    deposit_date = Column(Date)
+    payor_name = Column(String)
+    worked_by = Column(String)
+    worked_by_id = Column(Integer, index=True)
+    updated_at = Column(DateTime)
+
+
+class ProcessUpdateAck(Base):
+    """A colleague's acknowledgement that they reviewed a Process Update (one per colleague per update)."""
+    __tablename__ = "process_update_acks"
+    __table_args__ = (UniqueConstraint("update_id", "user_id", name="uq_update_ack"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    update_id = Column(Integer, ForeignKey("process_updates.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    user_name = Column(String)
+    acknowledged_at = Column(DateTime)
+
+
+class BreakLog(Base):
+    """One finished break: started when the screen locked (idle) or the colleague
+    pressed Take a Break, ended when they pressed Resume."""
+    __tablename__ = "break_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    process_id = Column(Integer, ForeignKey("processes.id"), nullable=True)
+    break_type = Column(String, nullable=False)   # Tea Break / Lunch Break / Other Break / Meeting Break
+    source = Column(String, nullable=False, default="auto")   # auto = idle lock, manual = Take a Break button
+    started_at = Column(DateTime, nullable=False)   # UTC (naive), like created_at
+    ended_at = Column(DateTime, nullable=False)
+    minutes = Column(Float, nullable=False, default=0)
+    comment = Column(String, nullable=True)         # reason picked on the lock screen
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class SessionLog(Base):
+    """One login session of a colleague: login time, last heartbeat and (if they logged out) logout time."""
+    __tablename__ = "session_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    login_at = Column(DateTime, nullable=False)       # UTC (naive)
+    last_seen = Column(DateTime, nullable=False)
+    logout_at = Column(DateTime, nullable=True)
+
+
+class AwayNow(Base):
+    """Colleagues whose screen is locked for a break right now (one row per colleague)."""
+    __tablename__ = "away_now"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    started_at = Column(DateTime, nullable=False)    # UTC (naive)
+    source = Column(String, nullable=False, default="auto")
+    updated_at = Column(DateTime, nullable=False)    # last heartbeat while away

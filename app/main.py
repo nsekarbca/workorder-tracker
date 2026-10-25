@@ -4,8 +4,9 @@ from dateutil import parser as date_parser
 from dateutil.relativedelta import relativedelta
 import secrets
 
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Response
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session, selectinload
@@ -17,8 +18,9 @@ import re
 import base64
 
 import os
+import sys
 
-from . import models, schemas, auth, email_utils
+from . import models, schemas, auth, email_utils, syslock
 from .database import Base, engine, get_db, SessionLocal
 
 Base.metadata.create_all(bind=engine)
@@ -50,6 +52,22 @@ _ADDED_COLUMNS = [
     ("daily_batch_stats", "hours_status", "VARCHAR"),
     ("daily_batch_stats", "hours_decided_by", "VARCHAR"),
     ("daily_batch_stats", "hours_decided_at", "TIMESTAMP"),
+    ("celebration_comments", "image_b64", "TEXT"),
+    ("celebration_comments", "image_type", "VARCHAR"),
+    ("work_orders", "division_name", "VARCHAR"),
+    ("work_orders", "run", "VARCHAR"),
+    ("work_orders", "inits", "VARCHAR"),
+    ("work_orders", "ecom_type", "VARCHAR"),
+    ("work_orders", "eobs", "INTEGER"),
+    ("work_orders", "checks", "INTEGER"),
+    ("work_orders", "not_posted", "INTEGER"),
+    ("work_orders", "not_posted_amount", "DOUBLE PRECISION"),
+    ("work_orders", "offset_amount", "DOUBLE PRECISION"),
+    ("work_orders", "posted_835_amount", "DOUBLE PRECISION"),
+    ("break_logs", "comment", "VARCHAR"),
+    ("users", "photo", "TEXT"),
+    ("users", "shift", "VARCHAR"),
+    ("process_updates", "ack_required", "BOOLEAN DEFAULT FALSE"),
 ]
 
 
@@ -69,7 +87,43 @@ def _ensure_added_columns():
 
 _ensure_added_columns()
 
+# Indexes on the columns every queue / dashboard query filters by. IF NOT EXISTS makes this safe on
+# every start (SQLite and PostgreSQL); a failure never blocks startup.
+_INDEXES = [
+    ("ix_wo_process", "work_orders", "process_id"),
+    ("ix_wo_assigned", "work_orders", "assigned_to_id"),
+    ("ix_wo_received", "work_orders", "received_date"),
+    ("ix_wo_posting_status", "work_orders", "posting_status"),
+    ("ix_wo_edm", "work_orders", "edm"),
+    ("ix_wo_proc_received", "work_orders", "process_id, received_date"),
+    ("ix_wo_team_lead", "work_orders", "team_lead_id"),
+    ("ix_impexc_process", "import_exceptions", "process_id, created_at"),
+    ("ix_celeb_target", "celebration_comments", "target_user_id, occasion_date"),
+]
+
+
+def _ensure_indexes():
+    try:
+        insp = sa_inspect(engine)
+        tables = set(insp.get_table_names())
+        for name, table, cols in _INDEXES:
+            if table not in tables:
+                continue
+            try:
+                with engine.begin() as conn:
+                    conn.execute(sa_text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({cols})"))
+            except Exception as exc:
+                print(f"[startup] index {name} skipped: {exc}")
+    except Exception as exc:
+        print(f"[startup] could not create indexes: {exc}")
+
+
+_ensure_indexes()
+
 app = FastAPI(title="WorkFlow Hub")
+
+# Compress anything over 1 KB (the page itself, big order lists): ~70-80% less data on the network.
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 app.add_middleware(
     CORSMiddleware,
@@ -301,6 +355,8 @@ def login(
     if user.role == "colleague":
         user.last_login_date = _work_today()     # logged in today -> eligible for auto-assignment
         db.commit()
+        _record_login_day(db, user.id)
+        _open_session(db, user.id)
         for p in processes:
             _auto_assign_open_slots(db, p.id)
     return {
@@ -393,6 +449,249 @@ def set_session_timeout(
         db.add(setting)
     db.commit()
     return {"minutes": payload.minutes}
+
+
+SHIFT_OPTIONS = [
+    "Day Shift (08:00 AM - 05:00 PM)", "Day Shift (09:00 AM - 06:00 PM)",
+    "Mid Shift (03:30 PM - 12:30 AM)",
+    "Night Shift (05:30 PM - 02:30 AM)", "Night Shift (06:30 PM - 03:30 AM)",
+]
+
+
+def _clean_shift(v):
+    v = (v or "").strip()
+    if not v:
+        return None
+    if v not in SHIFT_OPTIONS:
+        raise HTTPException(status_code=400, detail="Choose a shift from the list")
+    return v
+
+
+BREAK_IDLE_SETTING_KEY = "break_idle_minutes"
+DEFAULT_BREAK_IDLE_MINUTES = 5
+BREAK_TYPES = ["Tea Break", "Lunch Break", "Dinner Break", "Other Break", "Meeting Break"]
+
+
+BREAK_LOCK_SYSTEM_KEY = "break_lock_system"
+
+
+def _break_settings(db: Session) -> dict:
+    row = db.query(models.AppSetting).filter(models.AppSetting.key == BREAK_IDLE_SETTING_KEY).first()
+    sysrow = db.query(models.AppSetting).filter(models.AppSetting.key == BREAK_LOCK_SYSTEM_KEY).first()
+    return {"minutes": int(row.value) if row else DEFAULT_BREAK_IDLE_MINUTES,
+            "lock_system": (sysrow.value != "0") if sysrow else True}
+
+
+@app.get("/settings/break-idle", response_model=schemas.BreakIdleSetting)
+def get_break_idle(current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
+    """Minutes of no activity after which a colleague's screen locks for a break."""
+    return _break_settings(db)
+
+
+@app.put("/settings/break-idle", response_model=schemas.BreakIdleSetting)
+def set_break_idle(
+    payload: schemas.BreakIdleSetting,
+    current_user: models.User = Depends(auth.require_role("super_admin")),
+    db: Session = Depends(get_db),
+):
+    if payload.minutes < 1 or payload.minutes > 120:
+        raise HTTPException(status_code=400, detail="Enter 1 to 120 minutes")
+    for key, val in ((BREAK_IDLE_SETTING_KEY, str(payload.minutes)),
+                     (BREAK_LOCK_SYSTEM_KEY, "0" if payload.lock_system is False else "1")):
+        row = db.query(models.AppSetting).filter(models.AppSetting.key == key).first()
+        if row:
+            row.value = val
+        else:
+            db.add(models.AppSetting(key=key, value=val))
+    db.commit()
+    return _break_settings(db)
+
+
+def _local_request(request: Request) -> bool:
+    host = request.client.host if request.client else ""
+    return host in ("127.0.0.1", "::1", "localhost")
+
+
+@app.post("/breaks/lock-system")
+def lock_system_screen(request: Request, payload: Optional[dict] = None, current_user: models.User = Depends(auth.require_role("colleague"))):
+    """
+    Shows the full-screen break lock in front of every application and blocks
+    Alt+Tab / Win key / Win+D (see app/syslock.py). Only possible when this
+    server runs on the colleague's own Windows PC and the request comes from
+    that PC; on a hosted server there is nothing to lock.
+    """
+    if not _local_request(request) or not syslock.IS_WIN:
+        return {"locked": False}
+    start = None
+    try:
+        if payload and payload.get("started_at"):
+            start = datetime.fromisoformat(str(payload["started_at"]).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        start = None
+    return {"locked": syslock.start(start)}
+
+
+@app.get("/breaks/idle")
+def system_idle(request: Request, current_user: models.User = Depends(auth.require_role("colleague"))):
+    """Seconds since any mouse/keyboard input on this PC (only when the server runs on the colleague's own Windows PC)."""
+    if not _local_request(request):
+        return {"idle_seconds": None}
+    return {"idle_seconds": syslock.idle_seconds()}
+
+
+@app.get("/breaks/lock-status")
+def lock_system_status(request: Request, current_user: models.User = Depends(auth.require_role("colleague"))):
+    if not _local_request(request):
+        return {"active": False, "resumed": False, "chosen": ""}
+    return syslock.status()
+
+
+@app.post("/breaks/unlock-system")
+def unlock_system_screen(request: Request, current_user: models.User = Depends(auth.require_role("colleague"))):
+    if _local_request(request):
+        syslock.stop()
+        syslock.clear_result()
+    return {"ok": True}
+
+
+@app.post("/breaks")
+def record_break(
+    payload: schemas.BreakIn,
+    current_user: models.User = Depends(auth.require_role("colleague")),
+    db: Session = Depends(get_db),
+):
+    """Saved when the colleague presses Resume: the break ends now."""
+    if payload.break_type not in BREAK_TYPES:
+        raise HTTPException(status_code=400, detail="Pick a break type: " + ", ".join(BREAK_TYPES))
+    ended = datetime.utcnow()
+    started = ended
+    if payload.started_at:
+        try:
+            dt = datetime.fromisoformat(payload.started_at.replace("Z", "+00:00"))
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            started = dt
+        except ValueError:
+            started = ended
+    if started > ended:
+        started = ended
+    if ended - started > timedelta(hours=16):
+        started = ended - timedelta(hours=16)
+    row = models.BreakLog(
+        user_id=current_user.id, process_id=payload.process_id, break_type=payload.break_type,
+        source="manual" if payload.source == "manual" else "auto",
+        started_at=started, ended_at=ended, minutes=round((ended - started).total_seconds() / 60, 2),
+        comment=((payload.comment or "").strip()[:300] or None),
+    )
+    db.add(row)
+    _away_clear(db, current_user.id)
+    db.commit()
+    return {"id": row.id, "minutes": row.minutes}
+
+
+@app.get("/breaks")
+def list_breaks(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Breaks in an IST date range. Colleague: own; Team Lead: their team; Admin / Super Admin: everyone."""
+    today = datetime.now(IST).date()
+    try:
+        d1 = date.fromisoformat(date_from) if date_from else today.replace(day=1)
+        d2 = date.fromisoformat(date_to) if date_to else today
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date")
+    if (d2 - d1).days > 92:
+        raise HTTPException(status_code=400, detail="Choose a range of 92 days or less")
+    def _utc(d):
+        return datetime(d.year, d.month, d.day, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
+    lo, hi = _utc(d1), _utc(d2 + timedelta(days=1))
+    q = db.query(models.BreakLog).filter(models.BreakLog.started_at >= lo, models.BreakLog.started_at < hi)
+    if current_user.role == "colleague":
+        q = q.filter(models.BreakLog.user_id == current_user.id)
+    elif current_user.role == "team_lead":
+        ids = [u.id for u in _batch_visible_colleagues(db, current_user)]
+        q = q.filter(models.BreakLog.user_id.in_(ids or [-1]))
+    rows = q.order_by(models.BreakLog.started_at.desc()).limit(5000).all()
+    out = []
+    for r in rows:
+        u = r.user
+        out.append({
+            "id": r.id, "user_id": r.user_id, "employee": u.full_name if u else "", "employee_id": u.employee_id if u else None,
+            "team_lead": (u.reporting_manager if u else None) or "", "break_type": r.break_type, "source": r.source,
+            "started_at": r.started_at.isoformat(), "ended_at": r.ended_at.isoformat(), "minutes": r.minutes,
+            "comment": r.comment or "",
+        })
+    return out
+
+
+@app.get("/auth/me/photo")
+def get_my_photo(current_user: models.User = Depends(auth.get_current_user)):
+    return {"photo": current_user.photo or ""}
+
+
+@app.put("/auth/me/photo")
+def set_my_photo(payload: schemas.PhotoIn, current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
+    """Profile picture (the browser shrinks it to about 160x160 first). Empty value removes it."""
+    ph = (payload.photo or "").strip()
+    if ph and (not ph.startswith("data:image/") or len(ph) > 250_000):
+        raise HTTPException(status_code=400, detail="Please choose a smaller picture (JPG or PNG).")
+    current_user.photo = ph or None
+    db.commit()
+    return {"ok": True}
+
+
+def _away_clear(db: Session, user_id: int):
+    db.query(models.AwayNow).filter(models.AwayNow.user_id == user_id).delete()
+
+
+@app.post("/breaks/away")
+def away_start(payload: schemas.AwayIn, current_user: models.User = Depends(auth.require_role("colleague")), db: Session = Depends(get_db)):
+    """The colleague's screen just locked for a break (shown on Away Now)."""
+    now = datetime.utcnow()
+    started = now
+    if payload.started_at:
+        try:
+            dt = datetime.fromisoformat(payload.started_at.replace("Z", "+00:00"))
+            started = dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
+        except ValueError:
+            started = now
+    if started > now or now - started > timedelta(hours=16):
+        started = now
+    row = db.query(models.AwayNow).filter(models.AwayNow.user_id == current_user.id).first()
+    if row:
+        row.started_at, row.source, row.updated_at = started, "manual" if payload.source == "manual" else "auto", now
+    else:
+        db.add(models.AwayNow(user_id=current_user.id, started_at=started, source="manual" if payload.source == "manual" else "auto", updated_at=now))
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/breaks/away")
+def away_list(
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Colleagues away right now: Team Lead -> their team, Admin / Super Admin -> everyone."""
+    ids = [u.id for u in _batch_visible_colleagues(db, current_user)]
+    rows = db.query(models.AwayNow).filter(models.AwayNow.user_id.in_(ids or [-1])).all()
+    now = datetime.utcnow()
+    users = {u.id: u for u in db.query(models.User).filter(models.User.id.in_([r.user_id for r in rows] or [-1])).all()}
+    out = []
+    for r in rows:
+        u = users.get(r.user_id)
+        if not u:
+            continue
+        out.append({
+            "user_id": r.user_id, "employee": u.full_name, "employee_id": u.employee_id, "team_lead": u.reporting_manager or "",
+            "photo": u.photo or "", "shift": u.shift or "", "started_at": r.started_at.isoformat() + "Z", "source": r.source,
+            "minutes": round((now - r.started_at).total_seconds() / 60, 1),
+            "no_signal_minutes": round((now - r.updated_at).total_seconds() / 60, 1),
+        })
+    out.sort(key=lambda x: -x["minutes"])
+    return out
 
 
 @app.post("/auth/forgot-username")
@@ -512,6 +811,7 @@ def create_user(
         anniversary_date=payload.anniversary_date,
         designation=payload.designation,
         reporting_manager=payload.reporting_manager,
+        shift=_clean_shift(payload.shift),
         employment_status=payload.employment_status,
         employee_id=payload.employee_id,
     )
@@ -546,6 +846,7 @@ def update_user(
     user.anniversary_date = payload.anniversary_date
     user.designation = payload.designation
     user.reporting_manager = payload.reporting_manager
+    user.shift = _clean_shift(payload.shift)
     user.employment_status = payload.employment_status
     user.employee_id = payload.employee_id
     user.processes = db.query(models.Process).filter(models.Process.id.in_(payload.process_ids)).all()
@@ -703,6 +1004,474 @@ def set_business_day(
     return {"rollover_time": _fmt_hhmm(minutes)}
 
 
+# ---------------------------------------------------------------------
+# Holidays: Super Admin maintains the list, everybody can view it. Holidays
+# (that fall on a weekday) are not counted as business days in TAT.
+# ---------------------------------------------------------------------
+_holiday_cache = {"dates": frozenset(), "at": 0.0}
+
+
+def _holiday_dates() -> frozenset:
+    import time as _time
+    if _time.time() - _holiday_cache["at"] > 30:
+        db = SessionLocal()
+        try:
+            _holiday_cache["dates"] = frozenset(r[0] for r in db.query(models.Holiday.holiday_date).all())
+        except Exception:
+            pass
+        finally:
+            db.close()
+        _holiday_cache["at"] = _time.time()
+    return _holiday_cache["dates"]
+
+
+def _count_business_days_ex_holidays(start: date, end: date) -> int:
+    """_count_business_days minus the holidays that fall on a counted weekday."""
+    n = _count_business_days(start, end)
+    if n <= 0:
+        return n
+    skipped = sum(1 for h in _holiday_dates() if start < h <= end and h.weekday() < 5)
+    return max(0, n - skipped)
+
+
+@app.get("/holidays", response_model=List[schemas.HolidayOut])
+def list_holidays(year: Optional[int] = None, current_user: models.User = Depends(auth.get_current_user),
+                  db: Session = Depends(get_db)):
+    q = db.query(models.Holiday)
+    if year:
+        q = q.filter(models.Holiday.holiday_date >= date(year, 1, 1), models.Holiday.holiday_date <= date(year, 12, 31))
+    return q.order_by(models.Holiday.holiday_date).all()
+
+
+@app.post("/holidays", response_model=schemas.HolidayOut)
+def add_holiday(payload: schemas.HolidayIn, current_user: models.User = Depends(auth.require_role("super_admin")),
+                db: Session = Depends(get_db)):
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Enter the holiday name")
+    if db.query(models.Holiday).filter(models.Holiday.holiday_date == payload.holiday_date).first():
+        raise HTTPException(status_code=409, detail="A holiday is already listed on that date")
+    h = models.Holiday(holiday_date=payload.holiday_date, name=name, created_by_name=current_user.full_name,
+                       created_at=datetime.now(IST).replace(tzinfo=None))
+    db.add(h)
+    db.commit()
+    db.refresh(h)
+    _holiday_cache["at"] = 0.0
+    return h
+
+
+@app.put("/holidays/{holiday_id}", response_model=schemas.HolidayOut)
+def update_holiday(holiday_id: int, payload: schemas.HolidayIn,
+                   current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    h = db.query(models.Holiday).filter(models.Holiday.id == holiday_id).first()
+    if not h:
+        raise HTTPException(status_code=404, detail="Holiday not found")
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Enter the holiday name")
+    clash = db.query(models.Holiday).filter(models.Holiday.holiday_date == payload.holiday_date, models.Holiday.id != holiday_id).first()
+    if clash:
+        raise HTTPException(status_code=409, detail="A holiday is already listed on that date")
+    h.holiday_date = payload.holiday_date
+    h.name = name
+    db.commit()
+    db.refresh(h)
+    _holiday_cache["at"] = 0.0
+    return h
+
+
+@app.delete("/holidays/{holiday_id}")
+def delete_holiday(holiday_id: int, current_user: models.User = Depends(auth.require_role("super_admin")),
+                   db: Session = Depends(get_db)):
+    h = db.query(models.Holiday).filter(models.Holiday.id == holiday_id).first()
+    if not h:
+        raise HTTPException(status_code=404, detail="Holiday not found")
+    db.delete(h)
+    db.commit()
+    _holiday_cache["at"] = 0.0
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------
+# Performance Evaluation (Team Lead / Admin / Super Admin): Production,
+# Quality and Attendance come from the database; four more ratings are
+# typed in by the supervisor.
+#   Production: Target = daily target x hours worked / 8 (Batch Count Dashboard),
+#               Achieved = transactions on those days.
+#   Quality:    accounts audited / errors from the Batch Count Dashboard.
+#   Attendance: Work Days = weekdays minus holidays, Worked Days = days the
+#               colleague logged in (tracked from the day this feature went live).
+# ---------------------------------------------------------------------
+def _record_login_day(db: Session, user_id: int):
+    try:
+        d = _work_today()
+        if not db.query(models.LoginDay).filter(models.LoginDay.user_id == user_id, models.LoginDay.login_date == d).first():
+            db.add(models.LoginDay(user_id=user_id, login_date=d))
+            db.commit()
+    except Exception:
+        db.rollback()
+
+
+def _open_session(db: Session, user_id: int):
+    """Start a clocked session at login; sessions left open by a closed browser end at their last heartbeat."""
+    try:
+        now = datetime.utcnow()
+        for s in db.query(models.SessionLog).filter(models.SessionLog.user_id == user_id, models.SessionLog.logout_at.is_(None)).all():
+            s.logout_at = s.last_seen
+        db.add(models.SessionLog(user_id=user_id, login_at=now, last_seen=now))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+@app.post("/sessions/heartbeat")
+def session_heartbeat(current_user: models.User = Depends(auth.require_role("colleague")), db: Session = Depends(get_db)):
+    s = db.query(models.SessionLog).filter(models.SessionLog.user_id == current_user.id, models.SessionLog.logout_at.is_(None)) \
+        .order_by(models.SessionLog.id.desc()).first()
+    if s is None:
+        _open_session(db, current_user.id)
+    else:
+        s.last_seen = datetime.utcnow()
+        db.commit()
+    away = db.query(models.AwayNow).filter(models.AwayNow.user_id == current_user.id).first()
+    if away:
+        away.updated_at = datetime.utcnow()
+        db.commit()
+    return {"ok": True}
+
+
+@app.post("/sessions/end")
+def session_end(current_user: models.User = Depends(auth.require_role("colleague")), db: Session = Depends(get_db)):
+    now = datetime.utcnow()
+    open_rows = db.query(models.SessionLog).filter(models.SessionLog.user_id == current_user.id, models.SessionLog.logout_at.is_(None)) \
+        .order_by(models.SessionLog.id.desc()).all()
+    for i, s in enumerate(open_rows):
+        if i == 0:                       # the current session ends now
+            s.last_seen = now
+            s.logout_at = now
+        else:                            # older ones were left open by a closed browser: they ended at their last heartbeat
+            s.logout_at = s.last_seen
+    _away_clear(db, current_user.id)
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/clocked")
+def clocked_hours(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    Clocked time per colleague per IST day = login to logout (overlapping sessions
+    counted once; a session that was never logged out ends at its last heartbeat).
+    Scope: colleague own / Team Lead team / Admin + Super Admin everyone.
+    """
+    today = datetime.now(IST).date()
+    try:
+        d1 = date.fromisoformat(date_from) if date_from else today.replace(day=1)
+        d2 = date.fromisoformat(date_to) if date_to else today
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date")
+    if (d2 - d1).days > 92:
+        raise HTTPException(status_code=400, detail="Choose a range of 92 days or less")
+    def _utc(d):
+        return datetime(d.year, d.month, d.day, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
+    q = db.query(models.SessionLog).filter(models.SessionLog.login_at >= _utc(d1), models.SessionLog.login_at < _utc(d2 + timedelta(days=1)))
+    if current_user.role == "colleague":
+        q = q.filter(models.SessionLog.user_id == current_user.id)
+    elif current_user.role == "team_lead":
+        ids = [u.id for u in _batch_visible_colleagues(db, current_user)]
+        q = q.filter(models.SessionLog.user_id.in_(ids or [-1]))
+    by = {}
+    now = datetime.utcnow()
+    for s in q.all():
+        end = s.logout_at or s.last_seen
+        if end < s.login_at:
+            end = s.login_at
+        ist_day = (s.login_at.replace(tzinfo=timezone.utc).astimezone(IST)).date().isoformat()
+        live = s.logout_at is None and (now - s.last_seen) < timedelta(minutes=5)
+        by.setdefault((s.user_id, ist_day), []).append((s.login_at, end, live))
+    users = {u.id: u for u in db.query(models.User).filter(models.User.id.in_({k[0] for k in by} or {-1})).all()}
+    out = []
+    for (uid, day), ivs in by.items():
+        ivs.sort()
+        merged = []
+        for a, b, _ in ivs:
+            if merged and a <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        u = users.get(uid)
+        out.append({
+            "user_id": uid, "employee": u.full_name if u else "", "team_lead": (u.reporting_manager if u else None) or "",
+            "date": day, "first_login": ivs[0][0].isoformat(), "last_logout": merged[-1][1].isoformat(),
+            "minutes": round(sum((b - a).total_seconds() for a, b in merged) / 60, 2), "ongoing": any(x[2] for x in ivs),
+        })
+    return out
+
+
+PERF_ROLES = ("colleague", "team_lead", "admin", "super_admin")   # data: colleagues see only themselves
+PERF_RATE_ROLES = ("team_lead", "admin", "super_admin")
+PERF_FIELDS = ("pk", "shift", "flex", "me")
+
+
+def _perf_prev_month():
+    t = _work_today()
+    return (t.year - 1, 11) if t.month == 1 else (t.year, t.month - 2)   # (year, month 0-11)
+
+
+def _perf_work_days(start: date, end: date, holidays: frozenset) -> int:
+    if end < start:
+        return 0
+    n, d = 0, start
+    while d <= end:
+        if d.weekday() < 5 and d not in holidays:
+            n += 1
+        d += timedelta(days=1)
+    return n
+
+
+def _as_date(v):
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    try:
+        return date.fromisoformat(str(v)[:10])
+    except Exception:
+        return None
+
+
+@app.get("/performance/data")
+def performance_data(current_user: models.User = Depends(auth.require_role(*PERF_ROLES)), db: Session = Depends(get_db)):
+    try:
+        return _performance_data(current_user, db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Performance data error: {type(e).__name__}: {e}")
+
+
+def _performance_data(current_user: models.User, db: Session):
+    colleagues = _batch_visible_colleagues(db, current_user)
+    ids = [u.id for u in colleagues]
+    out = {"employees": [], "rows": [], "ratings": {}, "can_rate": current_user.role in PERF_RATE_ROLES, "role": current_user.role,
+           "rate_year": _perf_prev_month()[0], "rate_month": _perf_prev_month()[1], "attendance_since": None}
+    if not ids:
+        return out
+    tl_email = {u.full_name: u.email for u in db.query(models.User).filter(models.User.role == "team_lead").all()}
+    for u in colleagues:
+        out["employees"].append({
+            "id": u.id, "emp_id": (u.employee_id or u.username or str(u.id)).strip(), "name": u.full_name,
+            "tl": u.reporting_manager or "No Team Lead", "email": u.email, "tl_email": tl_email.get(u.reporting_manager),
+            "active": u.employment_status != "Inactive",
+        })
+    months = {}          # (uid, y, m) -> record
+
+    def rec(uid, y, m):
+        return months.setdefault((uid, y, m), {"emp": uid, "year": y, "m": m, "pt": None, "pa": None, "qa": None, "qd": None, "aw": None, "awd": None})
+
+    # Production + Quality from the Batch Count Dashboard rows
+    for r in _batch_base_rows(db, current_user, None, None, None, None):
+        d = _as_date(r["work_date"])
+        if d is None:
+            continue
+        x = rec(r["user_id"], d.year, d.month - 1)
+        exp = r.get("_expected")
+        if exp:
+            x["pt"] = (x["pt"] or 0) + exp
+            x["pa"] = (x["pa"] or 0) + (r["total_trans_count"] or 0)
+        if r["accounts_audited"] and r["accounts_audited"] > 0 and r["errors"] is not None:
+            x["qa"] = (x["qa"] or 0) + r["accounts_audited"]
+            x["qd"] = (x["qd"] or 0) + r["errors"]
+
+    # Attendance from login days
+    first = _as_date(db.query(func.min(models.LoginDay.login_date)).scalar())
+    if first:
+        out["attendance_since"] = first.isoformat()
+        today = _work_today()
+        holidays = _holiday_dates()
+        logins = {}
+        for uid, d in db.query(models.LoginDay.user_id, models.LoginDay.login_date).filter(models.LoginDay.user_id.in_(ids)).all():
+            d = _as_date(d)
+            if d:
+                logins.setdefault(uid, set()).add(d)
+        for u in colleagues:
+            doj = _as_date(u.doj)
+            start = max(first, doj) if doj else first
+            y, m = start.year, start.month
+            while (y, m) <= (today.year, today.month):
+                m_start = date(y, m, 1)
+                m_end = (date(y + (m == 12), (m % 12) + 1, 1) - timedelta(days=1))
+                a, b = max(m_start, start), min(m_end, today)
+                wd = _perf_work_days(a, b, holidays)
+                if wd > 0:
+                    worked = sum(1 for d in logins.get(u.id, ()) if a <= d <= b)
+                    x = rec(u.id, y, m - 1)
+                    x["aw"], x["awd"] = wd, worked   # not capped: logins on holidays/weekends count
+                y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+
+    out["rows"] = [v for v in months.values() if any(v[k] for k in ("pt", "qa", "aw"))]
+    for r in db.query(models.PerformanceRating).filter(models.PerformanceRating.user_id.in_(ids)).all():
+        out["ratings"].setdefault(str(r.user_id), {})[f"{r.year}-{r.month}"] = {k: getattr(r, k) for k in PERF_FIELDS}
+    return out
+
+
+@app.put("/performance/ratings")
+def save_performance_rating(payload: dict, current_user: models.User = Depends(auth.require_role(*PERF_RATE_ROLES)),
+                            db: Session = Depends(get_db)):
+    try:
+        uid, year, month = int(payload["user_id"]), int(payload["year"]), int(payload["month"])
+    except Exception:
+        raise HTTPException(status_code=400, detail="user_id, year and month are required")
+    if not (0 <= month <= 11):
+        raise HTTPException(status_code=400, detail="month must be 0-11")
+    if uid not in [u.id for u in _batch_visible_colleagues(db, current_user)]:
+        raise HTTPException(status_code=403, detail="You can only rate your own team")
+    is_lead = current_user.role == "team_lead"
+    if is_lead and (year, month) != _perf_prev_month():
+        raise HTTPException(status_code=403, detail="Ratings can only be given for the previous month")
+    row = db.query(models.PerformanceRating).filter_by(user_id=uid, year=year, month=month).first()
+    if row and is_lead:
+        for k in PERF_FIELDS:
+            if k in payload and getattr(row, k) is not None:
+                raise HTTPException(status_code=409, detail="This rating is already given and locked")
+    if not row:
+        row = models.PerformanceRating(user_id=uid, year=year, month=month)
+        db.add(row)
+    for k in PERF_FIELDS:
+        if k in payload:
+            v = payload[k]
+            if v in (None, ""):
+                setattr(row, k, None)
+            else:
+                try:
+                    v = int(v)
+                except Exception:
+                    raise HTTPException(status_code=400, detail=f"{k} must be 1-5")
+                if not (1 <= v <= 5):
+                    raise HTTPException(status_code=400, detail=f"{k} must be 1-5")
+                setattr(row, k, v)
+    row.updated_by = current_user.full_name
+    row.updated_at = datetime.now(IST).replace(tzinfo=None)
+    db.commit()
+    return {k: getattr(row, k) for k in PERF_FIELDS}
+
+
+# ---------------------------------------------------------------------------
+# 835 Postings: details form (several lines) for EDM orders with 835 Posted $ above zero
+# ---------------------------------------------------------------------------
+def _p835_out(r, tl_by_user=None, order=None):
+    return {
+        "id": r.id, "order_id": r.order_id, "line_no": r.line_no, "edm": r.edm, "division": r.division, "exchange": r.exchange,
+        "check_number_edm": r.check_number_edm, "check_number_835": r.check_number_835, "amount": r.amount,
+        "edm_description": r.edm_description, "deposit_date": r.deposit_date.isoformat() if r.deposit_date else None,
+        "payor_name": r.payor_name, "worked_by": r.worked_by,
+        "team_lead": (tl_by_user or {}).get(r.worked_by_id, ""),
+        "date_updated": r.updated_at.isoformat() if r.updated_at else None,
+        "order_amount": order.amount if order else None,
+        "manual_posted": order.posted_amount if order else None,
+        "posted_835": order.posted_835_amount if order else None,
+    }
+
+
+def _p835_lines_total(db, order_id) -> float:
+    return round(sum(float(x.amount or 0) for x in db.query(models.Posting835Line).filter_by(order_id=order_id).all()), 2)
+
+
+@app.get("/orders/{order_id}/posting-835")
+def get_posting_835(order_id: int, current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "super_admin")),
+                    db: Session = Depends(get_db)):
+    order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
+    if not order or (current_user.role == "colleague" and order.assigned_to_id != current_user.id):
+        raise HTTPException(status_code=404, detail="Order not found")
+    rows = db.query(models.Posting835Line).filter_by(order_id=order_id).order_by(models.Posting835Line.line_no, models.Posting835Line.id).all()
+    return [_p835_out(r) for r in rows]
+
+
+@app.put("/orders/{order_id}/posting-835")
+def save_posting_835(order_id: int, payload: dict, current_user: models.User = Depends(auth.require_role("colleague")),
+                     db: Session = Depends(get_db)):
+    """Replaces the lines of the 835 form. payload: {"total": <835 Posted $>, "lines": [{exchange, check_number_edm, check_number_835, amount, payor_name}, ...]}"""
+    order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.assigned_to_id != current_user.id:
+        raise HTTPException(status_code=403, detail="This order is not assigned to you")
+    if order.escalated or order.posting_status == "Completed":
+        raise HTTPException(status_code=403, detail="This order is locked")
+    lines = payload.get("lines") or []
+    if not lines:
+        raise HTTPException(status_code=400, detail="Add at least one line")
+    clean, total = [], 0.0
+    for i, ln in enumerate(lines, 1):
+        vals = {k: str(ln.get(k) or "").strip() for k in ("exchange", "check_number_edm", "check_number_835", "payor_name")}
+        missing = [lbl for k, lbl in (("exchange", "Exchange"), ("check_number_edm", "Check Number as per EDM"),
+                                      ("check_number_835", "Check Number as per 835_push"), ("payor_name", "Payor name")) if not vals[k]]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Line {i}: required " + ", ".join(missing))
+        try:
+            amt = float(ln.get("amount"))
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Line {i}: Amount must be a number")
+        if amt <= 0:
+            raise HTTPException(status_code=400, detail=f"Line {i}: Amount must be greater than 0")
+        total += amt
+        clean.append((vals, amt))
+    total = round(total, 2)
+    try:
+        expected = round(float(payload.get("total")), 2)
+    except Exception:
+        expected = None
+    if expected is not None and total > expected + 0.005:
+        raise HTTPException(status_code=400, detail=f"The line amounts add up to {total:.2f}, which is more than 835 Posted $ ({expected:.2f})")
+    db.query(models.Posting835Line).filter_by(order_id=order_id).delete()
+    now = datetime.now(IST).replace(tzinfo=None)
+    for i, (vals, amt) in enumerate(clean, 1):
+        db.add(models.Posting835Line(
+            order_id=order_id, process_id=order.process_id, line_no=i, edm=order.edm, division=order.division,
+            edm_description=order.description, deposit_date=order.deposit_date, worked_by=current_user.full_name,
+            worked_by_id=current_user.id, amount=amt, updated_at=now, **vals))
+    db.commit()
+    return {"lines": len(clean), "total": total}
+
+
+@app.get("/posting-835")
+def list_posting_835(process_id: Optional[int] = None, date_from: Optional[date] = None, date_to: Optional[date] = None,
+                     current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+                     db: Session = Depends(get_db)):
+    L = models.Posting835Line
+    q = db.query(L)
+    if process_id is not None:
+        q = q.filter(L.process_id == process_id)
+    if current_user.role == "team_lead":
+        ids = [u.id for u in _batch_visible_colleagues(db, current_user)]
+        q = q.filter(L.worked_by_id.in_(ids or [-1]))
+    if date_from:
+        q = q.filter(L.updated_at >= datetime.combine(date_from, datetime.min.time()))
+    if date_to:
+        q = q.filter(L.updated_at < datetime.combine(date_to + timedelta(days=1), datetime.min.time()))
+    rows = q.order_by(L.updated_at.desc(), L.order_id, L.line_no).limit(5000).all()
+    uids = {r.worked_by_id for r in rows if r.worked_by_id}
+    tl_by_user = {u.id: (u.reporting_manager or "") for u in db.query(models.User).filter(models.User.id.in_(uids or [-1])).all()}
+    orders = {o.id: o for o in db.query(models.WorkOrder).filter(models.WorkOrder.id.in_({r.order_id for r in rows} or [-1])).all()}
+    return [_p835_out(r, tl_by_user, orders.get(r.order_id)) for r in rows]
+
+
+# Reactions a person can leave on a celebration comment (clicking again removes it).
+REACTION_TYPES = ("like", "heart")
+CELEBRATION_IMAGE_MAX_BYTES = 2 * 1024 * 1024
+UPDATE_MODES = ("Team message", "Email", "Smartsheet", "Call")
+UPDATE_CATEGORIES = ("Payer", "Adjustment", "Generic")
+UPDATE_STATUSES = ("Active", "Inactive")
+
+
 @app.get("/celebrations/today", response_model=List[schemas.CelebrationPerson])
 def todays_celebrations(
     current_user: models.User = Depends(auth.get_current_user),
@@ -787,6 +1556,7 @@ def todays_celebrations(
             enriched.append({
                 "id": c.id, "target_user_id": c.target_user_id, "message": c.message,
                 "posted_by_name": c.posted_by_name, "created_at": c.created_at,
+                "has_image": bool(c.image_b64),
                 "reaction_counts": counts, "my_reactions": my_reactions,
             })
         p["comments"] = enriched
@@ -800,16 +1570,43 @@ def add_celebration_comment(
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
 ):
-    message = payload.message.strip()
-    if not message:
+    message = (payload.message or "").strip()
+    image_b64, image_type = None, None
+    if payload.image:
+        m = re.match(r"^data:(image/(?:gif|png|jpeg|webp));base64,([A-Za-z0-9+/=\s]+)$", payload.image.strip())
+        if not m:
+            raise HTTPException(status_code=400, detail="Only GIF, PNG, JPEG or WebP pictures can be attached")
+        try:
+            raw = base64.b64decode(m.group(2))
+        except Exception:
+            raise HTTPException(status_code=400, detail="The picture could not be read")
+        if len(raw) > CELEBRATION_IMAGE_MAX_BYTES:
+            raise HTTPException(status_code=400, detail="The picture is too large (2 MB max)")
+        magic_ok = {"image/gif": raw[:4] == b"GIF8", "image/png": raw[:8] == b"\x89PNG\r\n\x1a\n",
+                    "image/jpeg": raw[:3] == b"\xff\xd8\xff", "image/webp": raw[:4] == b"RIFF" and raw[8:12] == b"WEBP"}[m.group(1)]
+        if not magic_ok:
+            raise HTTPException(status_code=400, detail="That file is not a valid picture")
+        image_b64, image_type = base64.b64encode(raw).decode(), m.group(1)
+    if not message and not image_b64:
         raise HTTPException(status_code=400, detail="Comment can't be empty")
     target = db.query(models.User).filter(models.User.id == target_user_id).first()
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
+    today_ist = datetime.now(IST).date()
+    # The same person can't post the same comment twice on the same celebration (case/space-insensitive).
+    norm = " ".join(message.split()).lower()
+    for prev in db.query(models.CelebrationComment.message, models.CelebrationComment.image_b64).filter(
+        models.CelebrationComment.target_user_id == target_user_id,
+        models.CelebrationComment.posted_by_id == current_user.id,
+        models.CelebrationComment.occasion_date == today_ist,
+    ).all():
+        if " ".join((prev.message or "").split()).lower() == norm and (prev.image_b64 or None) == image_b64:
+            raise HTTPException(status_code=409, detail="You have already posted this comment. Please write something different.")
     comment = models.CelebrationComment(
         target_user_id=target_user_id,
-        occasion_date=datetime.now(IST).date(),
+        occasion_date=today_ist,
         message=message,
+        image_b64=image_b64, image_type=image_type,
         posted_by_id=current_user.id,
         posted_by_name=current_user.full_name,
     )
@@ -819,8 +1616,23 @@ def add_celebration_comment(
     return {
         "id": comment.id, "target_user_id": comment.target_user_id, "message": comment.message,
         "posted_by_name": comment.posted_by_name, "created_at": comment.created_at,
+        "has_image": bool(image_b64),
         "reaction_counts": {t: 0 for t in REACTION_TYPES}, "my_reactions": [],
     }
+
+
+@app.get("/celebrations/comments/{comment_id}/image")
+def get_celebration_comment_image(
+    comment_id: int,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The picture / GIF / poster on a celebration comment (any logged-in user; fetched as a blob via authFetch)."""
+    c = db.query(models.CelebrationComment).filter(models.CelebrationComment.id == comment_id).first()
+    if not c or not c.image_b64:
+        raise HTTPException(status_code=404, detail="No picture on this comment")
+    return Response(content=base64.b64decode(c.image_b64), media_type=c.image_type or "image/png",
+                    headers={"Cache-Control": "private, max-age=86400"})
 
 
 @app.post("/celebrations/comments/{comment_id}/react")
@@ -869,13 +1681,76 @@ def list_process_updates(
 ):
     """Newest first — the process screen shows the latest one most prominently."""
     _require_process_access(current_user, process_id)
-    return (
+    rows = (
         db.query(models.ProcessUpdate)
         .filter(models.ProcessUpdate.process_id == process_id)
         .order_by(models.ProcessUpdate.created_at.desc())
         .limit(20)
         .all()
     )
+    _attach_ack_info(db, current_user, process_id, rows)
+    return rows
+
+
+def _ack_scope_colleagues(db: Session, current_user: models.User, process_id: int):
+    """Colleagues of this process whose acknowledgement is tracked (Team Lead: their team; Admin / Super Admin: everyone)."""
+    return [u for u in _batch_visible_colleagues(db, current_user)
+            if u.role == "colleague" and u.employment_status != "Inactive" and any(p.id == process_id for p in u.processes)]
+
+
+def _attach_ack_info(db: Session, current_user: models.User, process_id: int, rows):
+    ids = [r.id for r in rows]
+    acks = db.query(models.ProcessUpdateAck).filter(models.ProcessUpdateAck.update_id.in_(ids or [-1])).all()
+    by_update = {}
+    for a in acks:
+        by_update.setdefault(a.update_id, {})[a.user_id] = a
+    scope = _ack_scope_colleagues(db, current_user, process_id) if current_user.role in ("team_lead", "admin", "super_admin") else []
+    scope_ids = {u.id for u in scope}
+    for r in rows:
+        got = by_update.get(r.id, {})
+        if current_user.role == "colleague":
+            mine = got.get(current_user.id)
+            r.acknowledged = bool(mine)
+            r.acknowledged_at = mine.acknowledged_at if mine else None
+        elif r.ack_required:
+            r.ack_count = len([1 for uid in got if uid in scope_ids])
+            r.ack_total = len(scope_ids)
+
+
+@app.post("/process-updates/{update_id}/acknowledge")
+def acknowledge_process_update(update_id: int, current_user: models.User = Depends(auth.require_role("colleague")),
+                               db: Session = Depends(get_db)):
+    upd = db.query(models.ProcessUpdate).filter(models.ProcessUpdate.id == update_id).first()
+    if not upd:
+        raise HTTPException(status_code=404, detail="Update not found")
+    _require_process_access(current_user, upd.process_id)
+    if not db.query(models.ProcessUpdateAck).filter_by(update_id=update_id, user_id=current_user.id).first():
+        db.add(models.ProcessUpdateAck(update_id=update_id, user_id=current_user.id, user_name=current_user.full_name,
+                                       acknowledged_at=datetime.utcnow()))
+        db.commit()
+    return {"status": "acknowledged"}
+
+
+@app.get("/process-updates/{update_id}/acknowledgements")
+def process_update_acknowledgements(update_id: int, current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+                                    db: Session = Depends(get_db)):
+    """Who has / hasn't acknowledged an update (Team Lead: their team; Admin / Super Admin: all colleagues of the process)."""
+    upd = db.query(models.ProcessUpdate).filter(models.ProcessUpdate.id == update_id).first()
+    if not upd:
+        raise HTTPException(status_code=404, detail="Update not found")
+    _require_process_access(current_user, upd.process_id)
+    scope = _ack_scope_colleagues(db, current_user, upd.process_id)
+    got = {a.user_id: a for a in db.query(models.ProcessUpdateAck).filter_by(update_id=update_id).all()}
+    done, pending = [], []
+    for u in sorted(scope, key=lambda x: x.full_name.lower()):
+        row = {"user_id": u.id, "name": u.full_name, "emp_id": (u.employee_id or u.username or "").strip(), "team_lead": u.reporting_manager or ""}
+        a = got.get(u.id)
+        if a:
+            row["acknowledged_at"] = a.acknowledged_at.isoformat() if a.acknowledged_at else None
+            done.append(row)
+        else:
+            pending.append(row)
+    return {"update_id": update_id, "ack_required": bool(upd.ack_required), "acknowledged": done, "pending": pending}
 
 
 @app.post("/process-updates", response_model=List[schemas.ProcessUpdateOut])
@@ -913,6 +1788,7 @@ def create_process_update(
             posted_by_id=current_user.id,
             posted_by_name=current_user.full_name,
             posted_by_role=current_user.role,
+            ack_required=(payload.status == "Active"),
         )
         db.add(update)
         created.append(update)
@@ -1292,6 +2168,14 @@ _HEADER_ALIASES = {
     "division": "division", "deposit date": "deposit_date", "deposit_date": "deposit_date",
     "bar grp": "bar_grp", "bar_grp": "bar_grp",
     "last edited by": "last_edited_by", "scanned date": "scanned_date", "scanned batch": "scanned_batch",
+    # ECOM active-queue headers
+    "division #": "division", "division no": "division", "division name": "division_name",
+    "run": "run", "inits": "inits", "type": "ecom_type",
+    "bank deposit date": "deposit_date", "create date": "created",
+    "eobs": "eobs", "check(s)": "checks", "checks": "checks", "check": "checks",
+    "notposted": "not_posted", "not posted": "not_posted",
+    "notposted$": "not_posted_amount", "not posted $": "not_posted_amount", "not posted$": "not_posted_amount",
+    "offset $": "offset_amount", "offset$": "offset_amount", "offset": "offset_amount",
 }
 
 
@@ -1307,7 +2191,7 @@ def _cell_text(v) -> str:
     return str(v).strip()
 
 
-def _read_inventory_rows(raw: bytes, filename: str):
+def _read_inventory_rows(raw: bytes, filename: str, ecom: bool = False):
     """
     Reads the uploaded inventory (.xlsx or .csv) into a list of dicts keyed by
     internal field names. Title rows above the header (e.g. "Batch Manager -
@@ -1345,7 +2229,7 @@ def _read_inventory_rows(raw: bytes, filename: str):
             continue
         d = {f: (r[j] if j < len(r) else "") for j, f in mapping.items()}
         desc = d.get("description") or ""
-        if "_" in desc:
+        if "_" in desc and not ecom:
             parts = desc.split("_")
             d["division"] = parts[0].strip()
             d["deposit_date"] = parts[1].strip() if len(parts) > 2 else (d.get("deposit_date") or "")
@@ -1361,6 +2245,30 @@ def _norm_text(v) -> str:
 
 def _norm_edm(v) -> str:
     return (v or "").strip().upper()
+
+
+def _is_ecom_process(process) -> bool:
+    return bool(process and (process.name or "").strip().upper() == "ECOM")
+
+
+def _pending_base(order):
+    """What Posted $ is measured against: Amount, or for ECOM NotPosted$ + Offset $."""
+    if _is_ecom_process(order.process):
+        if order.not_posted_amount is None and order.offset_amount is None:
+            return None
+        return float(order.not_posted_amount or 0) + float(order.offset_amount or 0)
+    return None if order.amount is None else float(order.amount)
+
+
+def _recalc_pending(order):
+    base = _pending_base(order)
+    if base is not None:
+        order.pending_amount = round(base - float(order.posted_amount or 0) - float(order.posted_835_amount or 0), 2)
+
+
+def _dup_key(edm, run, ecom: bool) -> str:
+    """Duplicate key: EDM / Batch for EDM; Run + Batch for ECOM."""
+    return f"{_norm_edm(run)}|{_norm_edm(edm)}" if ecom else _norm_edm(edm)
 
 
 def _norm_facility(v) -> str:
@@ -1387,6 +2295,14 @@ def _client_for_row(division, by_no: dict, by_name: dict):
     return by_name.get(_norm_text(text))
 
 
+def _tol(fn, v):
+    """Parse an imported cell; junk like '-', 'N/A' becomes blank instead of failing the whole import."""
+    try:
+        return fn(v)
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
 def _order_from_inventory_row(process_id, team_lead_id, received, row, username):
     """One inventory line -> an unassigned WorkOrder for the given Team Lead."""
     return models.WorkOrder(
@@ -1395,14 +2311,23 @@ def _order_from_inventory_row(process_id, team_lead_id, received, row, username)
         received_date=received,
         edm=row.get("edm") or None,
         status=row.get("status") or None,
-        created=_parse_dt(row.get("created")),
-        image_count=_parse_int(row.get("image_count")),
-        doc_count=_parse_int(row.get("doc_count")),
+        created=_tol(_parse_dt, row.get("created")),
+        image_count=_tol(_parse_int, row.get("image_count")),
+        doc_count=_tol(_parse_int, row.get("doc_count")),
         def_doc_type=row.get("def_doc_type") or None,
-        amount=_parse_float(row.get("amount")),
+        amount=_tol(_parse_float, row.get("amount")),
         description=row.get("description") or None,
         division=row.get("division") or None,
         deposit_date=_safe_date(row.get("deposit_date")),
+        division_name=row.get("division_name") or None,
+        run=row.get("run") or None,
+        inits=row.get("inits") or None,
+        ecom_type=row.get("ecom_type") or None,
+        eobs=_tol(_parse_int, row.get("eobs")),
+        checks=_tol(_parse_int, row.get("checks")),
+        not_posted=_tol(_parse_int, row.get("not_posted")),
+        not_posted_amount=_tol(_parse_float, row.get("not_posted_amount")),
+        offset_amount=_tol(_parse_float, row.get("offset_amount")),
         last_edited_by=username,
     )
 
@@ -1438,7 +2363,7 @@ def import_inventory(
         - The EDM must not already exist in this process from the last
           month. If it exists and is In-Process / Clarification / blank it
           is skipped quietly; if it is Completed it is skipped AND logged
-          under Import Exceptions for the Team Lead, Admin and Super Admin.
+          under Import Review Queue for the Team Lead, Admin and Super Admin.
           A repeat of an EDM inside the same file is skipped too.
     Orders imported for a Team Lead are tagged to them, so auto-assignment
     only offers them to colleagues reporting to that Team Lead.
@@ -1465,6 +2390,7 @@ def import_inventory(
     process = db.query(models.Process).filter(models.Process.id == process_id).first()
     is_edm = bool(process and process.name.strip().upper() == "EDM")
     is_cb_unmatched = bool(process and process.name.strip().lower() == "cb unmatched posting")
+    is_ecom = _is_ecom_process(process)
 
     # Client -> Team Lead for this process
     clients = db.query(models.Client).all()
@@ -1483,19 +2409,19 @@ def import_inventory(
     # why: near IST midnight the two disagree on which calendar day it is.
     today = _work_today()
     existing = {}
-    if is_edm:
+    if is_edm or is_ecom:
         cutoff = today - relativedelta(months=DUPLICATE_LOOKBACK_MONTHS)
         for o in db.query(
             models.WorkOrder.id, models.WorkOrder.edm, models.WorkOrder.posting_status,
-            models.WorkOrder.posted_date, models.WorkOrder.employee_name,
+            models.WorkOrder.posted_date, models.WorkOrder.employee_name, models.WorkOrder.run,
         ).filter(
             models.WorkOrder.process_id == process_id,
             models.WorkOrder.received_date >= cutoff,
             models.WorkOrder.edm.isnot(None),
         ).all():
-            existing.setdefault(_norm_edm(o.edm), []).append(o)
+            existing.setdefault(_dup_key(o.edm, o.run, is_ecom), []).append(o)
 
-    reader = _read_inventory_rows(file.file.read(), file.filename)
+    reader = _read_inventory_rows(file.file.read(), file.filename, ecom=is_ecom)
     counts = {
         "total_rows": 0, "imported": 0, "skipped_bar_grp": 0,
         "skipped_doc_type": 0, "skipped_other_team_lead": 0, "skipped_unassigned_client": 0,
@@ -1541,6 +2467,8 @@ def import_inventory(
 
         # 2) the client must be assigned to a Team Lead for this process
         client = _client_for_row(row.get("division"), by_no, by_name)
+        if client is None and is_ecom and row.get("division_name"):
+            client = _client_for_row(row.get("division_name"), by_no, by_name)
         row_tl = client_tl.get(client.id) if client else None
         if row_tl is None:
             counts["skipped_unassigned_client"] += 1
@@ -1555,8 +2483,8 @@ def import_inventory(
             continue
 
         # 3) EDM process: not already imported in the last month, nor repeated in this file
-        edm_key = _norm_edm(row.get("edm"))
-        if is_edm and edm_key:
+        edm_key = _dup_key(row.get("edm"), row.get("run"), is_ecom)
+        if (is_edm or is_ecom) and _norm_edm(row.get("edm")):
             if edm_key in seen_in_file:
                 counts["skipped_duplicate_in_file"] += 1
                 continue
@@ -1567,7 +2495,7 @@ def import_inventory(
                 if done:
                     counts["skipped_duplicate_completed"] += 1
                     latest = max(done, key=lambda o: (o.posted_date or date.min, o.id))
-                    log_exception("duplicate_completed", row, client, "EDM already Completed", row_tl, existing_order=latest)
+                    log_exception("duplicate_completed", row, client, ("Run + Batch already Completed" if is_ecom else "EDM already Completed"), row_tl, existing_order=latest)
                 else:
                     counts["skipped_duplicate_open"] += 1     # In-Process / Clarification / blank: already in the system
                 continue
@@ -1576,18 +2504,27 @@ def import_inventory(
         counts["imported"] += 1
 
     # One exception per document: skip any EDM already logged for this process recently.
+    # (ECOM: a document is Run + Batch, so the same Batch under another Run is kept.)
+    def _exc_key(e):
+        run = None
+        if is_ecom and e.row_json:
+            try:
+                run = json.loads(e.row_json).get("run")
+            except ValueError:
+                pass
+        return (e.kind, _dup_key(e.edm, run, is_ecom))
+
     if exceptions:
-        recent = {
-            (e.kind, _norm_edm(e.edm))
-            for e in db.query(models.ImportException.kind, models.ImportException.edm).filter(
-                models.ImportException.process_id == process_id,
-                models.ImportException.created_at >= now_ist - timedelta(days=EXCEPTION_DEDUPE_DAYS),
-                models.ImportException.edm.isnot(None),
-            ).all()
-        }
+        recent = set()
+        for e in db.query(models.ImportException).filter(
+            models.ImportException.process_id == process_id,
+            models.ImportException.created_at >= now_ist - timedelta(days=EXCEPTION_DEDUPE_DAYS),
+            models.ImportException.edm.isnot(None),
+        ).all():
+            recent.add(_exc_key(e))
         logged = set()
         for e in exceptions:
-            key = (e.kind, _norm_edm(e.edm))
+            key = _exc_key(e)
             if e.edm and (key in recent or key in logged):
                 continue
             logged.add(key)
@@ -1635,6 +2572,7 @@ def list_import_exceptions(
         item = schemas.ImportExceptionOut.model_validate(r)
         item.process_name = pnames.get(r.process_id)
         item.team_lead_name = tlnames.get(r.team_lead_id)
+        item.details = _exception_row(r)
         out.append(item)
     return out
 
@@ -1700,7 +2638,11 @@ def release_import_exceptions(
     def client_of(e):
         if e.facility_no and _norm_facility(e.facility_no) in by_no:
             return by_no[_norm_facility(e.facility_no)]
-        return _client_for_row(e.division_raw or _exception_row(e).get("division"), by_no, by_name)
+        row = _exception_row(e)
+        c = _client_for_row(e.division_raw or row.get("division"), by_no, by_name)
+        if c is None and row.get("division_name"):
+            c = _client_for_row(row.get("division_name"), by_no, by_name)
+        return c
 
     result = {"clients_assigned": 0, "moved": 0, "already_in_system": 0, "no_client": 0, "other_process": []}
     tl_procs = {p.id for p in tl.processes}
@@ -1737,17 +2679,21 @@ def release_import_exceptions(
         if not c or (c.id, e.process_id) not in assignment:
             continue
         row = _exception_row(e)
-        edm_key = _norm_edm(row.get("edm"))
         process = db.query(models.Process).filter(models.Process.id == e.process_id).first()
         is_edm = bool(process and process.name.strip().upper() == "EDM")
+        is_ecom = _is_ecom_process(process)
+        edm_key = _dup_key(row.get("edm"), row.get("run"), is_ecom)
         dup = False
-        if edm_key and (e.process_id, edm_key) in seen:
+        if _norm_edm(row.get("edm")) and (e.process_id, edm_key) in seen:
             dup = True
-        elif edm_key and is_edm:
-            dup = db.query(models.WorkOrder.id).filter(
+        elif _norm_edm(row.get("edm")) and (is_edm or is_ecom):
+            q = db.query(models.WorkOrder.id).filter(
                 models.WorkOrder.process_id == e.process_id, models.WorkOrder.received_date >= cutoff,
-                func.upper(models.WorkOrder.edm) == edm_key,
-            ).first() is not None
+                func.upper(models.WorkOrder.edm) == _norm_edm(row.get("edm")),
+            )
+            if is_ecom:
+                q = q.filter(func.upper(func.coalesce(models.WorkOrder.run, "")) == _norm_edm(row.get("run")))
+            dup = q.first() is not None
         seen.add((e.process_id, edm_key))
         if dup:
             result["already_in_system"] += 1
@@ -1785,12 +2731,27 @@ def _parse_dt(v: Optional[str]) -> Optional[datetime]:
     except (ValueError, OverflowError) as e:
         raise ValueError(f"Unrecognized datetime format: {v!r}") from e
 
+def _clean_number(v) -> str:
+    """'$1,234.50' -> '1234.50'; '(25.00)' / '25.00-' -> negative."""
+    t = str(v).strip().replace("$", "").replace(",", "").replace(" ", "")
+    if t.startswith("(") and t.endswith(")"):
+        t = "-" + t[1:-1]
+    if t.endswith("-") and len(t) > 1:
+        t = "-" + t[:-1]
+    return t
+
+
 def _parse_int(v: Optional[str]) -> Optional[int]:
-    return int(v) if v not in (None, "") else None
+    if v in (None, ""):
+        return None
+    n = int(float(_clean_number(v)))
+    if abs(n) > 2_147_483_647:          # would overflow an INTEGER column (e.g. a check/ID number in a count column)
+        raise ValueError("number too large for a count")
+    return n
 
 
 def _parse_float(v: Optional[str]) -> Optional[float]:
-    return float(v) if v not in (None, "") else None
+    return float(_clean_number(v)) if v not in (None, "") else None
 
 
 # ---------------------------------------------------------------------------
@@ -1904,6 +2865,30 @@ def _attach_team_files(db: Session, orders) -> None:
             )
     for o in orders:
         o.team_files = by_order.get(o.id, [])
+
+
+@app.get("/orders/day-summary")
+def orders_day_summary(
+    process_id: int,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Orders submitted to Production today (IST) - count and Trans Count - for the Active Queue summary strip."""
+    _deny_quality(current_user)
+    _require_view_access(current_user, process_id)
+    start_ist = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = start_ist.astimezone(timezone.utc).replace(tzinfo=None)
+    q = db.query(models.WorkOrder).filter(
+        models.WorkOrder.process_id == process_id,
+        models.WorkOrder.submitted == True,  # noqa: E712
+        models.WorkOrder.submitted_at >= start_utc,
+    )
+    if current_user.role == "colleague":
+        q = q.filter(models.WorkOrder.assigned_to_id == current_user.id)
+    elif current_user.role == "team_lead":
+        q = q.filter(models.WorkOrder.team_lead_id == current_user.id)
+    rows = q.all()
+    return {"count": len(rows), "trans_count": sum(int(r.trans_count or 0) for r in rows)}
 
 
 @app.get("/orders", response_model=List[schemas.WorkOrderOut])
@@ -2206,15 +3191,18 @@ def update_colleague_fields(
     # else can be saved until all three are filled in (existing value or
     # part of this update).
     final_posted_amount = payload_data.get("posted_amount", order.posted_amount)
+    ecom_order = _is_ecom_process(order.process)
     final_bar_batch = payload_data.get("bar_batch", order.bar_batch)
     final_trans_count = payload_data.get("trans_count", order.trans_count)
     missing_core = []
     if final_posted_amount is None:
         missing_core.append("Posted $")
-    if not final_bar_batch:
+    if not final_bar_batch and not ecom_order:
         missing_core.append("BAR Batch")
     if final_trans_count is None:
-        missing_core.append("Trans Count")
+        missing_core.append("# of Transaction" if ecom_order else "Trans Count")
+    if ecom_order and not (payload_data.get("posting_status") or order.posting_status):
+        missing_core.append("Posting Status")
     if missing_core:
         raise HTTPException(
             status_code=400,
@@ -2228,22 +3216,35 @@ def update_colleague_fields(
     #   * Pending $ <> 0 -> Poster Comment is required (checked when the row is
     #     being Completed or sent to Clarification, the only statuses where the
     #     comment can be entered at all)
-    bar_text = str(final_bar_batch).strip()
+    bar_text = str(final_bar_batch or "").strip()
     problems = []
-    if abs(float(final_posted_amount)) < 0.005:
-        if bar_text not in ("0", "00", "0000000"):
-            problems.append("BAR Batch must be 0 when Posted $ is 0")
-    else:
-        if not (bar_text.isdigit() and len(bar_text) == 7 and int(bar_text) > 0):
-            problems.append("BAR Batch must be a 7-digit number when Posted $ is not 0")
-    bar_positive = bar_text.isdigit() and int(bar_text) > 0
-    if bar_positive and not (final_trans_count and final_trans_count > 0):
-        problems.append("Trans Count must be greater than 0 when BAR Batch is greater than 0")
-    if order.amount is not None and final_status in ("Completed", "Clarification"):
-        pending_now = float(order.amount) - float(final_posted_amount)
+    if not ecom_order:
+        if abs(float(final_posted_amount)) < 0.005:
+            if bar_text not in ("0", "00", "0000000"):
+                problems.append("BAR Batch must be 0 when Posted $ is 0")
+        else:
+            if not (bar_text.isdigit() and len(bar_text) == 7 and int(bar_text) > 0):
+                problems.append("BAR Batch must be a 7-digit number when Posted $ is not 0")
+        bar_positive = bar_text.isdigit() and int(bar_text) > 0
+        if bar_positive and not (final_trans_count and final_trans_count > 0):
+            problems.append("Trans Count must be greater than 0 when BAR Batch is greater than 0")
+    final_835 = payload_data.get("posted_835_amount", order.posted_835_amount)
+    if final_835 is not None and float(final_835) < 0:
+        problems.append("835 Posted $ can't be negative")
+    if final_835 and float(final_835) > 0.005:
+        lines_total = _p835_lines_total(db, order.id)
+        if lines_total <= 0:
+            problems.append("835 Posted $ is above 0 \u2014 fill the 835 details form first (click Details next to 835 Posted $)")
+        elif abs(lines_total - float(final_835)) >= 0.005:
+            problems.append(f"The 835 details lines add up to {lines_total:.2f} but 835 Posted $ is {float(final_835):.2f} \u2014 open Details and fix the line amounts")
+    pending_base = _pending_base(order)
+    if pending_base is not None and final_status in ("Completed", "Clarification"):
+        pending_now = pending_base - float(final_posted_amount) - float(final_835 or 0)
         final_comment = payload_data.get("poster_comment", order.poster_comment)
         if abs(pending_now) >= 0.005 and not (final_comment or "").strip():
             problems.append("Poster Comment is required when Pending $ is not 0")
+        if abs(pending_now) >= 0.005 and final_status == "Completed" and ((order.process.name if order.process else "") or "").strip().upper() == "EDM":
+            problems.append("Posting Status can't be Completed while Pending $ is not 0")
     if problems:
         raise HTTPException(status_code=400, detail="Cannot save \u2014 " + "; ".join(problems))
 
@@ -2373,9 +3374,10 @@ def update_colleague_fields(
         if order.timer_status == "running":
             _finalize_timer(order, "paused")
 
-    # Pending $ = Amount - Posted $, recalculated any time either changes.
-    if order.amount is not None:
-        order.pending_amount = order.amount - (order.posted_amount or 0)
+    # Pending $ = Amount - Posted $ (ECOM: (NotPosted$ + Offset $) - Posted $), recalculated any time either changes.
+    _recalc_pending(order)
+    if not (order.posted_835_amount and float(order.posted_835_amount) > 0.005):
+        db.query(models.Posting835Line).filter_by(order_id=order.id).delete()     # no 835 posting any more -> no details lines
 
     # Completing an order requires the core figures to already be filled in
     # (redundant with the check above, kept as a final guard), plus a Posted
@@ -2385,7 +3387,7 @@ def update_colleague_fields(
         missing = []
         if order.posted_amount is None:
             missing.append("Posted $")
-        if not order.bar_batch:
+        if not order.bar_batch and not _is_ecom_process(order.process):
             missing.append("BAR Batch")
         if order.trans_count is None:
             missing.append("Trans Count")
@@ -2400,7 +3402,7 @@ def update_colleague_fields(
     # TAT = business days (Mon-Fri) between the Created date and Posted Date,
     # minus business days spent waiting on escalations.
     if order.posted_date and _tat_start(order):
-        total_bdays = _count_business_days(_tat_start(order), order.posted_date)
+        total_bdays = _count_business_days_ex_holidays(_tat_start(order), order.posted_date)
         pause_bdays = _pause_business_days(db, order)
         order.tat_days = total_bdays - pause_bdays
 
@@ -2991,6 +3993,7 @@ def _batch_aggregate(group: list) -> dict:
         "batches_worked": sum(r["batches_worked"] for r in group),
         "total_trans_count": sum(r["total_trans_count"] for r in group),
         "hours_worked": round(sum(hrs), 2) if hrs else None,
+        "hours_auto": (lambda v: round(sum(v), 2) if v else None)([r["hours_auto"] for r in group if r.get("hours_auto") is not None]),
         "production_pct": prod,
         "accounts_audited": sum(aud) if aud else None,
         "errors": sum(err) if err else None,
@@ -3026,9 +4029,10 @@ def _batch_base_rows(db: Session, current_user: models.User, start_date, end_dat
         if o.process_id is None:
             continue
         key = (o.assigned_to_id, o.process_id, o.posted_date)
-        g = groups.setdefault(key, {"batches": 0, "trans": 0})
+        g = groups.setdefault(key, {"batches": 0, "trans": 0, "secs": 0})
         g["batches"] += 1
         g["trans"] += o.trans_count or 0
+        g["secs"] += o.time_taken_seconds or 0
     if not groups:
         return []
 
@@ -3046,6 +4050,9 @@ def _batch_base_rows(db: Session, current_user: models.User, start_date, end_dat
     for (uid, pid, d), g in groups.items():
         proc = processes.get(pid)
         st = stats.get((uid, pid, d))
+        # Total Hours Worked is what the colleague entered (as before). hours_auto is a separate,
+        # automatic figure: the day's total Time Taken on the completed orders (shown to Team Lead / Admin / Super Admin).
+        hours_auto = round(g["secs"] / 3600.0, 2) if g["secs"] else None
         hours = st.hours_worked if st else None
         audited = st.accounts_audited if st else None
         errs = st.errors if st else None
@@ -3073,6 +4080,7 @@ def _batch_base_rows(db: Session, current_user: models.User, start_date, end_dat
             "total_trans_count": g["trans"],
             "daily_target": target,
             "hours_worked": hours,
+            "hours_auto": hours_auto if current_user.role != "colleague" else None,
             "pending_hours": st.pending_hours if st else None,
             "hours_status": st.hours_status if st else None,
             "comment": st.comment if st else None,
@@ -3504,10 +4512,9 @@ def correct_completed_order(
     order.last_edited_by = current_user.username
 
     # Keep derived figures consistent with whatever the Team Lead just fixed.
-    if order.amount is not None:
-        order.pending_amount = order.amount - (order.posted_amount or 0)
+    _recalc_pending(order)
     if order.posted_date and _tat_start(order):
-        total_bdays = _count_business_days(_tat_start(order), order.posted_date)
+        total_bdays = _count_business_days_ex_holidays(_tat_start(order), order.posted_date)
         pause_bdays = _pause_business_days(db, order)
         order.tat_days = total_bdays - pause_bdays
 
@@ -3552,10 +4559,9 @@ def production_edit(
     for field, value in data.items():
         setattr(order, field, value)
     order.last_edited_by = current_user.username
-    if order.amount is not None:
-        order.pending_amount = order.amount - (order.posted_amount or 0)
+    _recalc_pending(order)
     if order.posted_date and _tat_start(order):
-        order.tat_days = _count_business_days(_tat_start(order), order.posted_date) - _pause_business_days(db, order)
+        order.tat_days = _count_business_days_ex_holidays(_tat_start(order), order.posted_date) - _pause_business_days(db, order)
 
     _log_order_change(db, current_user, order, "production_edit", reasons, before)
     db.commit()
@@ -3829,6 +4835,7 @@ def get_onshore_attachment(
 def onshore_queue(
     tab: str = "pending",
     team: Optional[str] = None,
+    process_id: Optional[int] = None,
     current_user: models.User = Depends(auth.require_role("onshore", "recon", "calling", "super_admin", "admin")),
     db: Session = Depends(get_db),
 ):
@@ -3844,6 +4851,8 @@ def onshore_queue(
     q = db.query(models.WorkOrder).options(
         selectinload(models.WorkOrder.clarification_detail), selectinload(models.WorkOrder.escalation_detail)
     ).filter(models.WorkOrder.onshore_status.isnot(None))
+    if process_id is not None:
+        q = q.filter(models.WorkOrder.process_id == process_id)
 
     my_team = current_user.role if current_user.role in TEAM_ROLES else team
     if tab == "pending":
@@ -4177,9 +5186,9 @@ def _pause_business_days(db: Session, order: models.WorkOrder) -> int:
         models.EscalationEvent.raised_date.isnot(None),
     ).all()
     if events:
-        return sum(_count_business_days(e.raised_date, e.closed_date) for e in events)
+        return sum(_count_business_days_ex_holidays(e.raised_date, e.closed_date) for e in events)
     if order.issue_raised_date and order.issue_closed_date:      # orders from before queries were logged
-        return _count_business_days(order.issue_raised_date, order.issue_closed_date)
+        return _count_business_days_ex_holidays(order.issue_raised_date, order.issue_closed_date)
     return 0
 
 
