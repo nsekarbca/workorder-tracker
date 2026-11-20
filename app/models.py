@@ -439,6 +439,26 @@ class ClientProcessTeamLead(Base):
     team_lead_id = Column(Integer, ForeignKey("users.id"), nullable=False)
 
 
+class QualityError(Base):
+    """An error found on an audited account: who made it, what kind, which order, and how much rework it caused."""
+    __tablename__ = "quality_errors"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)      # colleague who made it
+    process_id = Column(Integer, ForeignKey("processes.id"), index=True, nullable=True)
+    order_id = Column(Integer, index=True, nullable=True)       # plain number (no FK) so deleting / archiving orders never breaks this log
+    order_ref = Column(String(120), nullable=True)               # EDM / batch text kept at the time of logging
+    error_date = Column(Date, index=True, nullable=False)        # work date the error belongs to
+    error_type = Column(String(80), nullable=False)
+    severity = Column(String(20), nullable=True)                 # Minor / Major / Critical
+    notes = Column(Text, nullable=True)
+    rework_count = Column(Integer, nullable=False, default=0)    # how many times the order had to be reworked
+    rework_done = Column(Boolean, nullable=False, default=False)
+    logged_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    logged_by_name = Column(String(120), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, nullable=True)
+
+
 class ImportException(Base):
     """
     Rows an inventory import deliberately did NOT bring in and that someone
@@ -508,6 +528,7 @@ class OnshoreMessage(Base):
     author_role = Column(String, nullable=True)
     kind = Column(String, nullable=False)                      # sent | onshore_red | onshore_yellow | tl_info | resolved
     text = Column(Text, nullable=True)
+    track = Column(String, nullable=True)                      # which reason of a multi-reason escalation (NULL = the main one)
 
 
 class OnshoreAttachment(Base):
@@ -628,6 +649,143 @@ class SessionLog(Base):
     login_at = Column(DateTime, nullable=False)       # UTC (naive)
     last_seen = Column(DateTime, nullable=False)
     logout_at = Column(DateTime, nullable=True)
+    auto_closed = Column(Boolean, nullable=True)      # True = the browser was closed / crashed: no logout was recorded
+
+
+class BreakAdjustment(Base):
+    """
+    A Team Lead / Admin correction on the Break Tracker, kept as an auditable note:
+    excuse some of a day's flags (late login, break limits, hour targets) and / or change one break's type.
+    The original break rows are never edited.
+    """
+    __tablename__ = "break_adjustments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    adj_date = Column(Date, nullable=False, index=True)          # the IST day it applies to
+    excused = Column(String, nullable=True)                       # comma list of: late, break, hours
+    break_id = Column(Integer, ForeignKey("break_logs.id"), nullable=True, index=True)
+    old_type = Column(String, nullable=True)
+    new_type = Column(String, nullable=True)
+    note = Column(String, nullable=False)
+    created_by_name = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=True)                  # UTC (naive)
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class LeaveDay(Base):
+    """A day a Team Lead / Admin marked as Leave / Sick / Training / Other for a colleague. Late-login and hour-target checks are skipped on it."""
+    __tablename__ = "leave_days"
+    __table_args__ = (UniqueConstraint("user_id", "leave_date", name="uq_leave_user_date"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    leave_date = Column(Date, nullable=False, index=True)
+    kind = Column(String, nullable=False, default="Leave")        # Leave / Sick / Training / Other
+    note = Column(String, nullable=True)
+    created_by_name = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class ShiftChange(Base):
+    """A temporary shift for one colleague over a date range (e.g. Night -> Day for a week). Late-login / early-leave checks use it."""
+    __tablename__ = "shift_changes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    date_from = Column(Date, nullable=False)
+    date_to = Column(Date, nullable=False)
+    shift = Column(String, nullable=False)
+    note = Column(String, nullable=True)
+    created_by_name = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class BreakQuery(Base):
+    """A colleague's question about a day a Team Lead / Admin changed (adjustment, leave, shift change)."""
+    __tablename__ = "break_queries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    kind = Column(String, nullable=True)
+    ref_date = Column(Date, nullable=True)
+    ref_text = Column(String, nullable=True)
+    message = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="Open")       # Open / Resolved
+    reply = Column(String, nullable=True)
+    replied_by = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=True)
+    replied_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class BreakRequest(Base):
+    """A colleague asks in advance for extra break time on a day (e.g. a doctor visit). Once approved, the break-limit flags allow that many extra minutes."""
+    __tablename__ = "break_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    req_date = Column(Date, nullable=False, index=True)
+    extra_minutes = Column(Integer, nullable=False)
+    reason = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="Pending")      # Pending / Approved / Rejected / Cancelled
+    decided_by_name = Column(String, nullable=True)
+    decision_note = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=True)
+    decided_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class AuditEvent(Base):
+    """Who did what and when: break adjustments, leave, shift changes, request decisions, settings, profile and holiday changes. Never edited or deleted."""
+    __tablename__ = "audit_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    at = Column(DateTime, nullable=False, index=True)
+    actor_id = Column(Integer, nullable=True)
+    actor_name = Column(String, nullable=True)
+    actor_role = Column(String, nullable=True)
+    category = Column(String, nullable=False, index=True)
+    action = Column(String, nullable=False)
+    target_user_id = Column(Integer, nullable=True, index=True)
+    target_name = Column(String, nullable=True)
+    ref_date = Column(String, nullable=True)
+    details = Column(String, nullable=True)
+
+
+class UpdateReminder(Base):
+    """A reminder sent to a colleague who has not acknowledged a Process Update (kept so the same person is not nagged more than once a day)."""
+    __tablename__ = "update_reminders"
+
+    id = Column(Integer, primary_key=True, index=True)
+    update_id = Column(Integer, ForeignKey("process_updates.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    sent_at = Column(DateTime, nullable=False)
+    sent_by_name = Column(String, nullable=True)
+    emailed = Column(Boolean, nullable=False, default=False)
+
+
+class EscalationReminder(Base):
+    """A reminder about an escalation that has waited too long with Onshore / Recon / Calling (manual or automatic)."""
+    __tablename__ = "escalation_reminders"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, nullable=False, index=True)      # plain number: orders may be archived / deleted
+    team = Column(String, nullable=True)                         # onshore | recon | calling
+    sent_at = Column(DateTime, nullable=False)                   # IST (naive)
+    hours_waiting = Column(Float, nullable=True)
+    recipients = Column(Integer, nullable=False, default=0)
+    emailed = Column(Boolean, nullable=False, default=False)
+    auto = Column(Boolean, nullable=False, default=False)
+    sent_by_name = Column(String, nullable=True)
+    track = Column(String, nullable=True)                        # which reason of a multi-reason escalation (NULL = the main one)
 
 
 class AwayNow(Base):

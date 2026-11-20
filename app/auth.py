@@ -56,6 +56,10 @@ def get_current_user(
     user = db.query(models.User).filter(models.User.username == username).first()
     if user is None:
         raise credentials_exception
+    if user.employment_status == "Inactive":
+        # Inactive profile = locked: any token it still holds stops working at once.
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="This account is inactive",
+                            headers={"WWW-Authenticate": "Bearer"})
     return user
 
 

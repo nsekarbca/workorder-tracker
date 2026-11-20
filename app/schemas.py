@@ -191,7 +191,7 @@ class ResetPasswordWithTokenRequest(BaseModel):
 class CreateUserRequest(BaseModel):
     username: str
     full_name: str
-    role: str  # "colleague", "team_lead", "admin", "quality", "onshore", "recon", "calling" or "super_admin"
+    role: str  # "colleague", "team_lead", "admin", "manager", "quality", "onshore", "recon", "calling" or "super_admin"
     email: Optional[str] = None
     dob: Optional[date] = None
     doj: Optional[date] = None
@@ -256,6 +256,7 @@ class EscalationDetailSave(BaseModel):
     # row's own escalation_category is often still an unsaved draft in the
     # browser at the point the popup is used, not yet persisted to the order
     data: dict = {}  # only the category's manual fields — auto fields are always server-derived
+    extras: List[dict] = []   # more reasons on the same escalation: [{"category": ..., "data": {...}}]
 
 
 class ReassignRequest(BaseModel):
@@ -358,6 +359,8 @@ class ProductionEdit(BaseModel):
 class WorkOrderOut(BaseModel):
     id: int
     process_id: Optional[int]
+    track: Optional[str] = None            # multi-reason escalation: which reason this row is ("" / None = the main one)
+    held_until: Optional[date] = None      # EDM division hold: not handed to colleagues before this date
     team_lead_id: Optional[int]
     received_date: Optional[date]
     assigned_date: Optional[date]
@@ -497,6 +500,7 @@ class OnshoreMessageOut(BaseModel):
     author_role: Optional[str] = None
     kind: str
     text: Optional[str] = None
+    track: Optional[str] = None
     attachments: List[OnshoreAttachmentOut] = []
 
     class Config:
@@ -719,6 +723,53 @@ class BreakIn(BaseModel):
     source: Optional[str] = "auto"
     process_id: Optional[int] = None
     comment: Optional[str] = None
+
+
+class AdjustmentIn(BaseModel):
+    user_id: int
+    date: str                                  # IST day, YYYY-MM-DD
+    excused: List[str] = []                    # any of: late, break, hours
+    break_id: Optional[int] = None
+    new_type: Optional[str] = None
+    note: str
+
+
+class LeaveIn(BaseModel):
+    user_id: int
+    date_from: str
+    date_to: Optional[str] = None
+    kind: str = "Leave"
+    note: Optional[str] = None
+
+
+class ShiftChangeIn(BaseModel):
+    user_id: int
+    date_from: str
+    date_to: Optional[str] = None
+    shift: str
+    note: Optional[str] = None
+
+
+class QueryIn(BaseModel):
+    kind: Optional[str] = None
+    ref_date: Optional[str] = None
+    ref_text: Optional[str] = None
+    message: str
+
+
+class QueryReplyIn(BaseModel):
+    reply: str
+
+
+class BreakRequestIn(BaseModel):
+    req_date: str
+    extra_minutes: int
+    reason: str
+
+
+class BreakRequestDecision(BaseModel):
+    approve: bool
+    note: Optional[str] = None
 
 
 class BreakIdleSetting(BaseModel):

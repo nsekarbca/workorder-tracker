@@ -48,25 +48,51 @@ def get_base_url() -> str:
     return os.getenv("APP_BASE_URL", "").rstrip("/")
 
 
-def send_email(to_email: str, subject: str, body: str) -> bool:
-    """Best-effort send. Returns True on success, False if not configured or if sending failed — never raises."""
+last_error = ""
+last_result = {"ok": None, "at": None, "error": "", "ok_at": None}   # for the System health screen
+
+
+def _note(ok: bool, err: str = ""):
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    now = _dt.now(_tz(_td(hours=5, minutes=30))).strftime("%Y-%m-%d %H:%M")
+    last_result.update({"ok": ok, "at": now, "error": err})
+    if ok:
+        last_result["ok_at"] = now
+
+
+def send_email(to_email: str, subject: str, body: str, html: str = None) -> bool:
+    """Best-effort send. Returns True on success, False if not configured or if sending failed — never raises.
+    The reason for a failure is kept in email_utils.last_error. Pass html for a formatted version (body stays as the plain-text part)."""
+    global last_error
+    last_error = ""
     if not to_email:
+        last_error = "No email address"
         return False
     cfg = _config()
     if not cfg:
+        last_error = "SMTP is not configured (set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_FROM)"
         logger.warning("SMTP not configured — skipped email to %s: %s", to_email, subject)
         return False
     try:
-        msg = MIMEText(body)
+        if html:
+            from email.mime.multipart import MIMEMultipart
+            msg = MIMEMultipart("alternative")
+            msg.attach(MIMEText(body, "plain", "utf-8"))
+            msg.attach(MIMEText(html, "html", "utf-8"))
+        else:
+            msg = MIMEText(body, "plain", "utf-8")
         msg["Subject"] = subject
         msg["From"] = cfg["from_addr"]
         msg["To"] = to_email
-        with smtplib.SMTP(cfg["host"], cfg["port"], timeout=10) as server:
+        with smtplib.SMTP(cfg["host"], cfg["port"], timeout=20) as server:
             server.starttls()
             server.login(cfg["user"], cfg["password"])
             server.sendmail(cfg["from_addr"], [to_email], msg.as_string())
+        _note(True)
         return True
-    except Exception:
+    except Exception as e:
+        last_error = f"{type(e).__name__}: {e}"
+        _note(False, last_error)
         logger.exception("Failed to send email to %s", to_email)
         return False
 

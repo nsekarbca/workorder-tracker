@@ -3,14 +3,23 @@ from typing import List, Optional
 from dateutil import parser as date_parser
 from dateutil.relativedelta import relativedelta
 import secrets
+import uuid
+import logging
+import contextvars
+import threading
+import time
+import collections
+import shutil
+from logging.handlers import RotatingFileHandler
 
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy import or_, and_, false as sa_false, func, inspect as sa_inspect, text as sa_text
+from sqlalchemy import or_, and_, case, cast, String, false as sa_false, func, inspect as sa_inspect, text as sa_text
 import csv
 import json
 import io
@@ -42,6 +51,8 @@ TEAM_FOR_CATEGORY = {
 _ADDED_COLUMNS = [
     ("users", "last_login_date", "DATE"),
     ("work_orders", "onshore_status", "VARCHAR"),
+    ("onshore_messages", "track", "VARCHAR"),
+    ("escalation_reminders", "track", "VARCHAR"),
     ("work_orders", "onshore_comment", "TEXT"),
     ("work_orders", "onshore_tl_reply", "TEXT"),
     ("work_orders", "onshore_sent_at", "TIMESTAMP"),
@@ -68,6 +79,7 @@ _ADDED_COLUMNS = [
     ("users", "photo", "TEXT"),
     ("users", "shift", "VARCHAR"),
     ("process_updates", "ack_required", "BOOLEAN DEFAULT FALSE"),
+    ("session_logs", "auto_closed", "BOOLEAN"),
 ]
 
 
@@ -99,6 +111,18 @@ _INDEXES = [
     ("ix_wo_team_lead", "work_orders", "team_lead_id"),
     ("ix_impexc_process", "import_exceptions", "process_id, created_at"),
     ("ix_celeb_target", "celebration_comments", "target_user_id, occasion_date"),
+    ("ix_wo_proc_status_recv", "work_orders", "process_id, posting_status, received_date"),
+    ("ix_wo_posted", "work_orders", "posted_date"),
+    ("ix_wo_submitted", "work_orders", "submitted, process_id"),
+    ("ix_wo_assigned_posted", "work_orders", "assigned_to_id, posted_date"),
+    ("ix_wo_onshore_status", "work_orders", "onshore_status"),
+    ("ix_login_user_date", "login_days", "user_id, login_date"),
+    ("ix_leave_user_date", "leave_days", "user_id, leave_date"),
+    ("ix_batch_date", "daily_batch_stats", "work_date, process_id"),
+    ("ix_escev_raised", "escalation_events", "process_id, raised_date"),
+    ("ix_onmsg_order", "onshore_messages", "order_id"),
+    ("ix_qerr_user_date", "quality_errors", "user_id, error_date"),
+    ("ix_esrem_order", "escalation_reminders", "order_id"),
 ]
 
 
@@ -120,6 +144,39 @@ def _ensure_indexes():
 
 _ensure_indexes()
 
+_rid_var = contextvars.ContextVar("rid", default="-")
+
+
+def _log_dir() -> str:
+    return os.getenv("LOG_DIR") or os.path.join(os.getcwd(), "logs")
+
+
+class _ISTFormatter(logging.Formatter):
+    """Log times in India time so they match what people say ('around 10:42')."""
+    def formatTime(self, record, datefmt=None):
+        t = datetime.utcfromtimestamp(record.created) + timedelta(hours=5, minutes=30)
+        return t.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _setup_logging():
+    """Rotating log file (5 x 2 MB) next to the database: logs/workflowhub.log. Errors, logins, changes and slow requests land here, each with a request ID."""
+    lg = logging.getLogger("workflowhub")
+    if lg.handlers:
+        return
+    lg.setLevel(logging.INFO)
+    lg.propagate = False
+    try:
+        d = _log_dir()
+        os.makedirs(d, exist_ok=True)
+        h = RotatingFileHandler(os.path.join(d, "workflowhub.log"), maxBytes=2_000_000, backupCount=5, encoding="utf-8")
+        h.setFormatter(_ISTFormatter("%(asctime)s %(levelname)s %(message)s"))
+        lg.addHandler(h)
+    except Exception:
+        lg.addHandler(logging.StreamHandler())
+
+
+_setup_logging()
+
 app = FastAPI(title="WorkFlow Hub")
 
 # Compress anything over 1 KB (the page itself, big order lists): ~70-80% less data on the network.
@@ -133,6 +190,118 @@ app.add_middleware(
 )
 
 
+_RC = {}                                   # (user token, path+query) -> (expires, status, body, media_type)
+_RC_LOCK = threading.Lock()
+_RC_TTL = 30                               # seconds
+_RC_PATHS = ("/performance/data", "/forecast", "/clients/dashboard", "/escalations/reasons", "/workload", "/orders/aging",
+             "/orders/escalation-aging", "/orders/time-benchmarks", "/quality/errors/summary", "/reports/management-summary")
+
+
+@app.middleware("http")
+async def dashboard_cache(request, call_next):
+    """Heavy read-only dashboards are remembered for 30 seconds per user, and forgotten at once when anyone saves a change.
+    (With several server workers a change made on another worker can take up to 30 seconds to show on these dashboards.)"""
+    import time as _t
+    from fastapi.responses import Response as _R
+    m = request.method
+    if m in ("POST", "PUT", "PATCH", "DELETE"):
+        response = await call_next(request)
+        if response.status_code < 400:
+            with _RC_LOCK:
+                _RC.clear()
+        return response
+    path = request.url.path
+    if m != "GET" or path not in _RC_PATHS:
+        return await call_next(request)
+    key = (request.headers.get("authorization", ""), path + "?" + request.url.query)
+    now = _t.time()
+    with _RC_LOCK:
+        hit = _RC.get(key)
+        if hit and hit[0] > now:
+            return _R(content=hit[2], status_code=hit[1], headers={**hit[3], "X-Cache": "HIT"})
+    response = await call_next(request)
+    if response.status_code == 200:
+        body = b"".join([chunk async for chunk in response.body_iterator])
+        with _RC_LOCK:
+            if len(_RC) > 500:
+                for k in [k for k, v in _RC.items() if v[0] < now]:
+                    _RC.pop(k, None)
+            hdrs = {k: v for k, v in response.headers.items() if k.lower() not in ("content-length", "x-cache")}
+            _RC[key] = (now + _RC_TTL, 200, body, hdrs)
+        return _R(content=body, status_code=200, headers={**hdrs, "X-Cache": "MISS"})
+    return response
+
+
+def _log_user(request) -> str:
+    try:
+        from jose import jwt as _jwt
+        h = request.headers.get("authorization", "")
+        if h.lower().startswith("bearer "):
+            return str(_jwt.get_unverified_claims(h[7:]).get("sub") or "-")
+    except Exception:
+        pass
+    return "-"
+
+
+# ---- endpoint timing for the System health screen (per worker, kept in memory) ----
+_EP: dict = {}
+_EP_LOCK = threading.Lock()
+_STARTED = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+
+
+def _ep_record(request, status: int, ms: float):
+    route = request.scope.get("route")
+    key = request.method + " " + (getattr(route, "path", None) or re.sub(r"/\d+", "/{id}", request.url.path))
+    with _EP_LOCK:
+        e = _EP.get(key)
+        if e is None:
+            if len(_EP) > 400:
+                return
+            e = _EP[key] = {"n": 0, "total": 0.0, "max": 0.0, "errors": 0, "recent": collections.deque(maxlen=300)}
+        e["n"] += 1; e["total"] += ms; e["max"] = max(e["max"], ms); e["recent"].append(ms)
+        if status >= 500:
+            e["errors"] += 1
+
+
+@app.middleware("http")
+async def request_log(request, call_next):
+    """Gives every request an ID (also sent back as the X-Request-ID header), and logs: every error with its traceback,
+    every change (POST/PUT/PATCH/DELETE), refused logins / permissions, and anything slower than 2 seconds."""
+    import time as _t
+    from fastapi.responses import JSONResponse
+    rid = uuid.uuid4().hex[:8]
+    _rid_var.set(rid)
+    request.state.rid = rid
+    path = request.url.path
+    lg = logging.getLogger("workflowhub")
+    t0 = _t.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        lg.exception("rid=%s user=%s %s %s UNHANDLED ERROR", rid, _log_user(request), request.method, path)
+        return JSONResponse({"detail": f"Something went wrong. Please tell the Super Admin this reference: {rid}"}, status_code=500, headers={"X-Request-ID": rid})
+    response.headers["X-Request-ID"] = rid
+    ms = (_t.perf_counter() - t0) * 1000
+    st = response.status_code
+    if path != "/health" and not path.startswith("/static") and path != "/":
+        try:
+            _ep_record(request, st, ms)
+        except Exception:
+            pass
+    if path == "/health" or path.startswith("/static") or (request.method == "GET" and st < 400 and ms < 2000 and path != "/auth/login"):
+        return response
+    msg = "rid=%s user=%s %s %s -> %s %.0fms" % (rid, _log_user(request), request.method, path, st, ms)
+    if st >= 500:
+        lg.error(msg)
+    elif st in (401, 403, 429) or ms >= 2000:
+        lg.warning(msg + (" SLOW" if ms >= 2000 else ""))
+    elif request.method != "GET" and st < 400:
+        lg.info(msg)
+    elif st >= 400:
+        lg.info(msg)
+    return response
+
+
 @app.middleware("http")
 async def no_cache_for_app_shell(request, call_next):
     """
@@ -144,10 +313,30 @@ async def no_cache_for_app_shell(request, call_next):
     response = await call_next(request)
     path = request.url.path
     if path == "/" or path == "/index.html":
-        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-        response.headers["Pragma"] = "no-cache"
-        response.headers["Expires"] = "0"
+        # "no-cache" = always ask the server, but the server answers 304 (nothing to download) when the page is unchanged.
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
     return response
+
+
+@app.get("/health")
+def health():
+    """For IT monitoring / auto-restart: confirms the app is up and the database answers. No login needed, no data returned."""
+    try:
+        db = SessionLocal()
+        try:
+            db.execute(sa_text("SELECT 1"))
+        finally:
+            db.close()
+    except Exception:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    return {"status": "ok", "time": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")}
+
+
+@app.on_event("startup")
+def start_digest_scheduler():
+    import threading
+    threading.Thread(target=_digest_loop, daemon=True, name="digest").start()
+    threading.Thread(target=_scheduled_jobs_loop, daemon=True, name="jobs").start()
 
 
 @app.on_event("startup")
@@ -334,15 +523,96 @@ def _start_timer(order: models.WorkOrder):
 # Auth
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Login throttling: slow down repeated wrong passwords
+# ---------------------------------------------------------------------------
+_THROTTLE = {}
+_THROTTLE_LOCK = threading.Lock()
+_THROTTLE_WINDOW = 900            # failures are counted over 15 minutes
+_THROTTLE_RULES = {"u": (5, 60), "ip": (30, 300), "pw": (5, 60)}      # kind -> (failures allowed, first lock in seconds); the lock doubles each time, max 15 min
+
+
+def _client_ip(request) -> str:
+    if os.getenv("TRUST_PROXY") == "1":
+        xf = request.headers.get("x-forwarded-for")
+        if xf:
+            return xf.split(",")[0].strip()
+    return request.client.host if request.client else "?"
+
+
+def _throttle_wait(keys) -> int:
+    """Seconds this caller must still wait (0 = free to try)."""
+    now = datetime.utcnow().timestamp()
+    with _THROTTLE_LOCK:
+        w = 0
+        for k in keys:
+            e = _THROTTLE.get(k)
+            if e and e["until"] > now:
+                w = max(w, int(e["until"] - now) + 1)
+        return w
+
+
+def _throttle_fail(kind_keys) -> int:
+    """Record one failure for each (kind, key); returns the lock seconds started now (0 = none)."""
+    now = datetime.utcnow().timestamp()
+    started = 0
+    with _THROTTLE_LOCK:
+        if len(_THROTTLE) > 5000:
+            for k in [k for k, e in _THROTTLE.items() if e["until"] < now and now - e["first"] > _THROTTLE_WINDOW]:
+                _THROTTLE.pop(k, None)
+        for kind, k in kind_keys:
+            allowed, base = _THROTTLE_RULES[kind]
+            e = _THROTTLE.get(k)
+            if e is None or (e["until"] < now and now - e["first"] > _THROTTLE_WINDOW):
+                e = _THROTTLE[k] = {"n": 0, "first": now, "until": 0, "level": 0}
+            e["n"] += 1
+            if e["n"] >= allowed:
+                e["level"] += 1
+                secs = min(900, base * 2 ** (e["level"] - 1))
+                e["until"] = now + secs
+                started = max(started, secs)
+    return started
+
+
+def _throttle_clear(keys):
+    with _THROTTLE_LOCK:
+        for k in keys:
+            _THROTTLE.pop(k, None)
+
+
+def _throttle_raise(secs: int):
+    mins = max(1, (secs + 59) // 60)
+    raise HTTPException(status_code=429, detail=f"Too many wrong attempts. Please wait {mins} minute{'s' if mins != 1 else ''} and try again.",
+                        headers={"Retry-After": str(secs)})
+
+
 @app.post("/auth/login", response_model=schemas.LoginResponse)
 def login(
+    request: Request,
     form_data: OAuth2PasswordRequestForm = Depends(),
     process_id: Optional[int] = Form(None),
     db: Session = Depends(get_db),
 ):
+    ip = _client_ip(request)
+    ukey = f"u:{(form_data.username or '').strip().lower()}|{ip}"
+    ipkey = f"ip:{ip}"
+    lg = logging.getLogger("workflowhub")
+    wait = _throttle_wait([ukey, ipkey])
+    if wait:
+        lg.warning("rid=%s login BLOCKED user=%s ip=%s wait=%ss", getattr(request.state, "rid", "-"), form_data.username, ip, wait)
+        _throttle_raise(wait)
     user = db.query(models.User).filter(models.User.username == form_data.username).first()
     if not user or not auth.verify_password(form_data.password, user.password_hash):
+        lg.warning("rid=%s login FAILED user=%s ip=%s", getattr(request.state, "rid", "-"), form_data.username, ip)
+        started = _throttle_fail([("u", ukey), ("ip", ipkey)])
+        if started:
+            lg.warning("rid=%s login LOCKED user=%s ip=%s for %ss", getattr(request.state, "rid", "-"), form_data.username, ip, started)
+            _audit(db, None, "Security", "Login locked after repeated wrong passwords", None, None, f"user '{(form_data.username or '')[:40]}' from {ip} for {max(1, started // 60)} min")
+            db.commit()
+            _throttle_raise(started)
         raise HTTPException(status_code=401, detail="Incorrect username or password")
+    _throttle_clear([ukey])
+    lg.info("rid=%s login OK user=%s ip=%s", getattr(request.state, "rid", "-"), form_data.username, ip)
     if user.employment_status == "Inactive":
         raise HTTPException(status_code=403, detail="This account is inactive")
     # Quality (view/export Production only) can open any process; everyone else needs it assigned.
@@ -375,8 +645,16 @@ def change_password(
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
 ):
+    pwkey = f"pw:{current_user.id}"
+    wait = _throttle_wait([pwkey])
+    if wait:
+        _throttle_raise(wait)
     if not auth.verify_password(payload.old_password, current_user.password_hash):
+        started = _throttle_fail([("pw", pwkey)])
+        if started:
+            _throttle_raise(started)
         raise HTTPException(status_code=401, detail="Current password is incorrect")
+    _throttle_clear([pwkey])
     if len(payload.new_password) < 8:
         raise HTTPException(status_code=400, detail="New password must be at least 8 characters")
     current_user.password_hash = auth.hash_password(payload.new_password)
@@ -393,7 +671,7 @@ def read_me(current_user: models.User = Depends(auth.get_current_user)):
 @app.put("/auth/me/profile", response_model=schemas.UserOut)
 def update_my_profile(
     payload: schemas.ProfileDatesUpdate,
-    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "quality", "onshore", "recon", "calling")),
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "manager", "quality", "onshore", "recon", "calling")),
     db: Session = Depends(get_db),
 ):
     """
@@ -442,6 +720,7 @@ def set_session_timeout(
     if payload.minutes < 1:
         raise HTTPException(status_code=400, detail="Timeout must be at least 1 minute")
     setting = db.query(models.AppSetting).filter(models.AppSetting.key == SESSION_TIMEOUT_SETTING_KEY).first()
+    _audit(db, current_user, "Setting", "Changed session timeout", details=f"{setting.value if setting else 'default'} -> {payload.minutes} minutes")
     if setting:
         setting.value = str(payload.minutes)
     else:
@@ -496,6 +775,7 @@ def set_break_idle(
 ):
     if payload.minutes < 1 or payload.minutes > 120:
         raise HTTPException(status_code=400, detail="Enter 1 to 120 minutes")
+    _audit(db, current_user, "Setting", "Changed break lock settings", details=f"Idle minutes {payload.minutes}; lock whole PC {'off' if payload.lock_system is False else 'on'}")
     for key, val in ((BREAK_IDLE_SETTING_KEY, str(payload.minutes)),
                      (BREAK_LOCK_SYSTEM_KEY, "0" if payload.lock_system is False else "1")):
         row = db.query(models.AppSetting).filter(models.AppSetting.key == key).first()
@@ -593,7 +873,7 @@ def record_break(
 def list_breaks(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
-    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """Breaks in an IST date range. Colleague: own; Team Lead: their team; Admin / Super Admin: everyone."""
@@ -615,16 +895,3981 @@ def list_breaks(
         ids = [u.id for u in _batch_visible_colleagues(db, current_user)]
         q = q.filter(models.BreakLog.user_id.in_(ids or [-1]))
     rows = q.order_by(models.BreakLog.started_at.desc()).limit(5000).all()
+    retype = {}
+    for a in db.query(models.BreakAdjustment).filter(models.BreakAdjustment.break_id.in_([r.id for r in rows] or [-1])).order_by(models.BreakAdjustment.id).all():
+        if a.new_type:
+            retype[a.break_id] = a.new_type
     out = []
     for r in rows:
         u = r.user
         out.append({
             "id": r.id, "user_id": r.user_id, "employee": u.full_name if u else "", "employee_id": u.employee_id if u else None,
-            "team_lead": (u.reporting_manager if u else None) or "", "break_type": r.break_type, "source": r.source,
+            "team_lead": (u.reporting_manager if u else None) or "", "break_type": retype.get(r.id, r.break_type),
+            "original_type": r.break_type if r.id in retype else "", "source": r.source,
             "started_at": r.started_at.isoformat(), "ended_at": r.ended_at.isoformat(), "minutes": r.minutes,
             "comment": r.comment or "",
         })
     return out
+
+
+def _shift_start_minutes(shift):
+    """Start of a profile shift, e.g. 'Day Shift (08:00 AM - 05:00 PM)' -> minutes after midnight (None if no shift)."""
+    import re as _re
+    m = _re.search(r"\((\d{1,2}):(\d{2})\s*(AM|PM)", shift or "", _re.I)
+    if not m:
+        return None
+    h, mi, ap = int(m.group(1)) % 12, int(m.group(2)), m.group(3).upper()
+    return (h + (12 if ap == "PM" else 0)) * 60 + mi
+
+
+def _shift_length_minutes(shift):
+    """Length of a profile shift in minutes, e.g. 'Day Shift (09:00 AM - 06:00 PM)' -> 540 (None if it can't be read)."""
+    import re as _re
+    m = _re.search(r"\((\d{1,2}):(\d{2})\s*(AM|PM)\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)", shift or "", _re.I)
+    if not m:
+        return None
+    a = (int(m.group(1)) % 12 + (12 if m.group(3).upper() == "PM" else 0)) * 60 + int(m.group(2))
+    b = (int(m.group(4)) % 12 + (12 if m.group(6).upper() == "PM" else 0)) * 60 + int(m.group(5))
+    return (b - a) % 1440 or 1440
+
+
+LATE_GRACE_MIN = 5          # login up to 5 minutes after the shift start is not late
+LIM_TEA_LUNCH, LIM_OTHER = 60, 30
+LIM_CLOCKED, LIM_PRODUCTION = 540, 450      # 9h clocked, 7:30h production per working day
+LEFT_EARLY_MIN = 15                         # logging out more than 15 minutes before the shift ends is flagged
+LIM_LONG_BREAK = 120                        # a single break over 2 hours is flagged
+
+
+def _hol_set(db: Session, d1: date, d2: date) -> set:
+    return {h.holiday_date for h in db.query(models.Holiday).filter(models.Holiday.holiday_date >= d1, models.Holiday.holiday_date <= d2).all()}
+
+
+def _is_off_day(d: date, holidays: set) -> bool:
+    """Weekend or company holiday: late login and clocked / production hour checks are not applied."""
+    return d.weekday() >= 5 or d in holidays
+
+
+def _ist_dt(dt: datetime) -> datetime:
+    return dt.replace(tzinfo=timezone.utc).astimezone(IST)
+
+
+def _ist_bounds(d1: date, d2: date):
+    lo = datetime(d1.year, d1.month, d1.day, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
+    hi = datetime(d2.year, d2.month, d2.day, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None) + timedelta(days=1)
+    return lo, hi
+
+
+def _scope_ids(db: Session, current_user: models.User, active_only: bool = False):
+    """None = everybody (Admin / Super Admin); otherwise the visible colleague ids."""
+    if current_user.role == "colleague":
+        return [current_user.id]
+    if current_user.role == "team_lead":
+        us = _batch_visible_colleagues(db, current_user)
+        return [u.id for u in us if not active_only or u.employment_status != "Inactive"]
+    return None
+
+
+def _collect_days(db: Session, ids, d1: date, d2: date) -> dict:
+    """
+    Per (user_id, IST date): first login, last logout, clocked minutes (overlapping sessions counted once),
+    whether a session is live, and the break totals + reasons. One place for every break report.
+    """
+    lo, hi = _ist_bounds(d1, d2)
+    now = datetime.utcnow()
+    days = {}
+    def day(uid, d):
+        return days.setdefault((uid, d), {"ivs": [], "live": False, "tea_lunch": 0.0, "other": 0.0, "meeting": 0.0, "breaks": 0, "reasons": [], "longest": 0.0, "no_logout": False, "bk": [], "bt": {}})
+    sq = db.query(models.SessionLog).filter(models.SessionLog.login_at >= lo, models.SessionLog.login_at < hi)
+    bq = db.query(models.BreakLog).filter(models.BreakLog.started_at >= lo, models.BreakLog.started_at < hi)
+    if ids is not None:
+        sq = sq.filter(models.SessionLog.user_id.in_(ids or [-1]))
+        bq = bq.filter(models.BreakLog.user_id.in_(ids or [-1]))
+    for sl in sq.all():
+        end = sl.logout_at or sl.last_seen
+        if end < sl.login_at:
+            end = sl.login_at
+        live = sl.logout_at is None and (now - sl.last_seen) < timedelta(minutes=5)
+        if live:
+            end = max(end, now)
+        d = day(sl.user_id, _ist_dt(sl.login_at).date())
+        d["ivs"].append((sl.login_at, end))
+        d["live"] = d["live"] or live
+        if sl.auto_closed or (sl.logout_at is None and not live):      # no logout recorded for this session
+            d["no_logout"] = True
+    # Team Lead / Admin corrections: a break can be re-typed, and a day's flags can be excused (see BreakAdjustment).
+    aq = db.query(models.BreakAdjustment).filter(models.BreakAdjustment.adj_date >= d1, models.BreakAdjustment.adj_date <= d2)
+    if ids is not None:
+        aq = aq.filter(models.BreakAdjustment.user_id.in_(ids or [-1]))
+    retype, excuse, adj_notes = {}, {}, {}
+    for a in aq.order_by(models.BreakAdjustment.id).all():
+        if a.break_id and a.new_type:
+            retype[a.break_id] = a.new_type
+        for x in (a.excused or "").split(","):
+            if x:
+                excuse.setdefault((a.user_id, a.adj_date), set()).add(x)
+        adj_notes.setdefault((a.user_id, a.adj_date), []).append(a.note + (" (" + a.created_by_name + ")" if a.created_by_name else ""))
+    for b in bq.all():
+        d = day(b.user_id, _ist_dt(b.started_at).date())
+        m = b.minutes or 0
+        bt = retype.get(b.id, b.break_type)
+        if bt in ("Tea Break", "Lunch Break", "Dinner Break"):
+            d["tea_lunch"] += m
+        elif bt == "Other Break":
+            d["other"] += m
+        else:
+            d["meeting"] += m
+        d["breaks"] += 1
+        tt = d["bt"].setdefault(bt, [0, 0.0]); tt[0] += 1; tt[1] += m
+        d["longest"] = max(d["longest"], m)
+        d["bk"].append(b.comment or "")
+        if b.comment:
+            d["reasons"].append(b.comment)
+    lq = db.query(models.LeaveDay).filter(models.LeaveDay.leave_date >= d1, models.LeaveDay.leave_date <= d2)
+    if ids is not None:
+        lq = lq.filter(models.LeaveDay.user_id.in_(ids or [-1]))
+    for lv in lq.all():
+        if (lv.user_id, lv.leave_date) in days:
+            days[(lv.user_id, lv.leave_date)]["leave"] = lv.kind
+    sc = db.query(models.ShiftChange).filter(models.ShiftChange.date_from <= d2, models.ShiftChange.date_to >= d1)
+    if ids is not None:
+        sc = sc.filter(models.ShiftChange.user_id.in_(ids or [-1]))
+    sc = sc.order_by(models.ShiftChange.id).all()
+    for (uid, dd), dv in days.items():
+        for c_ in sc:
+            if c_.user_id == uid and c_.date_from <= dd <= c_.date_to:
+                dv["shift"] = c_.shift
+    rq = db.query(models.BreakRequest).filter(models.BreakRequest.status == "Approved", models.BreakRequest.req_date >= d1, models.BreakRequest.req_date <= d2)
+    if ids is not None:
+        rq = rq.filter(models.BreakRequest.user_id.in_(ids or [-1]))
+    for r_ in rq.all():
+        if (r_.user_id, r_.req_date) in days:
+            dv = days[(r_.user_id, r_.req_date)]
+            dv["extra"] = dv.get("extra", 0) + r_.extra_minutes
+            adj_notes.setdefault((r_.user_id, r_.req_date), []).append(f"Approved break request +{r_.extra_minutes}m: {r_.reason}" + (" (" + r_.decided_by_name + ")" if r_.decided_by_name else ""))
+    for (uid, dd), ex in excuse.items():
+        day(uid, dd)["excused"] = ex
+    for (uid, dd), notes in adj_notes.items():
+        day(uid, dd)["adj"] = notes
+    for d in days.values():
+        d.setdefault("excused", set()); d.setdefault("adj", []); d.setdefault("leave", None); d.setdefault("shift", None); d.setdefault("extra", 0)
+        d["ivs"].sort()
+        merged = []
+        for a, b in d["ivs"]:
+            if merged and a <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        d["first_login"] = d["ivs"][0][0] if d["ivs"] else None
+        d["last_logout"] = merged[-1][1] if merged else None
+        d["clocked"] = round(sum((b - a).total_seconds() for a, b in merged) / 60, 1)
+        d["brk_total"] = d["tea_lunch"] + d["other"] + d["meeting"]
+        d["production"] = max(0.0, d["clocked"] - d["brk_total"]) if merged else 0.0
+    return days
+
+
+def _late_minutes(first_login, shift, grace=LATE_GRACE_MIN):
+    """Minutes after the shift start (None = on time, or no shift set / no login)."""
+    st = _shift_start_minutes(shift)
+    if st is None or first_login is None:
+        return None
+    t = _ist_dt(first_login)
+    over = t.hour * 60 + t.minute - st
+    return over if over > grace else None
+
+
+def _day_flags(d: dict, shift, day_date: date, off: bool, today: date):
+    """Policy flags for one person-day."""
+    f = []
+    ex = d.get("excused", set())
+    shift = d.get("shift") or shift          # a temporary shift change for that day wins over the profile shift
+    off = off or bool(d.get("leave"))        # a marked leave day is not checked for late login / hour targets
+    ongoing = day_date >= today and d["live"]
+    late = None if (off or "late" in ex) else _late_minutes(d["first_login"], shift)
+    if late is not None:
+        f.append("Late login")
+    if "break" not in ex:
+        extra = d.get("extra", 0)          # extra break minutes a Team Lead approved in advance for this day
+        over = max(0.0, d["tea_lunch"] - LIM_TEA_LUNCH) + max(0.0, d["other"] - LIM_OTHER)
+        if over > extra:
+            if d["tea_lunch"] > LIM_TEA_LUNCH:
+                f.append("Tea + Lunch over 1h")
+            if d["other"] > LIM_OTHER:
+                f.append("Other break over 30m")
+        if d["longest"] > LIM_LONG_BREAK + extra:
+            f.append("Single break over 2h")
+    if d.get("no_logout") and "hours" not in ex and day_date < today:
+        f.append("No logout recorded")
+    if not off and not ongoing and "hours" not in ex and d["first_login"] is not None:
+        if d["clocked"] < LIM_CLOCKED:
+            f.append("Clocked under 9h")
+        if d["production"] < LIM_PRODUCTION:
+            f.append("Production under 7:30h")
+        st_, ln_ = _shift_start_minutes(shift), _shift_length_minutes(shift)
+        if st_ is not None and ln_ and d["last_logout"] is not None and not d.get("no_logout"):
+            due = datetime(day_date.year, day_date.month, day_date.day) + timedelta(minutes=st_ + ln_)
+            if _ist_dt(d["last_logout"]).replace(tzinfo=None) < due - timedelta(minutes=LEFT_EARLY_MIN):
+                f.append("Left early")
+    return f, late
+
+
+@app.get("/breaks/month-summary")
+def break_month_summary(
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    Current IST month, per person: days logged in more than 5 minutes after the shift start (late login)
+    and days over the break limit. Weekends and holidays are not checked for late login.
+    Scope: colleague own / Team Lead team / Admin + Super Admin everyone.
+    """
+    today = datetime.now(IST).date()
+    first = today.replace(day=1)
+    ids = _scope_ids(db, current_user)
+    days = _collect_days(db, ids, first, today)
+    hol = _hol_set(db, first, today)
+    users = {u.id: u for u in db.query(models.User).filter(models.User.id.in_({k[0] for k in days} or {-1})).all()}
+    res = {}
+    for (uid, d), v in sorted(days.items(), key=lambda x: x[0][1]):
+        u = users.get(uid)
+        flags, late = _day_flags(v, u.shift if u else None, d, _is_off_day(d, hol), today)
+        over = any(x in flags for x in ("Tea + Lunch over 1h", "Other break over 30m", "Single break over 2h"))
+        if late is None and not over:
+            continue
+        r = res.setdefault(uid, {"user_id": uid, "employee": u.full_name if u else "", "team_lead": (u.reporting_manager if u else None) or "",
+                                 "shift": (u.shift if u else None) or "", "late_days": 0, "over_days": 0, "late_dates": [], "over_dates": []})
+        if late is not None:
+            r["late_days"] += 1; r["late_dates"].append(d.isoformat())
+        if over:
+            r["over_days"] += 1; r["over_dates"].append(d.isoformat())
+    out = list(res.values())
+    uq = db.query(models.User).filter(models.User.role == "colleague", models.User.employment_status == "Active")
+    if ids is not None:
+        uq = uq.filter(models.User.id.in_(ids or [-1]))
+    no_shift = sum(1 for u in uq.all() if _shift_start_minutes(u.shift) is None)
+    return {"month": today.strftime("%B %Y"), "no_shift": no_shift, "grace": LATE_GRACE_MIN, "late_days": sum(r["late_days"] for r in out),
+            "over_days": sum(r["over_days"] for r in out), "users": out}
+
+
+# ---------------------------------------------------------------------------
+# Daily exception digest: yesterday's late logins / break-limit days / short days, emailed to each Team Lead
+# (their team) and, optionally, a full summary to Admins and Super Admins. Needs SMTP (see email_utils.py).
+# ---------------------------------------------------------------------------
+DIGEST_KEYS = {"enabled": "digest_enabled", "time": "digest_time", "admins": "digest_admins", "last": "digest_last_sent"}
+
+
+def _setting(db: Session, key: str, default: str = "") -> str:
+    row = db.query(models.AppSetting).filter(models.AppSetting.key == key).first()
+    return row.value if row else default
+
+
+def _set_setting(db: Session, key: str, val: str):
+    row = db.query(models.AppSetting).filter(models.AppSetting.key == key).first()
+    if row:
+        row.value = val
+    else:
+        db.add(models.AppSetting(key=key, value=val))
+
+
+def _digest_settings(db: Session) -> dict:
+    return {"enabled": _setting(db, DIGEST_KEYS["enabled"], "0") == "1", "time": _setting(db, DIGEST_KEYS["time"], "09:00"),
+            "admins": _setting(db, DIGEST_KEYS["admins"], "1") == "1", "last_sent": _setting(db, DIGEST_KEYS["last"], ""),
+            "weekly_enabled": _setting(db, WEEKLY_KEYS["enabled"], "0") == "1", "weekly_time": _setting(db, WEEKLY_KEYS["time"], "09:00"),
+            "weekly_last": _setting(db, WEEKLY_KEYS["last"], ""),
+            "smtp_configured": email_utils.is_configured()}
+
+
+def _digest_rows(db: Session, users: list, day_: date) -> list:
+    """Exception rows for these colleagues on one IST day (same rules as the Exceptions report)."""
+    today = datetime.now(IST).date()
+    ids = [u.id for u in users]
+    days = _collect_days(db, ids, day_, day_)
+    hol = _hol_set(db, day_, day_)
+    by = {u.id: u for u in users}
+    out = []
+    for (uid, d), v in days.items():
+        u = by.get(uid)
+        if not u:
+            continue
+        flags, late = _day_flags(v, u.shift, d, _is_off_day(d, hol), today)
+        if flags:
+            out.append({"employee": u.full_name, "team_lead": u.reporting_manager or "", "shift": (u.shift or "").split(" (")[0],
+                        "login": _ist_dt(v["first_login"]).strftime("%I:%M %p") if v["first_login"] else "", "late": late or 0,
+                        "tea_lunch": round(v["tea_lunch"]), "other": round(v["other"]), "clocked": round(v["clocked"]),
+                        "production": round(v["production"]), "flags": ", ".join(flags), "reasons": "; ".join(v["reasons"])})
+    out.sort(key=lambda r: (r["team_lead"], r["employee"]))
+    return out
+
+
+def _fmt_m(m: int) -> str:
+    return f"{m // 60}h {m % 60:02d}m" if m >= 60 else f"{m}m"
+
+
+def _digest_email(title: str, day_: date, rows: list, show_tl: bool):
+    heads = ["Employee"] + (["Team Lead"] if show_tl else []) + ["Login", "Tea+Lunch", "Other", "Clocked", "Production", "Exceptions", "Reasons"]
+    def cells(r):
+        return [r["employee"]] + ([r["team_lead"]] if show_tl else []) + [(r["login"] + (f" ({r['late']}m late)" if r["late"] else "")), _fmt_m(r["tea_lunch"]),
+                _fmt_m(r["other"]), _fmt_m(r["clocked"]), _fmt_m(r["production"]), r["flags"], r["reasons"]]
+    import html as _h
+    text = f"{title}\nDate: {day_.strftime('%A, %d %b %Y')}\n\n" + "\n".join(" | ".join(cells(r)) for r in rows) + \
+        "\n\nLate login = more than 5 minutes after the shift start. Limits: Tea + Lunch 1h, Other 30m, clocked 9h, production 7:30h. " \
+        "Weekends, holidays and days excused by a Team Lead are not counted.\n"
+    th = "".join(f'<th style="background:#5b2a63;color:#fff;padding:6px 8px;text-align:left;font-size:12px;">{_h.escape(x)}</th>' for x in heads)
+    trs = "".join("<tr>" + "".join(f'<td style="padding:5px 8px;border-bottom:1px solid #e3e7ef;font-size:12.5px;">{_h.escape(str(c))}</td>' for c in cells(r)) + "</tr>" for r in rows)
+    html = (f'<div style="font-family:Segoe UI,Arial,sans-serif;color:#222;"><h3 style="color:#0b2545;margin:0 0 4px;">{_h.escape(title)}</h3>'
+            f'<div style="color:#666;font-size:13px;margin-bottom:10px;">{_h.escape(day_.strftime("%A, %d %b %Y"))} &middot; {len(rows)} exception{"s" if len(rows) != 1 else ""}</div>'
+            f'<table style="border-collapse:collapse;"><tr>{th}</tr>{trs}</table>'
+            '<p style="color:#888;font-size:11.5px;margin-top:10px;">Late login = more than 5 minutes after the shift start. Limits: Tea + Lunch 1h, Other 30m, clocked 9h, production 7:30h. '
+            'Weekends, holidays and days excused by a Team Lead are not counted. Sent automatically by WorkFlow Hub.</p></div>')
+    return text, html
+
+
+def run_exception_digest(db: Session, day_: date = None, only_to: str = None) -> dict:
+    """Send yesterday's digest. only_to = send the full summary to just that address (test)."""
+    day_ = day_ or (datetime.now(IST).date() - timedelta(days=1))
+    cfg = _digest_settings(db)
+    colleagues = [u for u in db.query(models.User).filter(models.User.role == "colleague", models.User.employment_status != "Inactive").all()]
+    all_rows = _digest_rows(db, colleagues, day_)
+    res = {"date": day_.isoformat(), "exceptions": len(all_rows), "sent": 0, "failed": [], "skipped_no_email": []}
+    def send(to, title, rows, show_tl):
+        text, html = _digest_email(title, day_, rows, show_tl)
+        if email_utils.send_email(to, f"{title} - {day_.strftime('%d %b %Y')}", text, html):
+            res["sent"] += 1
+        else:
+            res["failed"].append(f"{to}: {email_utils.last_error}")
+    if only_to:
+        if all_rows:
+            send(only_to, "Break Tracker exceptions - all teams (test)", all_rows, True)
+        else:
+            res["note"] = "No exceptions yesterday, so no test mail was sent."
+        return res
+    tls = db.query(models.User).filter(models.User.role == "team_lead", models.User.employment_status != "Inactive").all()
+    for tl in tls:
+        rows = [r for r in all_rows if r["team_lead"] == tl.full_name]
+        if not rows:
+            continue
+        if not tl.email:
+            res["skipped_no_email"].append(tl.full_name); continue
+        send(tl.email, "Break Tracker exceptions - your team", rows, False)
+    if cfg["admins"] and all_rows:
+        for a in db.query(models.User).filter(models.User.role.in_(["admin", "manager", "super_admin"]), models.User.employment_status != "Inactive").all():
+            if a.email:
+                send(a.email, "Break Tracker exceptions - all teams", all_rows, True)
+    return res
+
+
+_JOBS_TOKEN = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+
+def _jobs_leader(db: Session) -> bool:
+    """With several server workers/processes, only ONE may run the timed jobs (backups, summary / reminder emails).
+    A heartbeat row in app_settings decides who the leader is; if the leader stops for 3 minutes another takes over."""
+    now = datetime.utcnow()
+    row = db.query(models.AppSetting).filter(models.AppSetting.key == "jobs_leader").first()
+    mine = f"{_JOBS_TOKEN}|{now.isoformat()}"
+    if row is None:
+        try:
+            db.add(models.AppSetting(key="jobs_leader", value=mine)); db.commit()
+            return True
+        except Exception:
+            db.rollback()
+            return False
+    old = row.value
+    try:
+        tok, ts = old.split("|", 1)
+        stale = (now - datetime.fromisoformat(ts)).total_seconds() > 180
+    except Exception:
+        tok, stale = "", True
+    if tok != _JOBS_TOKEN and not stale:
+        return False
+    n = db.query(models.AppSetting).filter(models.AppSetting.key == "jobs_leader", models.AppSetting.value == old).update({"value": mine})
+    db.commit()
+    return n == 1
+
+
+def _digest_loop():
+    import time as _t
+    while True:
+        _t.sleep(60)
+        db = SessionLocal()
+        try:
+            if not _jobs_leader(db):
+                continue
+            cfg = _digest_settings(db)
+            if not cfg["smtp_configured"]:
+                continue
+            now = datetime.now(IST)
+            if cfg["weekly_enabled"] and now.weekday() == 0:          # Monday: send last week's summary
+                try:
+                    wh, wm = (int(x) for x in cfg["weekly_time"].split(":"))
+                except ValueError:
+                    wh, wm = 9, 0
+                if (now.hour, now.minute) >= (wh, wm) and cfg["weekly_last"] != now.date().isoformat():
+                    _set_setting(db, WEEKLY_KEYS["last"], now.date().isoformat())
+                    db.commit()
+                    print(f"[weekly] {run_weekly_summary(db)}")
+            if not cfg["enabled"]:
+                continue
+            try:
+                hh, mm = (int(x) for x in cfg["time"].split(":"))
+            except ValueError:
+                hh, mm = 9, 0
+            if (now.hour, now.minute) >= (hh, mm) and cfg["last_sent"] != now.date().isoformat():
+                _set_setting(db, DIGEST_KEYS["last"], now.date().isoformat())     # mark first: never send twice
+                db.commit()
+                r = run_exception_digest(db)
+                print(f"[digest] {r}")
+        except Exception as e:
+            print("[digest] error:", e)
+        finally:
+            db.close()
+
+
+@app.get("/settings/digest")
+def get_digest_settings(current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    return _digest_settings(db)
+
+
+@app.put("/settings/digest")
+def set_digest_settings(payload: dict, current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    t = str(payload.get("time", "09:00"))
+    if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", t):
+        raise HTTPException(status_code=400, detail="Time must look like 09:00")
+    _set_setting(db, DIGEST_KEYS["enabled"], "1" if payload.get("enabled") else "0")
+    _set_setting(db, DIGEST_KEYS["time"], t)
+    _set_setting(db, DIGEST_KEYS["admins"], "1" if payload.get("admins", True) else "0")
+    wt = str(payload.get("weekly_time", "09:00"))
+    if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", wt):
+        raise HTTPException(status_code=400, detail="Weekly time must look like 09:00")
+    _set_setting(db, WEEKLY_KEYS["enabled"], "1" if payload.get("weekly_enabled") else "0")
+    _set_setting(db, WEEKLY_KEYS["time"], wt)
+    _audit(db, current_user, "Setting", "Changed email summary settings", details=f"Daily email {'on' if payload.get('enabled') else 'off'} at {t}; to Admins {'yes' if payload.get('admins', True) else 'no'}; weekly email {'on' if payload.get('weekly_enabled') else 'off'} at {wt}")
+    db.commit()
+    return _digest_settings(db)
+
+
+@app.post("/settings/digest/send")
+def send_digest_now(mode: str = "test", current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    """mode=test: yesterday's full summary to your own email. mode=now: the real digest to every Team Lead / Admin now."""
+    if not email_utils.is_configured():
+        raise HTTPException(status_code=400, detail=email_utils.last_error or "SMTP is not configured on the server (see the SMTP lines in run.bat).")
+    _audit(db, current_user, "Setting", "Sent email summary", details=f"mode={mode}")
+    db.commit()
+    if mode in ("weekly_test", "weekly_now"):
+        if mode == "weekly_test":
+            if not current_user.email:
+                raise HTTPException(status_code=400, detail="Add your email address in My Profile / your user record first.")
+            return run_weekly_summary(db, only_to=current_user.email)
+        return run_weekly_summary(db)
+    if mode == "test":
+        if not current_user.email:
+            raise HTTPException(status_code=400, detail="Add your email address in My Profile / your user record first.")
+        return run_exception_digest(db, only_to=current_user.email)
+    return run_exception_digest(db)
+
+
+ADJ_KINDS = ("late", "break", "hours")
+
+
+def _audit(db: Session, actor, category: str, action: str, target=None, ref_date=None, details: str = ""):
+    """Queue one audit row in the caller's transaction (it is saved by the caller's db.commit())."""
+    try:
+        db.add(models.AuditEvent(at=datetime.utcnow(), actor_id=getattr(actor, "id", None), actor_name=getattr(actor, "full_name", None) or "system",
+                                 actor_role=getattr(actor, "role", None), category=category, action=action,
+                                 target_user_id=getattr(target, "id", None), target_name=getattr(target, "full_name", None),
+                                 ref_date=str(ref_date) if ref_date else None, details=(details or "")[:600]))
+    except Exception as e:           # auditing must never break the action itself
+        print("[audit] could not queue:", e)
+
+
+def _order_diff_text(before: dict, order) -> str:
+    after = _order_snapshot(order)
+    parts = [f"{k}: {str(before.get(k))[:40]} -> {str(v)[:40]}" for k, v in after.items() if before.get(k) != v and k != "posted_date_text"]
+    return "; ".join(parts[:10]) + (f" (+{len(parts) - 10} more)" if len(parts) > 10 else "")
+
+
+def _audit_order(db: Session, actor, action: str, order, details: str = ""):
+    """One audit row for a Team Lead / Admin action on an order (shown against the colleague it was assigned to)."""
+    who = None
+    try:
+        who = order.assignee if order.assigned_to_id else None
+    except Exception:
+        who = None
+    _audit(db, actor, "Order", action, who, None, f"{order.edm or '#' + str(order.id)} ({order.process.name if order.process else ''}): {details}")
+
+
+def _may_adjust(db: Session, current_user: models.User, user_id: int):
+    u = db.query(models.User).filter(models.User.id == user_id, models.User.role == "colleague").first()
+    if not u:
+        raise HTTPException(status_code=404, detail="Colleague not found")
+    if current_user.role == "team_lead" and u.reporting_manager != current_user.full_name:
+        raise HTTPException(status_code=403, detail="That colleague is not in your team")
+    return u
+
+
+@app.post("/breaks/adjustments")
+def add_break_adjustment(
+    payload: schemas.AdjustmentIn,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Excuse flags of one day (late login / break limits / hour targets) and / or change one break's type. A note is required."""
+    u = _may_adjust(db, current_user, payload.user_id)
+    try:
+        day_ = date.fromisoformat(payload.date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date")
+    if day_ > datetime.now(IST).date():
+        raise HTTPException(status_code=400, detail="You cannot adjust a future date")
+    note = (payload.note or "").strip()
+    if len(note) < 3:
+        raise HTTPException(status_code=400, detail="Please write a short reason for the adjustment")
+    excused = [x for x in dict.fromkeys(payload.excused or []) if x]
+    if any(x not in ADJ_KINDS for x in excused):
+        raise HTTPException(status_code=400, detail="Unknown item to excuse")
+    old_type = None
+    if payload.break_id or payload.new_type:
+        if payload.new_type not in BREAK_TYPES:
+            raise HTTPException(status_code=400, detail="Pick a break type: " + ", ".join(BREAK_TYPES))
+        b = db.query(models.BreakLog).filter(models.BreakLog.id == payload.break_id, models.BreakLog.user_id == u.id).first() if payload.break_id else None
+        if not b or _ist_dt(b.started_at).date() != day_:
+            raise HTTPException(status_code=400, detail="That break does not belong to this colleague and day")
+        old_type = b.break_type
+        for a in db.query(models.BreakAdjustment).filter(models.BreakAdjustment.break_id == b.id, models.BreakAdjustment.new_type.isnot(None)).order_by(models.BreakAdjustment.id).all():
+            old_type = a.new_type
+        if old_type == payload.new_type:
+            raise HTTPException(status_code=400, detail="The break already has that type")
+    elif not excused:
+        raise HTTPException(status_code=400, detail="Choose what to excuse or which break to change")
+    row = models.BreakAdjustment(user_id=u.id, adj_date=day_, excused=",".join(excused) or None, break_id=payload.break_id if payload.new_type else None,
+                                 old_type=old_type, new_type=payload.new_type if payload.break_id else None, note=note[:300],
+                                 created_by_name=current_user.full_name, created_at=datetime.utcnow())
+    db.add(row)
+    bits = []
+    if excused:
+        bits.append("Excused: " + ", ".join(excused))
+    if payload.new_type:
+        bits.append(f"Break {old_type} -> {payload.new_type}")
+    _audit(db, current_user, "Adjustment", "Added adjustment", u, day_, "; ".join(bits) + " | Reason: " + note[:300])
+    db.commit()
+    return {"id": row.id}
+
+
+@app.get("/breaks/adjustments")
+def list_break_adjustments(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    today = datetime.now(IST).date()
+    try:
+        d1 = date.fromisoformat(date_from) if date_from else today.replace(day=1)
+        d2 = date.fromisoformat(date_to) if date_to else today
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date")
+    q = db.query(models.BreakAdjustment).filter(models.BreakAdjustment.adj_date >= d1, models.BreakAdjustment.adj_date <= d2)
+    ids = _scope_ids(db, current_user)
+    if ids is not None:
+        q = q.filter(models.BreakAdjustment.user_id.in_(ids or [-1]))
+    return [{"id": a.id, "user_id": a.user_id, "employee": a.user.full_name if a.user else "", "date": a.adj_date.isoformat(),
+             "excused": [x for x in (a.excused or "").split(",") if x], "break_id": a.break_id, "old_type": a.old_type or "", "new_type": a.new_type or "",
+             "note": a.note, "by": a.created_by_name or "", "at": a.created_at.isoformat() + "Z" if a.created_at else None}
+            for a in q.order_by(models.BreakAdjustment.adj_date.desc(), models.BreakAdjustment.id.desc()).all()]
+
+
+@app.delete("/breaks/adjustments/{adj_id}")
+def delete_break_adjustment(
+    adj_id: int,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    a = db.query(models.BreakAdjustment).filter(models.BreakAdjustment.id == adj_id).first()
+    if not a:
+        raise HTTPException(status_code=404, detail="Adjustment not found")
+    tu = _may_adjust(db, current_user, a.user_id)
+    _audit(db, current_user, "Adjustment", "Removed adjustment", tu, a.adj_date, ((("Excused: " + a.excused + "; ") if a.excused else "") + (f"Break {a.old_type} -> {a.new_type}; " if a.new_type else "") + "Reason was: " + (a.note or "")))
+    db.delete(a)
+    db.commit()
+    return {"ok": True}
+
+
+def _reason_cat(c: str) -> str:
+    c = (c or "").strip().lower()
+    if not c:
+        return "none"
+    if c.startswith("medical"):
+        return "medical"
+    if c.startswith("personal"):
+        return "personal"
+    return "other"
+
+
+def _period_range(period: str):
+    today = datetime.now(IST).date()
+    if period == "week":
+        return today - timedelta(days=today.weekday()), today, "This week"
+    if period == "last_month":
+        last = today.replace(day=1) - timedelta(days=1)
+        return last.replace(day=1), last, last.strftime("%B %Y")
+    return today.replace(day=1), today, today.strftime("%B %Y") + " (so far)"
+
+
+@app.get("/breaks/heatmap")
+def break_heatmap(
+    period: str = "month",
+    shift: Optional[str] = None,
+    team_lead: Optional[str] = None,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    When are people away at the same time? For every weekday x hour (IST): the average number of colleagues away
+    and the highest number away at once, built from the start and end time of every break. Night breaks that run past midnight are split by day.
+    """
+    if period not in ("week", "month", "last_month"):
+        raise HTTPException(status_code=400, detail="period must be week, month or last_month")
+    d1, d2, label = _period_range(period)
+    users = [u for u in _batch_visible_colleagues(db, current_user) if u.employment_status != "Inactive"]
+    shifts = sorted({((u.shift or "").split(" (")[0].strip() or "(No shift)") for u in users})
+    tls = sorted({u.reporting_manager for u in users if u.reporting_manager}) if current_user.role != "team_lead" else []
+    if shift:
+        users = [u for u in users if ((u.shift or "").split(" (")[0].strip() or "(No shift)") == shift]
+    if team_lead:
+        users = [u for u in users if (u.reporting_manager or "") == team_lead]
+    ids = [u.id for u in users]
+    lo, hi = _ist_bounds(d1, d2)
+    diffs, active = {}, set()
+    if ids:
+        for sl in db.query(models.SessionLog.login_at).filter(models.SessionLog.user_id.in_(ids), models.SessionLog.login_at >= lo, models.SessionLog.login_at < hi).all():
+            active.add(_ist_dt(sl[0]).date())
+        for b in db.query(models.BreakLog).filter(models.BreakLog.user_id.in_(ids), models.BreakLog.started_at >= lo, models.BreakLog.started_at < hi).all():
+            st, en = _ist_dt(b.started_at).replace(tzinfo=None), _ist_dt(b.ended_at).replace(tzinfo=None)
+            if en <= st:
+                continue
+            cur = st
+            while cur < en:
+                day_end = datetime(cur.year, cur.month, cur.day) + timedelta(days=1)
+                seg_end = min(en, day_end)
+                a_min = cur.hour * 60 + cur.minute
+                b_min = a_min + max(1, int(round((seg_end - cur).total_seconds() / 60)))
+                dd = diffs.setdefault(cur.date(), [0] * 1442)
+                dd[a_min] += 1
+                dd[min(b_min, 1440)] -= 1
+                active.add(cur.date())
+                cur = seg_end
+    # per date: minute-by-minute people away -> hourly average and hourly peak
+    avg_sum = [[0.0] * 24 for _ in range(7)]
+    peak = [[0] * 24 for _ in range(7)]
+    peak_on = [[None] * 24 for _ in range(7)]
+    n_days = [0] * 7
+    for d in sorted(x for x in active if d1 <= x <= d2):
+        wd = d.weekday()
+        n_days[wd] += 1
+        arr = diffs.get(d)
+        if not arr:
+            continue
+        run, mins = 0, []
+        for m in range(1440):
+            run += arr[m]
+            mins.append(run)
+        for h in range(24):
+            seg = mins[h * 60:(h + 1) * 60]
+            avg_sum[wd][h] += sum(seg) / 60.0
+            mx = max(seg)
+            if mx > peak[wd][h]:
+                peak[wd][h] = mx
+                peak_on[wd][h] = d.isoformat()
+    grid = []
+    for wd in range(7):
+        row = []
+        for h in range(24):
+            row.append({"avg": round(avg_sum[wd][h] / n_days[wd], 2) if n_days[wd] else None, "peak": peak[wd][h], "peak_on": peak_on[wd][h]})
+        grid.append(row)
+    allrow = []
+    tot_days = sum(n_days)
+    for h in range(24):
+        pk = max(peak[w][h] for w in range(7))
+        allrow.append({"avg": round(sum(avg_sum[w][h] for w in range(7)) / tot_days, 2) if tot_days else None, "peak": pk})
+    cells = [(grid[w][h]["avg"] or 0, grid[w][h]["peak"], w, h) for w in range(7) for h in range(24) if grid[w][h]["avg"]]
+    top = [{"weekday": w, "hour": h, "avg": a_, "peak": p_, "peak_on": grid[w][h]["peak_on"]} for a_, p_, w, h in sorted(cells, reverse=True)[:5]]
+    return {"label": label, "from": d1.isoformat(), "to": d2.isoformat(), "colleagues": len(ids), "days_counted": n_days, "grid": grid, "all": allrow, "top": top,
+            "shifts": shifts, "team_leads": tls}
+
+
+@app.get("/breaks/insights")
+def break_insights(
+    period: str = "month",
+    min_days: int = 3,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    Repeat offenders (min_days or more exception days in the period) and, for Admin / Super Admin,
+    a Team Lead scorecard: share of colleagues with no exception day. Excused days do not count.
+    """
+    if period not in ("week", "month", "last_month"):
+        raise HTTPException(status_code=400, detail="period must be week, month or last_month")
+    min_days = max(1, min(min_days, 31))
+    d1, d2, label = _period_range(period)
+    today = datetime.now(IST).date()
+    users = [u for u in _batch_visible_colleagues(db, current_user) if u.employment_status != "Inactive"]
+    ids = [u.id for u in users]
+    days = _collect_days(db, ids, d1, d2)
+    hol = _hol_set(db, d1, d2)
+    per = {u.id: {"u": u, "measured": 0, "exc": 0, "late": [], "brk": [], "hrs": [], "clk": 0.0, "prod": 0.0, "done": 0, "dates": [], "bmin": 0.0, "bdays": 0, "short": 0} for u in users}
+    for (uid, d), v in sorted(days.items(), key=lambda x: x[0][1]):
+        r = per.get(uid)
+        if not r or v["first_login"] is None:
+            continue
+        r["measured"] += 1
+        off = _is_off_day(d, hol)
+        flags, late = _day_flags(v, r["u"].shift, d, off, today)
+        if "Late login" in flags:
+            r["late"].append(d.isoformat())
+        if any(x in flags for x in ("Tea + Lunch over 1h", "Other break over 30m", "Single break over 2h")):
+            r["brk"].append(d.isoformat())
+        if any(x in flags for x in ("Clocked under 9h", "Production under 7:30h", "No logout recorded", "Left early")):
+            r["hrs"].append(d.isoformat())
+        if flags:
+            r["exc"] += 1
+            r["dates"].append(d.isoformat())
+        if not off and not v.get("leave") and not (d >= today and v["live"]):
+            r["done"] += 1; r["clk"] += v["clocked"]; r["prod"] += v["production"]
+            r["bmin"] += v["brk_total"]; r["bdays"] += 1
+            if "Clocked under 9h" in flags or "Production under 7:30h" in flags or "Left early" in flags:
+                r["short"] += 1
+    # Shift comparison (Day / Mid / Night ...): same numbers grouped by the shift name.
+    sg = {}
+    for r in per.values():
+        nm = ((r["u"].shift or "").split(" (")[0].strip()) or "(No shift)"
+        g = sg.setdefault(nm, {"shift": nm, "colleagues": 0, "measured": 0, "compliant": 0, "exc": 0, "late": 0, "brk": 0, "short": 0, "clk": 0.0, "prod": 0.0, "done": 0, "bmin": 0.0, "bdays": 0})
+        g["colleagues"] += 1
+        if r["measured"]:
+            g["measured"] += 1
+            g["compliant"] += 1 if r["exc"] == 0 else 0
+        g["exc"] += r["exc"]; g["late"] += len(r["late"]); g["brk"] += len(r["brk"]); g["short"] += r["short"]
+        g["clk"] += r["clk"]; g["prod"] += r["prod"]; g["done"] += r["done"]; g["bmin"] += r["bmin"]; g["bdays"] += r["bdays"]
+    shifts = [{"shift": g["shift"], "colleagues": g["colleagues"], "measured": g["measured"],
+               "compliance_pct": round(100 * g["compliant"] / g["measured"]) if g["measured"] else None,
+               "exception_days": g["exc"], "late_days": g["late"], "break_days": g["brk"], "short_days": g["short"],
+               "avg_break": round(g["bmin"] / g["bdays"], 1) if g["bdays"] else 0,
+               "avg_clocked": round(g["clk"] / g["done"], 1) if g["done"] else 0,
+               "avg_production": round(g["prod"] / g["done"], 1) if g["done"] else 0} for g in sg.values()]
+    shifts.sort(key=lambda x: x["shift"])
+    offenders = []
+    for r in per.values():
+        if r["exc"] >= min_days:
+            offenders.append({"user_id": r["u"].id, "employee": r["u"].full_name, "team_lead": r["u"].reporting_manager or "", "shift": r["u"].shift or "",
+                              "exception_days": r["exc"], "late_days": len(r["late"]), "break_days": len(r["brk"]), "hours_days": len(r["hrs"]),
+                              "late_dates": r["late"], "break_dates": r["brk"], "hours_dates": r["hrs"], "worked_days": r["measured"]})
+    offenders.sort(key=lambda x: (-x["exception_days"], x["employee"]))
+    # Reasons given on the lock screen, per person (and per Team Lead for Admin / Super Admin).
+    rp = {}
+    for (uid, d), v in days.items():
+        u = next((x for x in users if x.id == uid), None) if False else per.get(uid, {}).get("u")
+        if not u or not v["bk"]:
+            continue
+        e = rp.setdefault(uid, {"user_id": uid, "employee": u.full_name, "team_lead": u.reporting_manager or "", "breaks": 0, "medical": 0, "personal": 0, "other": 0, "none": 0})
+        for c in v["bk"]:
+            e["breaks"] += 1
+            e[_reason_cat(c)] += 1
+    reasons = sorted(rp.values(), key=lambda e: (-(e["medical"] + e["personal"] + e["other"]), e["employee"]))
+    rteams = []
+    if current_user.role in ("admin", "manager", "super_admin"):
+        g = {}
+        for e in reasons:
+            t = g.setdefault(e["team_lead"] or "(No Team Lead)", {"team_lead": e["team_lead"] or "(No Team Lead)", "breaks": 0, "medical": 0, "personal": 0, "other": 0, "none": 0})
+            for k in ("breaks", "medical", "personal", "other", "none"):
+                t[k] += e[k]
+        rteams = sorted(g.values(), key=lambda t: t["team_lead"])
+    rtotal = {k: sum(e[k] for e in reasons) for k in ("breaks", "medical", "personal", "other", "none")}
+    score = []
+    if current_user.role in ("admin", "manager", "super_admin"):
+        grp = {}
+        for r in per.values():
+            g = grp.setdefault(r["u"].reporting_manager or "(No Team Lead)", {"team_lead": r["u"].reporting_manager or "(No Team Lead)", "colleagues": 0, "measured": 0, "compliant": 0,
+                                                                              "exception_days": 0, "late": 0, "brk": 0, "hrs": 0, "clk": 0.0, "prod": 0.0, "done": 0})
+            g["colleagues"] += 1
+            if r["measured"]:
+                g["measured"] += 1
+                g["compliant"] += 1 if r["exc"] == 0 else 0
+            g["exception_days"] += r["exc"]; g["late"] += len(r["late"]); g["brk"] += len(r["brk"]); g["hrs"] += len(r["hrs"])
+            g["clk"] += r["clk"]; g["prod"] += r["prod"]; g["done"] += r["done"]
+        for g in grp.values():
+            score.append({"team_lead": g["team_lead"], "colleagues": g["colleagues"], "measured": g["measured"], "compliant": g["compliant"],
+                          "compliance_pct": round(100 * g["compliant"] / g["measured"]) if g["measured"] else None,
+                          "exception_days": g["exception_days"], "late_days": g["late"], "break_days": g["brk"], "hours_days": g["hrs"],
+                          "avg_clocked": round(g["clk"] / g["done"], 1) if g["done"] else 0, "avg_production": round(g["prod"] / g["done"], 1) if g["done"] else 0})
+        score.sort(key=lambda x: (-(x["compliance_pct"] if x["compliance_pct"] is not None else -1), x["team_lead"]))
+    return {"period": period, "label": label, "from": d1.isoformat(), "to": d2.isoformat(), "min_days": min_days, "offenders": offenders, "scorecard": score, "shifts": shifts,
+            "reasons": {"total": rtotal, "people": reasons, "teams": rteams}}
+
+
+LEAVE_KINDS = ("Leave", "Sick", "Training", "Other")
+
+
+@app.post("/breaks/leave")
+def mark_leave(
+    payload: schemas.LeaveIn,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Mark a day (or a range, up to 31 days) as Leave / Sick / Training / Other for a colleague. Re-marking a day just changes its kind."""
+    u = _may_adjust(db, current_user, payload.user_id)
+    if payload.kind not in LEAVE_KINDS:
+        raise HTTPException(status_code=400, detail="Kind must be one of: " + ", ".join(LEAVE_KINDS))
+    try:
+        d1 = date.fromisoformat(payload.date_from)
+        d2 = date.fromisoformat(payload.date_to) if payload.date_to else d1
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date")
+    if d2 < d1 or (d2 - d1).days > 30:
+        raise HTTPException(status_code=400, detail="Choose a range of 31 days or less")
+    today = datetime.now(IST).date()
+    if d1 < today - timedelta(days=100) or d2 > today + timedelta(days=100):
+        raise HTTPException(status_code=400, detail="Dates must be within 100 days of today")
+    n = 0
+    d = d1
+    while d <= d2:
+        row = db.query(models.LeaveDay).filter(models.LeaveDay.user_id == u.id, models.LeaveDay.leave_date == d).first()
+        note = (payload.note or "").strip()[:200] or None
+        if row:
+            row.kind, row.note, row.created_by_name, row.created_at = payload.kind, note, current_user.full_name, datetime.utcnow()
+        else:
+            db.add(models.LeaveDay(user_id=u.id, leave_date=d, kind=payload.kind, note=note, created_by_name=current_user.full_name, created_at=datetime.utcnow()))
+        n += 1
+        d += timedelta(days=1)
+    _audit(db, current_user, "Leave", "Marked leave", u, d1 if d1 == d2 else f"{d1} to {d2}", f"{payload.kind}, {n} day(s)" + (f" | {(payload.note or '').strip()[:200]}" if (payload.note or "").strip() else ""))
+    db.commit()
+    return {"days": n}
+
+
+@app.get("/breaks/leave")
+def list_leave(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    today = datetime.now(IST).date()
+    try:
+        d1 = date.fromisoformat(date_from) if date_from else today.replace(day=1)
+        d2 = date.fromisoformat(date_to) if date_to else today
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date")
+    q = db.query(models.LeaveDay).filter(models.LeaveDay.leave_date >= d1, models.LeaveDay.leave_date <= d2)
+    ids = _scope_ids(db, current_user)
+    if ids is not None:
+        q = q.filter(models.LeaveDay.user_id.in_(ids or [-1]))
+    return [{"id": x.id, "user_id": x.user_id, "employee": x.user.full_name if x.user else "", "date": x.leave_date.isoformat(), "kind": x.kind,
+             "note": x.note or "", "by": x.created_by_name or ""} for x in q.order_by(models.LeaveDay.leave_date, models.LeaveDay.id).all()]
+
+
+@app.delete("/breaks/leave/{leave_id}")
+def delete_leave(
+    leave_id: int,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    x = db.query(models.LeaveDay).filter(models.LeaveDay.id == leave_id).first()
+    if not x:
+        raise HTTPException(status_code=404, detail="Not found")
+    tu = _may_adjust(db, current_user, x.user_id)
+    _audit(db, current_user, "Leave", "Removed leave", tu, x.leave_date, x.kind)
+    db.delete(x)
+    db.commit()
+    return {"ok": True}
+
+
+# ---------------- Approved break requests ----------------
+@app.post("/breaks/requests")
+def create_break_request(
+    payload: schemas.BreakRequestIn,
+    current_user: models.User = Depends(auth.require_role("colleague")),
+    db: Session = Depends(get_db),
+):
+    today = datetime.now(IST).date()
+    try:
+        d = date.fromisoformat(payload.req_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date")
+    if d < today or d > today + timedelta(days=30):
+        raise HTTPException(status_code=400, detail="Choose today or a day within the next 30 days")
+    if payload.extra_minutes < 5 or payload.extra_minutes > 480:
+        raise HTTPException(status_code=400, detail="Extra time must be between 5 and 480 minutes")
+    reason = (payload.reason or "").strip()
+    if len(reason) < 3:
+        raise HTTPException(status_code=400, detail="Please give a reason")
+    if db.query(models.BreakRequest).filter(models.BreakRequest.user_id == current_user.id, models.BreakRequest.req_date == d,
+                                            models.BreakRequest.status.in_(["Pending", "Approved"])).first():
+        raise HTTPException(status_code=400, detail="You already have a pending or approved request for that day")
+    db.add(models.BreakRequest(user_id=current_user.id, req_date=d, extra_minutes=payload.extra_minutes, reason=reason[:300], status="Pending", created_at=datetime.utcnow()))
+    db.commit()
+    return {"ok": True}
+
+
+def _req_out(x):
+    return {"id": x.id, "user_id": x.user_id, "employee": x.user.full_name if x.user else "", "team_lead": (x.user.reporting_manager if x.user else "") or "",
+            "date": x.req_date.isoformat(), "extra_minutes": x.extra_minutes, "reason": x.reason, "status": x.status, "decided_by": x.decided_by_name or "",
+            "note": x.decision_note or "", "created_at": x.created_at.isoformat() + "Z" if x.created_at else ""}
+
+
+@app.get("/breaks/requests")
+def list_break_requests(
+    status: str = "all",
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Colleague: own requests. Team Lead: own team. Admin / Manager / Super Admin: everyone. status = pending | all."""
+    today = datetime.now(IST).date()
+    q = db.query(models.BreakRequest)
+    if current_user.role == "colleague":
+        q = q.filter(models.BreakRequest.user_id == current_user.id)
+    else:
+        ids = [u.id for u in _batch_visible_colleagues(db, current_user)]
+        q = q.filter(models.BreakRequest.user_id.in_(ids or [-1]))
+    if status == "pending":
+        q = q.filter(models.BreakRequest.status == "Pending")
+    else:
+        q = q.filter(models.BreakRequest.req_date >= today - timedelta(days=45))
+    return [_req_out(x) for x in q.order_by(models.BreakRequest.req_date.desc(), models.BreakRequest.id.desc()).limit(300).all()]
+
+
+@app.post("/breaks/requests/{req_id}/decide")
+def decide_break_request(
+    req_id: int,
+    payload: schemas.BreakRequestDecision,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    x = db.query(models.BreakRequest).filter(models.BreakRequest.id == req_id).first()
+    if not x:
+        raise HTTPException(status_code=404, detail="Request not found")
+    _may_adjust(db, current_user, x.user_id)
+    if x.status != "Pending":
+        raise HTTPException(status_code=400, detail="This request was already " + x.status.lower())
+    note = (payload.note or "").strip()
+    if not payload.approve and not note:
+        raise HTTPException(status_code=400, detail="Please give a reason for rejecting")
+    x.status = "Approved" if payload.approve else "Rejected"
+    x.decided_by_name, x.decision_note, x.decided_at = current_user.full_name, note[:300] or None, datetime.utcnow()
+    _audit(db, current_user, "Break request", "Approved break request" if payload.approve else "Rejected break request", x.user, x.req_date,
+           f"+{x.extra_minutes} min | Asked: {x.reason}" + (f" | Note: {note[:200]}" if note else ""))
+    db.commit()
+    return _req_out(x)
+
+
+@app.delete("/breaks/requests/{req_id}")
+def cancel_break_request(
+    req_id: int,
+    current_user: models.User = Depends(auth.require_role("colleague")),
+    db: Session = Depends(get_db),
+):
+    x = db.query(models.BreakRequest).filter(models.BreakRequest.id == req_id, models.BreakRequest.user_id == current_user.id).first()
+    if not x:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if x.status != "Pending":
+        raise HTTPException(status_code=400, detail="Only a pending request can be cancelled")
+    x.status = "Cancelled"
+    db.commit()
+    return {"ok": True}
+
+
+# ---------------- Weekly aggregates: trend lines + weekly email ----------------
+def _week_aggregate(db: Session, users: list, d1: date, d2: date):
+    """Per week (Monday start): person-days, exception days, late / break / short-hours days, average break, clocked and production time. Also per-person counts."""
+    today = datetime.now(IST).date()
+    by = {u.id: u for u in users}
+    days = _collect_days(db, list(by), d1, d2)
+    hol = _hol_set(db, d1, d2)
+    weeks, per = {}, {}
+    for (uid, d), v in days.items():
+        u = by.get(uid)
+        if not u or v["first_login"] is None:
+            continue
+        ws = d - timedelta(days=d.weekday())
+        w = weeks.setdefault(ws, {"days": 0, "exc": 0, "late": 0, "brk": 0, "short": 0, "done": 0, "clk": 0.0, "prod": 0.0, "bmin": 0.0})
+        off = _is_off_day(d, hol)
+        flags, late = _day_flags(v, u.shift, d, off, today)
+        p = per.setdefault((ws, uid), {"name": u.full_name, "team_lead": u.reporting_manager or "", "exc": 0, "late": 0, "brk": 0, "hrs": 0})
+        w["days"] += 1
+        if "Late login" in flags:
+            w["late"] += 1; p["late"] += 1
+        if any(x in flags for x in ("Tea + Lunch over 1h", "Other break over 30m", "Single break over 2h")):
+            w["brk"] += 1; p["brk"] += 1
+        if any(x in flags for x in ("Clocked under 9h", "Production under 7:30h", "Left early")):
+            w["short"] += 1; p["hrs"] += 1
+        if flags:
+            w["exc"] += 1; p["exc"] += 1
+        if not off and not v.get("leave") and not (d >= today and v["live"]):
+            w["done"] += 1; w["clk"] += v["clocked"]; w["prod"] += v["production"]; w["bmin"] += v["brk_total"]
+    return weeks, per
+
+
+def _week_row(ws: date, w: dict, today: date) -> dict:
+    w = w or {"days": 0, "exc": 0, "late": 0, "brk": 0, "short": 0, "done": 0, "clk": 0.0, "prod": 0.0, "bmin": 0.0}
+    return {"week_start": ws.isoformat(), "label": ws.strftime("%d %b"), "partial": ws + timedelta(days=6) >= today, "person_days": w["days"], "exception_days": w["exc"],
+            "compliance_pct": round(100 * (w["days"] - w["exc"]) / w["days"]) if w["days"] else None, "late_days": w["late"], "break_days": w["brk"], "short_days": w["short"],
+            "avg_break": round(w["bmin"] / w["done"], 1) if w["done"] else None, "avg_clocked": round(w["clk"] / w["done"], 1) if w["done"] else None,
+            "avg_production": round(w["prod"] / w["done"], 1) if w["done"] else None}
+
+
+@app.get("/breaks/trends")
+def break_trends(
+    weeks: int = 8,
+    user_id: Optional[int] = None,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Week-by-week trend (Monday weeks, newest last) for everyone the caller can see, or for one colleague."""
+    weeks = max(4, min(weeks, 26))
+    today = datetime.now(IST).date()
+    users = [u for u in _batch_visible_colleagues(db, current_user) if u.employment_status != "Inactive"]
+    people = sorted(({"id": u.id, "name": u.full_name} for u in users), key=lambda x: x["name"])
+    if user_id is not None:
+        users = [u for u in users if u.id == user_id]
+        if not users:
+            raise HTTPException(status_code=404, detail="Colleague not found")
+    cur = today - timedelta(days=today.weekday())
+    start = cur - timedelta(days=7 * (weeks - 1))
+    agg, _per = _week_aggregate(db, users, start, today)
+    rows = [_week_row(start + timedelta(days=7 * i), agg.get(start + timedelta(days=7 * i)), today) for i in range(weeks)]
+    return {"weeks": rows, "people": people, "scope": users[0].full_name if user_id is not None else "All colleagues you can see", "colleagues": len(users)}
+
+
+WEEKLY_KEYS = {"enabled": "weekly_enabled", "time": "weekly_time", "last": "weekly_last_sent"}
+
+
+def _weekly_email(title: str, ws: date, cur: dict, prev: dict, offenders: list, tl_rows: list):
+    import html as _h
+    we = ws + timedelta(days=6)
+    rng = f"{ws.strftime('%d %b')} - {we.strftime('%d %b %Y')}"
+    def delta(a, b, good_up):
+        if a is None or b is None:
+            return ""
+        d_ = a - b
+        if d_ == 0:
+            return " (same)"
+        return f" ({'+' if d_ > 0 else ''}{d_:g} vs last week)"
+    items = [("Compliance (days without an exception)", f"{cur['compliance_pct']}%" if cur["compliance_pct"] is not None else "-", delta(cur["compliance_pct"], prev["compliance_pct"], True)),
+             ("Exception days", str(cur["exception_days"]) + f" of {cur['person_days']}", delta(cur["exception_days"], prev["exception_days"], False)),
+             ("Late logins", str(cur["late_days"]), delta(cur["late_days"], prev["late_days"], False)),
+             ("Break-limit days", str(cur["break_days"]), delta(cur["break_days"], prev["break_days"], False)),
+             ("Short-hours / left-early days", str(cur["short_days"]), delta(cur["short_days"], prev["short_days"], False)),
+             ("Average break per day", _fmt_m(int(cur["avg_break"] or 0)), ""),
+             ("Average clocked per day", _fmt_m(int(cur["avg_clocked"] or 0)), ""),
+             ("Average production per day", _fmt_m(int(cur["avg_production"] or 0)), "")]
+    text = f"{title}\nWeek: {rng}\n\n" + "\n".join(f"{a}: {b}{c}" for a, b, c in items)
+    if offenders:
+        text += "\n\nMost exception days:\n" + "\n".join(f"- {o['name']}: {o['exc']} (late {o['late']}, breaks {o['brk']}, hours {o['hrs']})" for o in offenders)
+    if tl_rows:
+        text += "\n\nBy Team Lead:\n" + "\n".join(f"- {t['team_lead']}: {t['compliance']}% ({t['exc']} exception days of {t['days']})" for t in tl_rows)
+    td = 'style="padding:5px 8px;border-bottom:1px solid #e3e7ef;font-size:12.5px;"'
+    th = lambda x: f'<th style="background:#0b2545;color:#fff;padding:6px 8px;text-align:left;font-size:12px;">{_h.escape(x)}</th>'
+    html = f'<div style="font-family:Segoe UI,Arial,sans-serif;color:#222;"><h3 style="color:#0b2545;margin:0 0 4px;">{_h.escape(title)}</h3><div style="color:#666;font-size:13px;margin-bottom:10px;">Week {_h.escape(rng)}</div>'
+    html += "<table style='border-collapse:collapse;'>" + "".join(f"<tr><td {td}>{_h.escape(a)}</td><td {td}><b>{_h.escape(b)}</b>{_h.escape(c)}</td></tr>" for a, b, c in items) + "</table>"
+    if offenders:
+        html += '<h4 style="color:#0b2545;margin:14px 0 4px;">Most exception days</h4><table style="border-collapse:collapse;"><tr>' + "".join(th(x) for x in ("Employee", "Exception days", "Late", "Breaks", "Hours")) + "</tr>" + \
+                "".join(f"<tr><td {td}>{_h.escape(o['name'])}</td><td {td}>{o['exc']}</td><td {td}>{o['late']}</td><td {td}>{o['brk']}</td><td {td}>{o['hrs']}</td></tr>" for o in offenders) + "</table>"
+    if tl_rows:
+        html += '<h4 style="color:#0b2545;margin:14px 0 4px;">By Team Lead</h4><table style="border-collapse:collapse;"><tr>' + "".join(th(x) for x in ("Team Lead", "Compliance", "Exception days", "Person-days")) + "</tr>" + \
+                "".join(f"<tr><td {td}>{_h.escape(t['team_lead'])}</td><td {td}>{t['compliance']}%</td><td {td}>{t['exc']}</td><td {td}>{t['days']}</td></tr>" for t in tl_rows) + "</table>"
+    html += '<p style="color:#888;font-size:11.5px;margin-top:10px;">Weeks run Monday to Sunday. Weekends, holidays, leave and days excused by a Team Lead are not counted against anyone. Sent automatically by WorkFlow Hub.</p></div>'
+    return text, html
+
+
+def run_weekly_summary(db: Session, week_start: date = None, only_to: str = None) -> dict:
+    today = datetime.now(IST).date()
+    ws = week_start or (today - timedelta(days=today.weekday()) - timedelta(days=7))
+    pws = ws - timedelta(days=7)
+    colleagues = db.query(models.User).filter(models.User.role == "colleague", models.User.employment_status != "Inactive").all()
+    res = {"week": ws.isoformat(), "sent": 0, "failed": [], "skipped_no_email": [], "note": ""}
+    def build(users, with_tl):
+        agg, per = _week_aggregate(db, users, pws, ws + timedelta(days=6))
+        cur, prev = _week_row(ws, agg.get(ws), today), _week_row(pws, agg.get(pws), today)
+        offs = sorted((p for (w_, _u), p in per.items() if w_ == ws and p["exc"] > 0), key=lambda p: (-p["exc"], p["name"]))[:5]
+        tls = []
+        if with_tl:
+            by_tl = {}
+            for u in users:
+                by_tl.setdefault(u.reporting_manager or "(No Team Lead)", []).append(u)
+            for tl_name, us in sorted(by_tl.items()):
+                a2, _p2 = _week_aggregate(db, us, ws, ws + timedelta(days=6))
+                r2 = _week_row(ws, a2.get(ws), today)
+                if r2["person_days"]:
+                    tls.append({"team_lead": tl_name, "compliance": r2["compliance_pct"], "exc": r2["exception_days"], "days": r2["person_days"]})
+        return cur, prev, offs, tls
+    def send(to, title, users, with_tl):
+        cur, prev, offs, tls = build(users, with_tl)
+        if not cur["person_days"]:
+            return False
+        text, html = _weekly_email(title, ws, cur, prev, offs, tls)
+        if email_utils.send_email(to, f"{title} - week of {ws.strftime('%d %b %Y')}", text, html):
+            res["sent"] += 1
+        else:
+            res["failed"].append(f"{to}: {email_utils.last_error}")
+        return True
+    if only_to:
+        if not send(only_to, "Weekly break and attendance summary - all teams (test)", colleagues, True):
+            res["note"] = "No attendance data for last week, so no test mail was sent."
+        return res
+    for tl in db.query(models.User).filter(models.User.role == "team_lead", models.User.employment_status != "Inactive").all():
+        team = [u for u in colleagues if u.reporting_manager == tl.full_name]
+        if not team:
+            continue
+        if not tl.email:
+            res["skipped_no_email"].append(tl.full_name); continue
+        send(tl.email, "Weekly break and attendance summary - your team", team, False)
+    if _setting(db, DIGEST_KEYS["admins"], "1") == "1":
+        for a in db.query(models.User).filter(models.User.role.in_(["admin", "manager", "super_admin"]), models.User.employment_status != "Inactive").all():
+            if a.email:
+                send(a.email, "Weekly break and attendance summary - all teams", colleagues, True)
+    return res
+
+
+@app.post("/breaks/shift-change")
+def mark_shift_change(
+    payload: schemas.ShiftChangeIn,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Give a colleague a temporary shift for a date range; late-login and left-early checks use it on those days."""
+    u = _may_adjust(db, current_user, payload.user_id)
+    shift = (payload.shift or "").strip()
+    if _shift_start_minutes(shift) is None or len(shift) > 80:
+        raise HTTPException(status_code=400, detail="Pick a shift such as: Day Shift (09:00 AM - 06:00 PM)")
+    try:
+        d1 = date.fromisoformat(payload.date_from)
+        d2 = date.fromisoformat(payload.date_to) if payload.date_to else d1
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date")
+    today = datetime.now(IST).date()
+    if d2 < d1 or (d2 - d1).days > 92:
+        raise HTTPException(status_code=400, detail="Choose a range of 93 days or less")
+    if d1 < today - timedelta(days=100) or d2 > today + timedelta(days=200):
+        raise HTTPException(status_code=400, detail="Dates are too far from today")
+    # a new range replaces anything it overlaps for this colleague
+    for old in db.query(models.ShiftChange).filter(models.ShiftChange.user_id == u.id, models.ShiftChange.date_from <= d2, models.ShiftChange.date_to >= d1).all():
+        db.delete(old)
+    db.add(models.ShiftChange(user_id=u.id, date_from=d1, date_to=d2, shift=shift, note=(payload.note or "").strip()[:200] or None,
+                              created_by_name=current_user.full_name, created_at=datetime.utcnow()))
+    _audit(db, current_user, "Shift change", "Set temporary shift", u, d1 if d1 == d2 else f"{d1} to {d2}", f"{shift} (profile shift: {u.shift or 'not set'})" + (f" | {(payload.note or '').strip()[:200]}" if (payload.note or "").strip() else ""))
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/breaks/shift-change")
+def list_shift_changes(
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    today = datetime.now(IST).date()
+    ids = [u.id for u in _batch_visible_colleagues(db, current_user)]
+    rows = db.query(models.ShiftChange).filter(models.ShiftChange.user_id.in_(ids or [-1]), models.ShiftChange.date_to >= today - timedelta(days=31)).order_by(models.ShiftChange.date_from.desc()).all()
+    return [{"id": x.id, "user_id": x.user_id, "employee": x.user.full_name if x.user else "", "date_from": x.date_from.isoformat(), "date_to": x.date_to.isoformat(),
+             "shift": x.shift, "note": x.note or "", "by": x.created_by_name or ""} for x in rows]
+
+
+@app.delete("/breaks/shift-change/{sc_id}")
+def delete_shift_change(
+    sc_id: int,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    x = db.query(models.ShiftChange).filter(models.ShiftChange.id == sc_id).first()
+    if not x:
+        raise HTTPException(status_code=404, detail="Shift change not found")
+    tu = _may_adjust(db, current_user, x.user_id)
+    _audit(db, current_user, "Shift change", "Removed temporary shift", tu, f"{x.date_from} to {x.date_to}", x.shift)
+    db.delete(x)
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/breaks/my-notices")
+def my_break_notices(
+    current_user: models.User = Depends(auth.require_role("colleague")),
+    db: Session = Depends(get_db),
+):
+    """What a Team Lead / Admin changed on this colleague's days (last 60 days) and the colleague's own queries."""
+    today = datetime.now(IST).date()
+    since = today - timedelta(days=60)
+    items = []
+    for a in db.query(models.BreakAdjustment).filter(models.BreakAdjustment.user_id == current_user.id, models.BreakAdjustment.adj_date >= since).all():
+        bits = []
+        if a.excused:
+            bits.append("Excused: " + ", ".join({"late": "late login", "break": "break limits", "hours": "hour targets"}.get(x, x) for x in a.excused.split(",") if x))
+        if a.new_type:
+            bits.append("Break re-typed " + (a.old_type or "") + " -> " + a.new_type)
+        items.append({"kind": "Adjustment", "date": a.adj_date.isoformat(), "text": "; ".join(bits) + (" - " + a.note if a.note else ""), "by": a.created_by_name or ""})
+    for x in db.query(models.LeaveDay).filter(models.LeaveDay.user_id == current_user.id, models.LeaveDay.leave_date >= since).all():
+        items.append({"kind": "Leave", "date": x.leave_date.isoformat(), "text": x.kind + (" - " + x.note if x.note else ""), "by": x.created_by_name or ""})
+    for x in db.query(models.ShiftChange).filter(models.ShiftChange.user_id == current_user.id, models.ShiftChange.date_to >= since).all():
+        items.append({"kind": "Shift change", "date": x.date_from.isoformat(), "text": x.shift + (" until " + x.date_to.isoformat() if x.date_to != x.date_from else "") + (" - " + x.note if x.note else ""), "by": x.created_by_name or ""})
+    items.sort(key=lambda i: i["date"], reverse=True)
+    qs = [{"id": q.id, "kind": q.kind or "", "ref_date": q.ref_date.isoformat() if q.ref_date else "", "ref_text": q.ref_text or "", "message": q.message, "status": q.status,
+           "reply": q.reply or "", "replied_by": q.replied_by or "", "created_at": q.created_at.isoformat() + "Z" if q.created_at else ""}
+          for q in db.query(models.BreakQuery).filter(models.BreakQuery.user_id == current_user.id).order_by(models.BreakQuery.id.desc()).limit(30).all()]
+    return {"items": items[:60], "queries": qs}
+
+
+@app.post("/breaks/queries")
+def raise_break_query(
+    payload: schemas.QueryIn,
+    current_user: models.User = Depends(auth.require_role("colleague")),
+    db: Session = Depends(get_db),
+):
+    msg = (payload.message or "").strip()
+    if len(msg) < 3:
+        raise HTTPException(status_code=400, detail="Please type your question")
+    try:
+        rd = date.fromisoformat(payload.ref_date) if payload.ref_date else None
+    except ValueError:
+        rd = None
+    db.add(models.BreakQuery(user_id=current_user.id, kind=(payload.kind or "")[:30] or None, ref_date=rd, ref_text=(payload.ref_text or "")[:300] or None,
+                             message=msg[:500], status="Open", created_at=datetime.utcnow()))
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/breaks/queries")
+def list_break_queries(
+    status: str = "open",
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    ids = [u.id for u in _batch_visible_colleagues(db, current_user)]
+    q = db.query(models.BreakQuery).filter(models.BreakQuery.user_id.in_(ids or [-1]))
+    if status == "open":
+        q = q.filter(models.BreakQuery.status == "Open")
+    return [{"id": x.id, "employee": x.user.full_name if x.user else "", "team_lead": (x.user.reporting_manager if x.user else "") or "", "kind": x.kind or "",
+             "ref_date": x.ref_date.isoformat() if x.ref_date else "", "ref_text": x.ref_text or "", "message": x.message, "status": x.status, "reply": x.reply or "",
+             "replied_by": x.replied_by or "", "created_at": x.created_at.isoformat() + "Z" if x.created_at else ""} for x in q.order_by(models.BreakQuery.id.desc()).limit(200).all()]
+
+
+@app.post("/breaks/queries/{query_id}/reply")
+def reply_break_query(
+    query_id: int,
+    payload: schemas.QueryReplyIn,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    x = db.query(models.BreakQuery).filter(models.BreakQuery.id == query_id).first()
+    if not x:
+        raise HTTPException(status_code=404, detail="Query not found")
+    _may_adjust(db, current_user, x.user_id)
+    r = (payload.reply or "").strip()
+    if not r:
+        raise HTTPException(status_code=400, detail="Please type a reply")
+    x.reply, x.replied_by, x.status, x.replied_at = r[:500], current_user.full_name, "Resolved", datetime.utcnow()
+    _audit(db, current_user, "Query", "Replied to colleague query", x.user, x.ref_date, f"Q: {x.message[:150]} | A: {r[:250]}")
+    db.commit()
+    return {"ok": True}
+
+
+# ======================================================================
+# Order aging / SLA, escalation ageing, management summary, database backup
+# ======================================================================
+SLA_KEYS = {"warn": "sla_warn_days", "late": "sla_late_days"}
+
+
+def _sla_days(db: Session):
+    def num(k, d):
+        try:
+            return max(1, int(_setting(db, k, str(d))))
+        except ValueError:
+            return d
+    return num(SLA_KEYS["warn"], 2), num(SLA_KEYS["late"], 3)
+
+
+@app.get("/settings/sla")
+def get_sla_settings(current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")), db: Session = Depends(get_db)):
+    w, l = _sla_days(db)
+    return {"warn_days": w, "late_days": l}
+
+
+@app.put("/settings/sla")
+def set_sla_settings(payload: dict, current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    try:
+        w, l = int(payload.get("warn_days")), int(payload.get("late_days"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Enter whole numbers of days")
+    if w < 1 or l < w or l > 60:
+        raise HTTPException(status_code=400, detail="'At risk' must be at least 1 day and 'Late' must be the same or more (max 60)")
+    _audit(db, current_user, "Setting", "Changed order aging limits", details=f"At risk from {w} business days, late from {l}")
+    _set_setting(db, SLA_KEYS["warn"], str(w))
+    _set_setting(db, SLA_KEYS["late"], str(l))
+    db.commit()
+    return {"warn_days": w, "late_days": l}
+
+
+def _order_age(received: date, today: date, cache: dict) -> int:
+    if received not in cache:
+        cache[received] = _count_business_days_ex_holidays(received, today)
+    return cache[received]
+
+
+def _team_names(db: Session):
+    tls, members, _orph = _tl_membership(db)
+    colleague_tl = {cid: tid for tid, ids in members.items() for cid in ids}
+    return tls, colleague_tl
+
+
+_WAITING = ("with_onshore", "blue", "orange")
+
+
+class _ExtraProxy:
+    """An extra reason of a multi-reason escalation, looking like an order whose hand-off state is that reason's own."""
+    def __init__(self, order, ex: dict):
+        self._o, self._ex = order, ex
+
+    def __getattr__(self, n):
+        if n == "track" or n == "escalation_category":
+            return self._ex.get("category")
+        if n in ("onshore_status", "onshore_team", "onshore_comment", "onshore_tl_reply"):
+            return self._ex.get(n)
+        if n == "onshore_sent_at":
+            v = self._ex.get(n)
+            try:
+                return datetime.fromisoformat(v) if isinstance(v, str) else v
+            except ValueError:
+                return None
+        if n == "escalated":
+            return True
+        return getattr(self._o, n)
+
+
+def _order_tracks(o) -> list:
+    """The order itself (unless its main reason is already resolved) plus one proxy per extra open reason."""
+    det = getattr(o, "escalation_detail", None)
+    dd = (det.data or {}) if det else {}
+    out = [] if dd.get("_pdone") else [o]
+    out += [_ExtraProxy(o, ex) for ex in (dd.get("_queue") or [])]
+    return out
+
+
+def _holders(o) -> list:
+    return list(dict.fromkeys(_holder(t) for t in _order_tracks(o))) or ["Team Lead"]
+
+
+def _holder_all(o) -> str:
+    hs = _holders(o)
+    return hs[0] if len(hs) == 1 else " + ".join(hs)
+
+
+def _has_extra_state(db: Session):
+    """Orders that have an extra reason with its own hand-off state."""
+    return db.query(models.EscalationDetail.order_id).filter(cast(models.EscalationDetail.data, String).like('%"onshore_status"%'))
+
+
+def _holder(o) -> str:
+    """Who has an escalated order right now."""
+    if o.onshore_status in ("with_onshore", "blue", "orange"):
+        return {"onshore": "Onshore", "recon": "Recon", "calling": "Calling"}.get(o.onshore_team or "onshore", "Onshore")
+    return "Team Lead"
+
+
+@app.get("/orders/aging")
+def orders_aging(
+    process_id: Optional[int] = None,
+    team_lead_id: Optional[int] = None,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Open orders (not Completed, not yet in Production) by age in business days since the Received Date, with an at-risk list."""
+    W = models.WorkOrder
+    today = datetime.now(IST).date()
+    warn, late = _sla_days(db)
+    scoped = _orders_dash_scope(db, current_user, process_id, team_lead_id)
+    rows = scoped(db.query(W).options(selectinload(W.assignee), selectinload(W.process)).filter(
+        W.received_date.isnot(None), W.submitted.is_(False), func.coalesce(W.posting_status, "") != "Completed")).all()
+    tls, colleague_tl = _team_names(db)
+    tl_ids = set(tls)
+    cache = {}
+    buckets = [("0-1 days", 0, 1), ("2 days", 2, 2), ("3 days", 3, 3), ("4-5 days", 4, 5), ("6+ days", 6, 10 ** 6)]
+    bk = [0] * len(buckets)
+    by_proc, by_tl, items = {}, {}, []
+    for o in rows:
+        age = _order_age(o.received_date, today, cache)
+        for i, (_n, lo_, hi_) in enumerate(buckets):
+            if lo_ <= age <= hi_:
+                bk[i] += 1
+                break
+        st = o.posting_status or "Pending"
+        pn = o.process.name if o.process else "(none)"
+        tlid = _order_team_lead_id(o.assigned_to_id, o.team_lead_id, colleague_tl, tl_ids)
+        tln = tls.get(tlid, "No Team Lead")
+        for d, key in ((by_proc, pn), (by_tl, tln)):
+            g = d.setdefault(key, {"name": key, "open": 0, "at_risk": 0, "late": 0, "oldest": 0})
+            g["open"] += 1
+            g["oldest"] = max(g["oldest"], age)
+            if age >= late:
+                g["late"] += 1
+            elif age >= warn:
+                g["at_risk"] += 1
+        if age >= warn:
+            items.append({"id": o.id, "process": pn, "edm": o.edm or "", "received": o.received_date.isoformat(), "age": age, "status": st,
+                          "assignee": o.assignee.full_name if o.assignee else "(unassigned)", "team_lead": tln,
+                          "escalated": bool(o.escalated or o.onshore_status), "holder": _holder_all(o) if (o.escalated or o.onshore_status) else "",
+                          "level": "late" if age >= late else "risk", "amount": o.amount})
+    items.sort(key=lambda x: (-x["age"], x["process"], x["edm"]))
+    return {"as_of": today.isoformat(), "warn_days": warn, "late_days": late, "open": len(rows),
+            "at_risk": sum(1 for x in items if x["level"] == "risk"), "late": sum(1 for x in items if x["level"] == "late"),
+            "buckets": [{"label": b[0], "count": bk[i]} for i, b in enumerate(buckets)],
+            "by_process": sorted(by_proc.values(), key=lambda g: (-g["late"], -g["at_risk"], g["name"])),
+            "by_team_lead": sorted(by_tl.values(), key=lambda g: (-g["late"], -g["at_risk"], g["name"])) if current_user.role != "team_lead" else [],
+            "orders": items[:500], "truncated": len(items) > 500}
+
+
+@app.get("/orders/escalation-aging")
+def escalation_aging(
+    process_id: Optional[int] = None,
+    period: str = "month",
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Escalations open right now (who holds them, how long) and turnaround for the period: raised, closed, days to close by category, team response time."""
+    if period not in ("week", "month", "last_month"):
+        raise HTTPException(status_code=400, detail="period must be week, month or last_month")
+    W, E = models.WorkOrder, models.EscalationEvent
+    d1, d2, label = _period_range(period)
+    today = datetime.now(IST).date()
+    now_ist = datetime.now(IST).replace(tzinfo=None)
+    scoped = _orders_dash_scope(db, current_user, process_id)
+    open_orders = scoped(db.query(W).options(selectinload(W.assignee), selectinload(W.process)).filter(
+        or_(W.escalated.is_(True), W.onshore_status.in_(("with_onshore", "red", "yellow", "blue", "orange"))))).all()
+    ids = [o.id for o in open_orders]
+    last_msg = {}
+    if ids:
+        for m in db.query(models.OnshoreMessage).filter(models.OnshoreMessage.order_id.in_(ids)).order_by(models.OnshoreMessage.id).all():
+            last_msg[(m.order_id, m.track or None)] = m.created_at
+    tls, colleague_tl = _team_names(db)
+    tl_ids, cache, open_rows = set(tls), {}, []
+    for o in [t for oo in open_orders for t in (_order_tracks(oo) if oo.escalated else [oo])]:
+        since_dt = last_msg.get((o.id, getattr(o, "track", None))) or o.onshore_sent_at
+        since_hours = round((now_ist - since_dt).total_seconds() / 3600, 1) if since_dt else None
+        raised = o.issue_raised_date
+        tlid = _order_team_lead_id(o.assigned_to_id, o.team_lead_id, colleague_tl, tl_ids)
+        open_rows.append({"id": o.id, "process": o.process.name if o.process else "", "edm": o.edm or "", "category": o.escalation_category or "", "raised": raised.isoformat() if raised else "",
+                          "age": _order_age(raised, today, cache) if raised else None, "holder": _holder(o), "waiting_hours": since_hours,
+                          "colleague": o.assignee.full_name if o.assignee else "", "team_lead": tls.get(tlid, "No Team Lead")})
+    open_rows.sort(key=lambda r: (-(r["age"] or 0), -(r["waiting_hours"] or 0)))
+    # turnaround for escalations raised in the period
+    eq = db.query(E).filter(E.raised_date >= d1, E.raised_date <= d2)
+    if process_id is not None:
+        eq = eq.filter(E.process_id == process_id)
+    if current_user.role == "team_lead":
+        eq = eq.filter(E.team_lead_id == current_user.id)
+    cats = {}
+    for e, cat in [(e, c) for e in eq.all() for c in _event_cats(e)]:
+        g = cats.setdefault(cat, {"category": cat, "raised": 0, "closed": 0, "days_total": 0, "open": 0})
+        g["raised"] += 1
+        if e.closed_date:
+            g["closed"] += 1
+            g["days_total"] += _count_business_days_ex_holidays(e.raised_date, e.closed_date)
+        else:
+            g["open"] += 1
+    cat_rows = [{"category": g["category"], "raised": g["raised"], "closed": g["closed"], "open": g["open"],
+                 "avg_days": round(g["days_total"] / g["closed"], 1) if g["closed"] else None} for g in cats.values()]
+    cat_rows.sort(key=lambda g: (-g["raised"], g["category"]))
+    # how fast each receiving team answers: from "sent" (or the Team Lead's extra info) to the team's reply
+    scope_ids = {o_id for (o_id,) in scoped(db.query(W.id)).all()} if current_user.role == "team_lead" or process_id is not None else None
+    t_lo, t_hi = datetime(d1.year, d1.month, d1.day), datetime(d2.year, d2.month, d2.day) + timedelta(days=1)
+    mq = db.query(models.OnshoreMessage).filter(models.OnshoreMessage.created_at >= t_lo - timedelta(days=30), models.OnshoreMessage.created_at < t_hi).order_by(models.OnshoreMessage.order_id, models.OnshoreMessage.id)
+    pend, resp = {}, {}
+    for m in mq.all():
+        if scope_ids is not None and m.order_id not in scope_ids:
+            continue
+        if m.kind in ("sent", "tl_info"):
+            pend[m.order_id] = m.created_at
+        elif m.kind in ("onshore_red", "onshore_yellow") and m.order_id in pend:
+            if t_lo <= m.created_at < t_hi:
+                team = (m.author_role or "onshore").lower()
+                resp.setdefault(team, []).append((m.created_at - pend[m.order_id]).total_seconds() / 3600)
+            del pend[m.order_id]
+    teams = [{"team": {"onshore": "Onshore", "recon": "Recon", "calling": "Calling"}.get(t, t.title()), "answers": len(v), "avg_hours": round(sum(v) / len(v), 1), "longest_hours": round(max(v), 1)} for t, v in sorted(resp.items())]
+    holders = {}
+    for r in open_rows:
+        holders[r["holder"]] = holders.get(r["holder"], 0) + 1
+    return {"label": label, "from": d1.isoformat(), "to": d2.isoformat(), "open": open_rows, "holders": holders, "categories": cat_rows, "teams": teams}
+
+
+def _scope_label(user):
+    return "your team" if user.role == "team_lead" else "all teams"
+
+
+def _mgmt_summary(db: Session, user: models.User, d1: date, d2: date, process_id: Optional[int] = None) -> dict:
+    """Production summary for a date range, limited to what this user may see (Team Lead: own team; Admin / Manager / Super Admin: everything)."""
+    W, E = models.WorkOrder, models.EscalationEvent
+    today = datetime.now(IST).date()
+    warn, late = _sla_days(db)
+    scoped = _orders_dash_scope(db, user, process_id)
+    procs = {p.id: p.name for p in db.query(models.Process).all()}
+    rows = {}
+    def row(pid):
+        return rows.setdefault(pid, {"process": procs.get(pid, "(none)"), "received": 0, "completed": 0, "trans": 0, "tat_total": 0, "tat_n": 0, "to_production": 0,
+                                     "raised": 0, "closed": 0, "open": 0, "at_risk": 0, "late": 0})
+    for pid, n in scoped(db.query(W.process_id, func.count(W.id)).filter(W.received_date >= d1, W.received_date <= d2)).group_by(W.process_id).all():
+        row(pid)["received"] += n
+    for pid, n, tr, tat_sum, tat_n in scoped(db.query(W.process_id, func.count(W.id), func.coalesce(func.sum(W.trans_count), 0), func.coalesce(func.sum(W.tat_days), 0), func.count(W.tat_days)).filter(
+            W.posting_status == "Completed", W.posted_date >= d1, W.posted_date <= d2)).group_by(W.process_id).all():
+        r = row(pid); r["completed"] += n; r["trans"] += int(tr or 0); r["tat_total"] += int(tat_sum or 0); r["tat_n"] += tat_n
+    lo, hi = datetime(d1.year, d1.month, d1.day), datetime(d2.year, d2.month, d2.day) + timedelta(days=1)
+    for pid, n in scoped(db.query(W.process_id, func.count(W.id)).filter(W.submitted_at >= lo, W.submitted_at < hi)).group_by(W.process_id).all():
+        row(pid)["to_production"] += n
+    eq = db.query(E.process_id, E.raised_date, E.closed_date, E.team_lead_id)
+    if process_id is not None:
+        eq = eq.filter(E.process_id == process_id)
+    if user.role == "team_lead":
+        eq = eq.filter(E.team_lead_id == user.id)
+    for pid, rd, cd, _tl in eq.filter(or_(and_(E.raised_date >= d1, E.raised_date <= d2), and_(E.closed_date >= d1, E.closed_date <= d2))).all():
+        if rd and d1 <= rd <= d2:
+            row(pid)["raised"] += 1
+        if cd and d1 <= cd <= d2:
+            row(pid)["closed"] += 1
+    cache = {}
+    for pid, rd in scoped(db.query(W.process_id, W.received_date).filter(W.received_date.isnot(None), W.submitted.is_(False), func.coalesce(W.posting_status, "") != "Completed")).all():
+        r = row(pid); r["open"] += 1
+        age = _order_age(rd, today, cache)
+        if age >= late:
+            r["late"] += 1
+        elif age >= warn:
+            r["at_risk"] += 1
+    top = scoped(db.query(W.employee_name, func.count(W.id), func.coalesce(func.sum(W.trans_count), 0)).filter(
+        W.posting_status == "Completed", W.posted_date >= d1, W.posted_date <= d2, W.employee_name.isnot(None))).group_by(W.employee_name).order_by(func.count(W.id).desc()).limit(5).all()
+    out_rows = []
+    for r in sorted(rows.values(), key=lambda x: x["process"]):
+        r["avg_tat"] = round(r["tat_total"] / r["tat_n"], 1) if r["tat_n"] else None
+        out_rows.append(r)
+    tot = {k: sum(r[k] for r in out_rows) for k in ("received", "completed", "trans", "to_production", "raised", "closed", "open", "at_risk", "late")}
+    tat_n = sum(r["tat_n"] for r in out_rows)
+    tot["avg_tat"] = round(sum(r["tat_total"] for r in out_rows) / tat_n, 1) if tat_n else None
+    tl_rows = []
+    if user.role != "team_lead":
+        tls, colleague_tl = _team_names(db)
+        tl_ids = set(tls)
+        g = {}
+        def grow(tid):
+            return g.setdefault(tid, {"team_lead": tls.get(tid, "No Team Lead"), "received": 0, "completed": 0, "open": 0, "late": 0})
+        for a, o, n in scoped(db.query(W.assigned_to_id, W.team_lead_id, func.count(W.id)).filter(W.received_date >= d1, W.received_date <= d2)).group_by(W.assigned_to_id, W.team_lead_id).all():
+            grow(_order_team_lead_id(a, o, colleague_tl, tl_ids))["received"] += n
+        for a, o, n in scoped(db.query(W.assigned_to_id, W.team_lead_id, func.count(W.id)).filter(W.posting_status == "Completed", W.posted_date >= d1, W.posted_date <= d2)).group_by(W.assigned_to_id, W.team_lead_id).all():
+            grow(_order_team_lead_id(a, o, colleague_tl, tl_ids))["completed"] += n
+        for a, o, rd in scoped(db.query(W.assigned_to_id, W.team_lead_id, W.received_date).filter(W.received_date.isnot(None), W.submitted.is_(False), func.coalesce(W.posting_status, "") != "Completed")).all():
+            x = grow(_order_team_lead_id(a, o, colleague_tl, tl_ids)); x["open"] += 1
+            if _order_age(rd, today, cache) >= late:
+                x["late"] += 1
+        tl_rows = sorted(g.values(), key=lambda x: x["team_lead"])
+    return {"from": d1.isoformat(), "to": d2.isoformat(), "scope": _scope_label(user), "warn_days": warn, "late_days": late, "rows": out_rows, "total": tot,
+            "top": [{"name": n, "completed": c, "trans": int(t or 0)} for n, c, t in top], "team_leads": tl_rows}
+
+
+@app.get("/reports/management-summary")
+def management_summary_report(
+    period: str = "week",
+    process_id: Optional[int] = None,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    today = datetime.now(IST).date()
+    if period == "day":
+        d1 = d2 = today - timedelta(days=1)
+    elif period == "week":
+        d1, d2 = today - timedelta(days=today.weekday() + 7), today - timedelta(days=today.weekday() + 1)
+    elif period == "month":
+        d1, d2, _l = _period_range("month")
+    elif period == "last_month":
+        d1, d2, _l = _period_range("last_month")
+    else:
+        raise HTTPException(status_code=400, detail="period must be day, week, month or last_month")
+    return _mgmt_summary(db, current_user, d1, d2, process_id)
+
+
+def _mgmt_email(title: str, s: dict):
+    import html as _h
+    t = s["total"]
+    def tat(v):
+        return "-" if v is None else f"{v:g}"
+    head = ["Process", "Received", "Completed", "Trans count", "To Production", "Avg TAT (days)", "Escalations raised", "Closed", "Open now", "At risk", "Late"]
+    def cells(r):
+        return [r.get("process", "Total"), r["received"], r["completed"], r["trans"], r["to_production"], tat(r.get("avg_tat")), r["raised"], r["closed"], r["open"], r["at_risk"], r["late"]]
+    rng = s["from"] if s["from"] == s["to"] else f"{s['from']} to {s['to']}"
+    text = f"{title}\n{rng} ({s['scope']})\n\n" + "\n".join(" | ".join(str(c) for c in cells(r)) for r in s["rows"] + [dict(t, process="TOTAL")])
+    if s["top"]:
+        text += "\n\nTop completed: " + ", ".join(f"{x['name']} ({x['completed']})" for x in s["top"])
+    td = 'style="padding:5px 8px;border-bottom:1px solid #e3e7ef;font-size:12.5px;text-align:right;"'
+    tdl = td.replace("text-align:right", "text-align:left")
+    th = lambda x: f'<th style="background:#0b2545;color:#fff;padding:6px 8px;text-align:left;font-size:12px;">{_h.escape(x)}</th>'
+    def trow(r, bold=False):
+        cs = cells(r)
+        b = "font-weight:700;" if bold else ""
+        return "<tr>" + f'<td {tdl.replace("font-size", b + "font-size")}>{_h.escape(str(cs[0]))}</td>' + "".join(f'<td {td.replace("font-size", b + "font-size")}>{_h.escape(str(c))}</td>' for c in cs[1:]) + "</tr>"
+    html = f'<div style="font-family:Segoe UI,Arial,sans-serif;color:#222;"><h3 style="color:#0b2545;margin:0 0 4px;">{_h.escape(title)}</h3><div style="color:#666;font-size:13px;margin-bottom:10px;">{_h.escape(rng)} &middot; {_h.escape(s["scope"])}</div>'
+    html += "<table style='border-collapse:collapse;'><tr>" + "".join(th(x) for x in head) + "</tr>" + "".join(trow(r) for r in s["rows"]) + trow(dict(t, process="Total"), True) + "</table>"
+    if s["team_leads"]:
+        text += "\n\nBy Team Lead:\n" + "\n".join(f"{x['team_lead']}: received {x['received']}, completed {x['completed']}, open {x['open']}, late {x['late']}" for x in s["team_leads"])
+        html += '<h4 style="color:#0b2545;margin:14px 0 4px;">By Team Lead</h4><table style="border-collapse:collapse;"><tr>' + "".join(th(x) for x in ("Team Lead", "Received", "Completed", "Open now", "Late")) + "</tr>" + \
+                "".join(f"<tr><td {tdl}>{_h.escape(x['team_lead'])}</td><td {td}>{x['received']}</td><td {td}>{x['completed']}</td><td {td}>{x['open']}</td><td {td}>{x['late']}</td></tr>" for x in s["team_leads"]) + "</table>"
+    if s["top"]:
+        html += '<h4 style="color:#0b2545;margin:14px 0 4px;">Top completed</h4><table style="border-collapse:collapse;"><tr>' + "".join(th(x) for x in ("Colleague", "Completed", "Trans count")) + "</tr>" + \
+                "".join(f"<tr><td {tdl}>{_h.escape(x['name'])}</td><td {td}>{x['completed']}</td><td {td}>{x['trans']}</td></tr>" for x in s["top"]) + "</table>"
+    html += (f'<p style="color:#888;font-size:11.5px;margin-top:10px;">Open now = not Completed and not yet in Production. At risk = {s["warn_days"]}+ business days since the Received Date, '
+             f'late = {s["late_days"]}+. Sent automatically by WorkFlow Hub.</p></div>')
+    return text, html
+
+
+MGMT_KEYS = {"daily": "mgmt_daily", "weekly": "mgmt_weekly", "time": "mgmt_time", "last_d": "mgmt_last_daily", "last_w": "mgmt_last_weekly"}
+
+
+def _mgmt_settings(db: Session) -> dict:
+    return {"daily": _setting(db, MGMT_KEYS["daily"], "0") == "1", "weekly": _setting(db, MGMT_KEYS["weekly"], "0") == "1", "time": _setting(db, MGMT_KEYS["time"], "09:00"),
+            "last_daily": _setting(db, MGMT_KEYS["last_d"], ""), "last_weekly": _setting(db, MGMT_KEYS["last_w"], ""), "smtp_configured": email_utils.is_configured()}
+
+
+def run_management_summary(db: Session, kind: str = "daily", only_to: str = None) -> dict:
+    today = datetime.now(IST).date()
+    if kind == "weekly":
+        d1, d2, name = today - timedelta(days=today.weekday() + 7), today - timedelta(days=today.weekday() + 1), "Weekly"
+    else:
+        d1 = d2 = today - timedelta(days=1)
+        name = "Daily"
+    res = {"kind": kind, "from": d1.isoformat(), "to": d2.isoformat(), "sent": 0, "failed": [], "skipped_no_email": [], "note": ""}
+    def send(user, to, title):
+        s = _mgmt_summary(db, user, d1, d2)
+        t = s["total"]
+        if not any(t[k] for k in ("received", "completed", "to_production", "raised", "closed")) and not t["late"]:
+            return False
+        text, html = _mgmt_email(title, s)
+        if email_utils.send_email(to, f"{title} - {d1.strftime('%d %b %Y')}" + ("" if d1 == d2 else f" to {d2.strftime('%d %b %Y')}"), text, html):
+            res["sent"] += 1
+        else:
+            res["failed"].append(f"{to}: {email_utils.last_error}")
+        return True
+    if only_to:
+        su = db.query(models.User).filter(models.User.role == "super_admin", models.User.employment_status != "Inactive").first()
+        if not su or not send(su, only_to, f"{name} production summary - all teams (test)"):
+            res["note"] = "Nothing to report for that period, so no test mail was sent."
+        return res
+    for tl in db.query(models.User).filter(models.User.role == "team_lead", models.User.employment_status != "Inactive").all():
+        if not tl.email:
+            res["skipped_no_email"].append(tl.full_name); continue
+        send(tl, tl.email, f"{name} production summary - your team")
+    if _setting(db, DIGEST_KEYS["admins"], "1") == "1":
+        for a in db.query(models.User).filter(models.User.role.in_(["admin", "manager", "super_admin"]), models.User.employment_status != "Inactive").all():
+            if a.email:
+                send(a, a.email, f"{name} production summary - all teams")
+    return res
+
+
+@app.get("/settings/mgmt-summary")
+def get_mgmt_settings(current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    return _mgmt_settings(db)
+
+
+@app.put("/settings/mgmt-summary")
+def set_mgmt_settings(payload: dict, current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    t = str(payload.get("time", "09:00"))
+    if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", t):
+        raise HTTPException(status_code=400, detail="Time must look like 09:00")
+    _set_setting(db, MGMT_KEYS["daily"], "1" if payload.get("daily") else "0")
+    _set_setting(db, MGMT_KEYS["weekly"], "1" if payload.get("weekly") else "0")
+    _set_setting(db, MGMT_KEYS["time"], t)
+    _audit(db, current_user, "Setting", "Changed production summary email settings", details=f"Daily {'on' if payload.get('daily') else 'off'}; weekly (Mondays) {'on' if payload.get('weekly') else 'off'}; at {t}")
+    db.commit()
+    return _mgmt_settings(db)
+
+
+@app.post("/settings/mgmt-summary/send")
+def send_mgmt_summary(mode: str = "daily_test", current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    if not email_utils.is_configured():
+        raise HTTPException(status_code=400, detail=email_utils.last_error or "SMTP is not configured on the server (see the SMTP lines in run.bat).")
+    kind, _, how = mode.partition("_")
+    if kind not in ("daily", "weekly") or how not in ("test", "now"):
+        raise HTTPException(status_code=400, detail="Unknown mode")
+    _audit(db, current_user, "Setting", "Sent production summary email", details=f"mode={mode}")
+    db.commit()
+    if how == "test":
+        if not current_user.email:
+            raise HTTPException(status_code=400, detail="Add your email address in your user record first.")
+        return run_management_summary(db, kind, only_to=current_user.email)
+    return run_management_summary(db, kind)
+
+
+# ---------------- Database backup (laptop / SQLite version) ----------------
+BACKUP_KEYS = {"auto": "backup_auto", "time": "backup_time", "keep": "backup_keep", "last_auto": "backup_last_auto"}
+
+
+def _sqlite_path():
+    from .database import DATABASE_URL
+    if not DATABASE_URL.startswith("sqlite"):
+        return None
+    p = DATABASE_URL.split("///", 1)[-1]
+    return os.path.abspath(p) if p and p != ":memory:" else None
+
+
+def _backup_dir(db_path: str) -> str:
+    d = os.path.join(os.path.dirname(db_path), "backups")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _make_backup(kind: str = "manual") -> dict:
+    import sqlite3
+    src_path = _sqlite_path()
+    if not src_path or not os.path.exists(src_path):
+        raise RuntimeError("Backups from this screen work with the laptop (SQLite) version only.")
+    d = _backup_dir(src_path)
+    name = f"workorders_{datetime.now(IST).strftime('%Y%m%d_%H%M%S')}_{kind}.db"
+    dest = os.path.join(d, name)
+    src, dst = sqlite3.connect(src_path), sqlite3.connect(dest)
+    try:
+        src.backup(dst)                 # consistent copy even while the app is running
+    finally:
+        dst.close(); src.close()
+    return {"name": name, "size": os.path.getsize(dest)}
+
+
+def _list_backups():
+    p = _sqlite_path()
+    if not p:
+        return []
+    d = _backup_dir(p)
+    out = []
+    for n in os.listdir(d):
+        m = re.fullmatch(r"workorders_(\d{8})_(\d{6})_(manual|auto|pre)\.db", n)
+        if not m:
+            continue
+        full = os.path.join(d, n)
+        at = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+        out.append({"name": n, "size": os.path.getsize(full), "at": at.isoformat(), "kind": m.group(3)})
+    return sorted(out, key=lambda x: x["at"], reverse=True)
+
+
+def _prune_backups(db: Session):
+    try:
+        keep = max(1, int(_setting(db, BACKUP_KEYS["keep"], "14")))
+    except ValueError:
+        keep = 14
+    p = _sqlite_path()
+    for b in [x for x in _list_backups() if x["kind"] == "auto"][keep:]:
+        try:
+            os.remove(os.path.join(_backup_dir(p), b["name"]))
+        except OSError:
+            pass
+
+
+def _backup_settings(db: Session) -> dict:
+    return {"auto": _setting(db, BACKUP_KEYS["auto"], "0") == "1", "time": _setting(db, BACKUP_KEYS["time"], "22:00"), "keep": int(_setting(db, BACKUP_KEYS["keep"], "14") or 14)}
+
+
+@app.get("/backup/status")
+def backup_status(current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    p = _sqlite_path()
+    if not p:
+        return {"supported": False, "note": "This server does not use a SQLite file, so use your hosting provider's database backups."}
+    items = _list_backups()
+    last = datetime.fromisoformat(items[0]["at"]) if items else None
+    days = (datetime.now(IST).replace(tzinfo=None) - last).days if last else None
+    return {"supported": True, "db_file": os.path.basename(p), "db_size": os.path.getsize(p) if os.path.exists(p) else 0, "folder": _backup_dir(p), "backups": items,
+            "last_backup": items[0]["at"] if items else None, "days_since": days, "settings": _backup_settings(db), "restore": _restore_state(db)}
+
+
+@app.post("/backup/create")
+def backup_create(current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    try:
+        b = _make_backup("manual")
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    _audit(db, current_user, "Backup", "Created backup", details=b["name"])
+    db.commit()
+    return b
+
+
+@app.put("/backup/settings")
+def backup_set_settings(payload: dict, current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    t = str(payload.get("time", "22:00"))
+    if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", t):
+        raise HTTPException(status_code=400, detail="Time must look like 22:00")
+    try:
+        keep = int(payload.get("keep", 14))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Enter how many daily backups to keep")
+    if keep < 1 or keep > 90:
+        raise HTTPException(status_code=400, detail="Keep between 1 and 90 automatic backups")
+    _set_setting(db, BACKUP_KEYS["auto"], "1" if payload.get("auto") else "0")
+    _set_setting(db, BACKUP_KEYS["time"], t)
+    _set_setting(db, BACKUP_KEYS["keep"], str(keep))
+    _audit(db, current_user, "Backup", "Changed backup settings", details=f"Automatic {'on' if payload.get('auto') else 'off'} at {t}; keep {keep}")
+    db.commit()
+    return _backup_settings(db)
+
+
+def _safe_backup_path(name: str) -> str:
+    if not re.fullmatch(r"workorders_\d{8}_\d{6}_(manual|auto|pre)\.db", name or ""):
+        raise HTTPException(status_code=404, detail="Backup not found")
+    p = _sqlite_path()
+    full = os.path.join(_backup_dir(p), name) if p else None
+    if not full or not os.path.exists(full):
+        raise HTTPException(status_code=404, detail="Backup not found")
+    return full
+
+
+@app.get("/backup/download/{name}")
+def backup_download(name: str, current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    from fastapi.responses import FileResponse
+    full = _safe_backup_path(name)
+    _audit(db, current_user, "Backup", "Downloaded backup", details=name)
+    db.commit()
+    return FileResponse(full, media_type="application/octet-stream", filename=name)
+
+
+@app.delete("/backup/{name}")
+def backup_delete(name: str, current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    full = _safe_backup_path(name)
+    os.remove(full)
+    _audit(db, current_user, "Backup", "Deleted backup", details=name)
+    db.commit()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# System log viewer (Super Admin): "what happened at 10:42?"
+# ---------------------------------------------------------------------------
+_LOG_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}) (DEBUG|INFO|WARNING|ERROR|CRITICAL) (.*)$")
+
+
+def _read_log_entries(day: str) -> list:
+    d = _log_dir()
+    base = os.path.join(d, "workflowhub.log")
+    files = [base] + [f"{base}.{i}" for i in range(1, 6)]
+    entries = []
+    for f in files:
+        if not os.path.exists(f):
+            continue
+        try:
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    m = _LOG_LINE.match(line.rstrip("\n"))
+                    if m:
+                        if m.group(1) == day:
+                            entries.append({"at": m.group(2), "level": m.group(3), "text": m.group(4)})
+                        else:
+                            entries.append(None)          # a line of another day: keeps continuation lines from sticking to the wrong entry
+                    elif entries and entries[-1] is not None:
+                        if len(entries[-1]["text"]) < 4000:
+                            entries[-1]["text"] += "\n" + line.rstrip("\n")
+        except OSError:
+            continue
+    return [e for e in entries if e]
+
+
+@app.get("/logs/system")
+def system_log(day: Optional[str] = None, around: Optional[str] = None, minutes: int = 15, level: str = "all", q: str = "",
+               current_user: models.User = Depends(auth.require_role("super_admin"))):
+    """Log lines for one day (India time). `around` = HH:MM with +/- `minutes`; level=problems keeps warnings and errors."""
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    day = day or today
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        raise HTTPException(status_code=400, detail="Date must look like 2026-11-09")
+    items = _read_log_entries(day)
+    if around:
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", around):
+            raise HTTPException(status_code=400, detail="Time must look like 10:42")
+        c = int(around[:2]) * 60 + int(around[3:])
+        minutes = max(1, min(720, minutes))
+        items = [e for e in items if abs((int(e["at"][:2]) * 60 + int(e["at"][3:5])) - c) <= minutes]
+    if level == "problems":
+        items = [e for e in items if e["level"] in ("WARNING", "ERROR", "CRITICAL")]
+    elif level == "errors":
+        items = [e for e in items if e["level"] in ("ERROR", "CRITICAL")]
+    if q.strip():
+        ql = q.strip().lower()
+        items = [e for e in items if ql in e["text"].lower()]
+    total = len(items)
+    items = items[-500:]
+    base = os.path.join(_log_dir(), "workflowhub.log")
+    return {"day": day, "total": total, "shown": len(items), "entries": items, "log_file": base, "log_exists": os.path.exists(base)}
+
+
+@app.get("/logs/system/download")
+def system_log_download(current_user: models.User = Depends(auth.require_role("super_admin"))):
+    from fastapi.responses import FileResponse
+    f = os.path.join(_log_dir(), "workflowhub.log")
+    if not os.path.exists(f):
+        raise HTTPException(status_code=404, detail="No log file yet")
+    return FileResponse(f, media_type="text/plain", filename="workflowhub.log")
+
+
+# ---------------------------------------------------------------------------
+# Restore test: prove a backup can really be restored (quarterly, automatic + on demand)
+# ---------------------------------------------------------------------------
+RESTORE_CHECK_DAYS = 90
+_RESTORE_KEY_TABLES = ["users", "processes", "clients", "work_orders", "login_days", "audit_events"]
+
+
+def _restore_state(db: Session) -> dict:
+    try:
+        last = json.loads(_setting(db, "restore_check", "") or "null")
+    except ValueError:
+        last = None
+    try:
+        hist = json.loads(_setting(db, "restore_check_hist", "") or "[]")
+    except ValueError:
+        hist = []
+    days = None
+    if last:
+        try:
+            days = (datetime.now(IST).replace(tzinfo=None) - datetime.fromisoformat(last["at"])).days
+        except Exception:
+            days = None
+    due = last is None or days is None or days >= RESTORE_CHECK_DAYS or not last.get("ok")
+    return {"last": last, "history": hist, "days_since": days, "due": due, "every_days": RESTORE_CHECK_DAYS}
+
+
+def _run_restore_check(db: Session, name: Optional[str], by: str) -> dict:
+    """Copies a backup into a spare folder, opens the copy and checks it (integrity, tables, row counts). Never touches the live database."""
+    import sqlite3, time as _t
+    src_path = _sqlite_path()
+    if not src_path:
+        raise RuntimeError("Restore tests work with the laptop (SQLite) version only.")
+    items = _list_backups()
+    if not items:
+        raise RuntimeError("There is no backup to test yet. Make one first.")
+    chosen = next((b for b in items if b["name"] == name), None) if name else items[0]
+    if not chosen:
+        raise RuntimeError("That backup was not found.")
+    folder = _backup_dir(src_path)
+    spare = os.path.join(folder, "_restore_test")
+    shutil.rmtree(spare, ignore_errors=True)
+    os.makedirs(spare, exist_ok=True)
+    t0 = _t.perf_counter()
+    res = {"at": datetime.now(IST).replace(tzinfo=None).isoformat(timespec="seconds"), "backup": chosen["name"], "backup_at": chosen["at"], "by": by,
+           "ok": False, "integrity": None, "counts": {}, "missing_tables": [], "newest_order": None, "problems": []}
+    try:
+        copy = os.path.join(spare, chosen["name"])
+        shutil.copy2(os.path.join(folder, chosen["name"]), copy)
+        res["size"] = os.path.getsize(copy)
+        con = sqlite3.connect("file:" + copy.replace("\\", "/") + "?mode=ro", uri=True)
+        try:
+            res["integrity"] = con.execute("PRAGMA integrity_check").fetchone()[0]
+            have = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            res["missing_tables"] = sorted(set(models.Base.metadata.tables) - have)
+            for t in _RESTORE_KEY_TABLES:
+                if t in have:
+                    b = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                    live = db.execute(sa_text(f"SELECT COUNT(*) FROM {t}")).scalar()
+                    res["counts"][t] = {"backup": b, "live": live}
+            if "work_orders" in have:
+                r = con.execute("SELECT MAX(received_date) FROM work_orders").fetchone()
+                res["newest_order"] = str(r[0]) if r and r[0] else None
+        finally:
+            con.close()
+        if res["integrity"] != "ok":
+            res["problems"].append("The database file failed its integrity check.")
+        for t in ("users", "processes"):
+            c = res["counts"].get(t)
+            if c is None:
+                res["problems"].append(f"Table '{t}' is missing from the backup.")
+            elif c["backup"] == 0 and c["live"] > 0:
+                res["problems"].append(f"Table '{t}' is empty in the backup but has {c['live']} rows now.")
+        wo = res["counts"].get("work_orders")
+        if wo and wo["backup"] == 0 and wo["live"] > 50:
+            res["problems"].append("The backup holds no orders although the app does.")
+        res["ok"] = not res["problems"]
+    except Exception as e:
+        res["problems"].append(f"Could not open the restored copy: {e}")
+    finally:
+        shutil.rmtree(spare, ignore_errors=True)
+    res["seconds"] = round(_t.perf_counter() - t0, 1)
+    _set_setting(db, "restore_check", json.dumps(res))
+    hist = _restore_state(db)["history"]
+    hist.insert(0, {k: res[k] for k in ("at", "backup", "ok", "by")})
+    _set_setting(db, "restore_check_hist", json.dumps(hist[:8]))
+    _audit(db, None, "Backup", "Restore test " + ("passed" if res["ok"] else "FAILED"), None, None, f"{res['backup']} ({by})" + ("" if res["ok"] else ": " + "; ".join(res["problems"])[:300]))
+    db.commit()
+    (logging.getLogger("workflowhub").info if res["ok"] else logging.getLogger("workflowhub").error)("restore test %s backup=%s by=%s %s", "OK" if res["ok"] else "FAILED", res["backup"], by, "; ".join(res["problems"]))
+    return res
+
+
+@app.post("/backup/verify")
+def backup_verify(payload: Optional[dict] = None, current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    try:
+        return _run_restore_check(db, (payload or {}).get("name"), current_user.full_name)
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def _auto_restore_check():
+    """Quarterly (when never tested, older than 90 days, or last test failed): tests the newest backup. At most one try a day."""
+    db = SessionLocal()
+    try:
+        if not _sqlite_path() or not _list_backups():
+            return
+        st = _restore_state(db)
+        today = datetime.now(IST).date().isoformat()
+        if st["due"] and _setting(db, "restore_check_try", "") != today:
+            _set_setting(db, "restore_check_try", today)
+            db.commit()
+            _run_restore_check(db, None, "automatic")
+    finally:
+        db.close()
+
+
+def _scheduled_jobs_loop():
+    """Once a minute: automatic database backup, production summary emails."""
+    import time as _t
+    while True:
+        _t.sleep(60)
+        db = SessionLocal()
+        try:
+            if not _jobs_leader(db):
+                continue
+            now = datetime.now(IST)
+            bs = _backup_settings(db)
+            if bs["auto"] and _sqlite_path():
+                try:
+                    hh, mm = (int(x) for x in bs["time"].split(":"))
+                except ValueError:
+                    hh, mm = 22, 0
+                if (now.hour, now.minute) >= (hh, mm) and _setting(db, BACKUP_KEYS["last_auto"], "") != now.date().isoformat():
+                    _set_setting(db, BACKUP_KEYS["last_auto"], now.date().isoformat())
+                    db.commit()
+                    try:
+                        print("[backup]", _make_backup("auto"))
+                        _prune_backups(db)
+                    except Exception as e:
+                        logging.getLogger("workflowhub").error("backup failed: %s", e); print("[backup] failed:", e)
+            ms = _mgmt_settings(db)
+            if ms["smtp_configured"] and (ms["daily"] or ms["weekly"]):
+                try:
+                    hh, mm = (int(x) for x in ms["time"].split(":"))
+                except ValueError:
+                    hh, mm = 9, 0
+                if (now.hour, now.minute) >= (hh, mm):
+                    if ms["daily"] and ms["last_daily"] != now.date().isoformat():
+                        _set_setting(db, MGMT_KEYS["last_d"], now.date().isoformat()); db.commit()
+                        print("[summary daily]", run_management_summary(db, "daily"))
+                    if ms["weekly"] and now.weekday() == 0 and ms["last_weekly"] != now.date().isoformat():
+                        _set_setting(db, MGMT_KEYS["last_w"], now.date().isoformat()); db.commit()
+                        print("[summary weekly]", run_management_summary(db, "weekly"))
+            if datetime.now(IST).hour == 23 and datetime.now(IST).minute >= 30:
+                try:
+                    _auto_restore_check()
+                except Exception as e:
+                    logging.getLogger("workflowhub").error("restore test error: %s", e)
+            if now.weekday() == 6 and now.hour == 2:
+                try:
+                    _auto_archive()
+                except Exception as e:
+                    logging.getLogger("workflowhub").error("auto archive error: %s", e)
+            if datetime.now(IST).minute % 15 == 0:
+                try:
+                    _esc_auto_reminders()
+                except Exception as e:
+                    print("[esc reminders] error:", e)
+        except Exception as e:
+            logging.getLogger("workflowhub").error("jobs error: %s", e); print("[jobs] error:", e)
+        finally:
+            db.close()
+
+
+# ======================================================================
+# Workload balancing, time-per-order benchmarks, end-of-day checklist
+# ======================================================================
+def _median(vals):
+    v = sorted(vals)
+    n = len(v)
+    if not n:
+        return 0
+    return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2
+
+
+@app.get("/workload")
+def workload_view(
+    process_id: Optional[int] = None,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Each colleague's open orders, completed today and average time per order, with overloaded / idle flags and open orders ready to reassign."""
+    W, U = models.WorkOrder, models.User
+    if process_id is not None and current_user.role == "team_lead":
+        _require_process_access(current_user, process_id)
+    cq = db.query(U).options(selectinload(U.processes)).filter(U.role == "colleague", U.employment_status != "Inactive")
+    if current_user.role == "team_lead":
+        cq = cq.filter(U.reporting_manager == current_user.full_name)
+    cols = cq.all()
+    if process_id is not None:
+        cols = [c for c in cols if any(p.id == process_id for p in c.processes)]
+    elif current_user.role == "team_lead":
+        mine = {p.id for p in current_user.processes}
+        cols = [c for c in cols if any(p.id in mine for p in c.processes)]
+    ids = [c.id for c in cols]
+    today = _work_today()
+    week_ago = today - timedelta(days=6)
+    open_by, done_today, done_week = {}, {}, {}
+    oq = db.query(W).filter(W.assigned_to_id.in_(ids) if ids else sa_false(), W.submitted.is_(False), func.coalesce(W.posting_status, "") != "Completed")
+    if process_id is not None:
+        oq = oq.filter(W.process_id == process_id)
+    for o in oq.all():
+        open_by.setdefault(o.assigned_to_id, []).append(o)
+    dq = db.query(W).filter(W.assigned_to_id.in_(ids) if ids else sa_false(), W.posting_status == "Completed", W.posted_date >= week_ago, W.posted_date <= today)
+    if process_id is not None:
+        dq = dq.filter(W.process_id == process_id)
+    for o in dq.all():
+        done_week.setdefault(o.assigned_to_id, []).append(o)
+        if o.posted_date == today:
+            done_today.setdefault(o.assigned_to_id, []).append(o)
+    on_leave = {u for (u,) in db.query(models.LeaveDay.user_id).filter(models.LeaveDay.leave_date == today).all()}
+    cache = {}
+    def avg_min(lst):
+        t = [o.time_taken_seconds for o in lst if (o.time_taken_seconds or 0) > 0]
+        return round(sum(t) / len(t) / 60, 1) if t else None
+    rows = []
+    for c in cols:
+        op = open_by.get(c.id, [])
+        dt, dw = done_today.get(c.id, []), done_week.get(c.id, [])
+        rows.append({"id": c.id, "name": c.full_name, "team_lead": c.reporting_manager or "", "process_ids": [p.id for p in c.processes], "on_leave": c.id in on_leave,
+                     "open": len(op), "in_process": sum(1 for o in op if not o.escalated and (o.posting_status or "") != "Clarification"),
+                     "escalated": sum(1 for o in op if o.escalated or (o.posting_status or "") == "Clarification"),
+                     "running": any(o.timer_status == "running" for o in op),
+                     "done_today": len(dt), "trans_today": sum(int(o.trans_count or 0) for o in dt), "avg_today": avg_min(dt), "done_7d": len(dw), "avg_7d": avg_min(dw),
+                     "orders": [{"id": o.id, "edm": o.edm or ("#%d" % o.id), "process_id": o.process_id, "status": o.posting_status or "Pending", "escalated": bool(o.escalated), "timer": o.timer_status,
+                                 "age": _order_age(o.received_date, datetime.now(IST).date(), cache) if o.received_date else None} for o in op]})
+    active = [r for r in rows if not r["on_leave"]]
+    avg_open = (sum(r["open"] for r in active) / len(active)) if active else 0
+    limit = max(3, int(avg_open * 1.5 + 0.999))
+    for r in rows:
+        r["flag"] = "leave" if r["on_leave"] else ("overloaded" if r["open"] >= limit else ("idle" if r["open"] == 0 else ""))
+    rows.sort(key=lambda r: (-r["open"], r["name"]))
+    unassigned = 0
+    scoped = _orders_dash_scope(db, current_user, process_id)
+    unassigned = scoped(db.query(func.count(W.id)).filter(W.assigned_to_id.is_(None), W.submitted.is_(False), func.coalesce(W.posting_status, "") != "Completed")).scalar() or 0
+    procs = {p.id: p.name for p in db.query(models.Process).all()}
+    return {"date": today.isoformat(), "overload_at": limit, "avg_open": round(avg_open, 1), "unassigned": unassigned, "processes": procs, "colleagues": rows,
+            "totals": {"open": sum(r["open"] for r in rows), "done_today": sum(r["done_today"] for r in rows), "trans_today": sum(r["trans_today"] for r in rows),
+                       "overloaded": sum(1 for r in rows if r["flag"] == "overloaded"), "idle": sum(1 for r in rows if r["flag"] == "idle")}}
+
+
+@app.get("/orders/time-benchmarks")
+def time_benchmarks(
+    process_id: Optional[int] = None,
+    period: str = "month",
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Completed orders' Time Taken against the process average: unusually long / short ones and timer mistakes, plus a per-colleague comparison."""
+    if period not in ("week", "month", "last_month"):
+        raise HTTPException(status_code=400, detail="period must be week, month or last_month")
+    W = models.WorkOrder
+    d1, d2, label = _period_range(period)
+    scoped = _orders_dash_scope(db, current_user, process_id)
+    rows = scoped(db.query(W).options(selectinload(W.process)).filter(W.posting_status == "Completed", W.posted_date >= d1, W.posted_date <= d2)).all()
+    by_proc = {}
+    for o in rows:
+        by_proc.setdefault(o.process_id, []).append(o)
+    stats = {}
+    for pid, lst in by_proc.items():
+        times = [o.time_taken_seconds for o in lst if (o.time_taken_seconds or 0) >= 30]
+        stats[pid] = {"process": lst[0].process.name if lst[0].process else "(none)", "orders": len(lst), "timed": len(times),
+                      "avg": round(sum(times) / len(times) / 60, 1) if times else None, "median": round(_median(times) / 60, 1) if times else None}
+    flagged, by_col = [], {}
+    for o in rows:
+        t = o.time_taken_seconds or 0
+        st = stats[o.process_id]
+        med = (st["median"] or 0) * 60
+        why = None
+        if t == 0 or t < 30:
+            why = "No time recorded (timer not used)"
+        elif t > 8 * 3600:
+            why = "Over 8 hours - timer left running?"
+        elif st["timed"] >= 5 and med:
+            if t >= 2 * med and t - med >= 600:
+                why = "Much longer than usual"
+            elif t <= 0.25 * med and med - t >= 120:
+                why = "Much shorter than usual"
+        name = o.employee_name or "(unknown)"
+        g = by_col.setdefault((o.process_id, name), {"name": name, "process": st["process"], "orders": 0, "times": [], "flags": 0})
+        g["orders"] += 1
+        if t >= 30:
+            g["times"].append(t)
+        if why:
+            g["flags"] += 1
+            flagged.append({"id": o.id, "edm": o.edm or ("#%d" % o.id), "process": st["process"], "colleague": name, "posted": o.posted_date.isoformat() if o.posted_date else "",
+                            "minutes": round(t / 60, 1), "process_avg": st["avg"], "process_median": st["median"], "ratio": round(t / med, 1) if med and t else None, "why": why})
+    order_why = {"Over 8 hours - timer left running?": 0, "Much longer than usual": 1, "Much shorter than usual": 2, "No time recorded (timer not used)": 3}
+    flagged.sort(key=lambda f: (order_why[f["why"]], -(f["minutes"] or 0)))
+    cols = []
+    for g in by_col.values():
+        pavg = next((s["avg"] for s in stats.values() if s["process"] == g["process"]), None)
+        avg = round(sum(g["times"]) / len(g["times"]) / 60, 1) if g["times"] else None
+        cols.append({"name": g["name"], "process": g["process"], "orders": g["orders"], "avg": avg, "process_avg": pavg,
+                     "vs_process": round((avg / pavg - 1) * 100) if avg and pavg else None, "flags": g["flags"]})
+    cols.sort(key=lambda c: (c["process"], -(c["vs_process"] if c["vs_process"] is not None else -999)))
+    return {"label": label, "from": d1.isoformat(), "to": d2.isoformat(), "processes": sorted(stats.values(), key=lambda s: s["process"]), "colleagues": cols,
+            "flagged": flagged[:300], "flag_total": len(flagged), "orders": len(rows)}
+
+
+@app.get("/orders/day-checklist")
+def day_checklist(
+    process_id: int,
+    current_user: models.User = Depends(auth.require_role("colleague")),
+    db: Session = Depends(get_db),
+):
+    """What a colleague may have forgotten before Submit End of Day (advisory only)."""
+    _require_process_access(current_user, process_id)
+    W = models.WorkOrder
+    mine = db.query(W).filter(W.process_id == process_id, W.assigned_to_id == current_user.id, W.submitted.is_(False)).all()
+    def item(o, extra=""):
+        return {"id": o.id, "edm": o.edm or ("#%d" % o.id), "note": extra}
+    unstarted, running, clar, nohours, ready = [], [], [], [], 0
+    for o in mine:
+        done = (o.posting_status or "") == "Completed"
+        if done:
+            ready += 1
+            if (o.time_taken_seconds or 0) < 30:
+                nohours.append(item(o, "No Time Taken recorded"))
+            elif not o.trans_count:
+                nohours.append(item(o, "Trans Count is empty"))
+        elif o.escalated or (o.posting_status or "") == "Clarification":
+            clar.append(item(o, "Waiting with " + _holder_all(o) if (o.onshore_status or _holder_all(o) != "Team Lead") else "Waiting for Team Lead"))
+        elif o.timer_status == "not_started":
+            unstarted.append(item(o, "Timer never started"))
+        elif o.timer_status == "running":
+            running.append(item(o, "Timer is still running"))
+    return {"ready": ready, "unstarted": unstarted, "running": running, "clarification": clar, "missing_time": nohours,
+            "issues": len(unstarted) + len(running) + len(clar) + len(nohours)}
+
+
+# ======================================================================
+# Process update acknowledgement tracking, new joiner view, notifications centre
+# ======================================================================
+def _unack_scan(db: Session, user: models.User) -> list:
+    """Active, acknowledgement-required updates (last 90 days) with the colleagues in this user's scope who have not acknowledged yet."""
+    since = datetime.utcnow() - timedelta(days=90)
+    uq = db.query(models.ProcessUpdate).options(selectinload(models.ProcessUpdate.attachments)).filter(
+        models.ProcessUpdate.ack_required.is_(True), models.ProcessUpdate.status == "Active", models.ProcessUpdate.created_at >= since)
+    if user.role == "team_lead":
+        mine = [p.id for p in user.processes]
+        uq = uq.filter(models.ProcessUpdate.process_id.in_(mine or [-1]))
+    updates = uq.order_by(models.ProcessUpdate.created_at.desc()).all()
+    if not updates:
+        return []
+    colleagues = [u for u in _batch_visible_colleagues(db, user) if u.employment_status != "Inactive"]
+    for u in colleagues:
+        u.processes  # load
+    ids = [u.id for u in updates]
+    got = {}
+    for a in db.query(models.ProcessUpdateAck.update_id, models.ProcessUpdateAck.user_id).filter(models.ProcessUpdateAck.update_id.in_(ids)).all():
+        got.setdefault(a[0], set()).add(a[1])
+    last_rem = {}
+    for r in db.query(models.UpdateReminder).filter(models.UpdateReminder.update_id.in_(ids)).all():
+        k = (r.update_id, r.user_id)
+        if k not in last_rem or r.sent_at > last_rem[k]:
+            last_rem[k] = r.sent_at
+    procs = {p.id: p.name for p in db.query(models.Process).all()}
+    out = []
+    for up in updates:
+        scope = [c for c in colleagues if any(p.id == up.process_id for p in c.processes)]
+        pending = [c for c in scope if c.id not in got.get(up.id, set())]
+        out.append({"id": up.id, "process": procs.get(up.process_id, ""), "process_id": up.process_id, "message": (up.message or "")[:160], "posted_by": up.posted_by_name,
+                    "created_at": up.created_at.isoformat() + "Z" if up.created_at else "", "age_days": (datetime.utcnow() - up.created_at).days if up.created_at else 0,
+                    "total": len(scope), "acked": len(scope) - len(pending),
+                    "pending": [{"user_id": c.id, "name": c.full_name, "team_lead": c.reporting_manager or "", "reminded_at": last_rem[(up.id, c.id)].isoformat() + "Z" if (up.id, c.id) in last_rem else ""}
+                                for c in sorted(pending, key=lambda x: x.full_name.lower())]})
+    return out
+
+
+@app.get("/updates/unacknowledged")
+def unacknowledged_updates(current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")), db: Session = Depends(get_db)):
+    rows = [r for r in _unack_scan(db, current_user) if r["pending"]]
+    people = {}
+    for r in rows:
+        for c in r["pending"]:
+            g = people.setdefault(c["user_id"], {"name": c["name"], "team_lead": c["team_lead"], "count": 0})
+            g["count"] += 1
+    return {"total": sum(len(r["pending"]) for r in rows), "updates": rows, "colleagues": sorted(people.values(), key=lambda g: (-g["count"], g["name"])),
+            "smtp_configured": email_utils.is_configured()}
+
+
+@app.post("/updates/remind")
+def remind_unacknowledged(payload: dict, current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")), db: Session = Depends(get_db)):
+    """Remind colleagues who have not acknowledged: one update (update_id) or all (omit). Each person is reminded at most once a day per update."""
+    only = payload.get("update_id")
+    now = datetime.utcnow()
+    sent = skipped = emailed = 0
+    users = {u.id: u for u in _batch_visible_colleagues(db, current_user)}
+    per_user = {}
+    for r in _unack_scan(db, current_user):
+        if only is not None and r["id"] != only:
+            continue
+        for c in r["pending"]:
+            if c["reminded_at"] and (now - datetime.fromisoformat(c["reminded_at"].rstrip("Z"))) < timedelta(hours=20):
+                skipped += 1
+                continue
+            per_user.setdefault(c["user_id"], []).append(r)
+    for uid, ups in per_user.items():
+        u = users.get(uid)
+        if not u:
+            continue
+        mail = False
+        if u.email and email_utils.is_configured():
+            lines = [f"- {x['process']}: {x['message']}" for x in ups]
+            body = f"Hi {u.full_name},\n\n{current_user.full_name} asks you to review and acknowledge the following process update(s) in WorkFlow Hub:\n\n" + "\n".join(lines) + "\n\nOpen WorkFlow Hub > Home > Process Updates and click Acknowledge.\n"
+            mail = email_utils.send_email(u.email, "Reminder: please acknowledge process update(s)", body)
+            emailed += 1 if mail else 0
+        for x in ups:
+            db.add(models.UpdateReminder(update_id=x["id"], user_id=uid, sent_at=now, sent_by_name=current_user.full_name, emailed=mail))
+        sent += 1
+    _audit(db, current_user, "Update", "Sent acknowledgement reminders", details=f"{sent} colleague(s), {emailed} emailed" + (f", update #{only}" if only is not None else ""))
+    db.commit()
+    return {"reminded": sent, "emailed": emailed, "skipped_recent": skipped}
+
+
+@app.get("/new-joiners")
+def new_joiners(days: int = 60, target_orders: int = 5,
+                current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")), db: Session = Depends(get_db)):
+    """Ramp-up checklist per colleague who joined in the last N days (Date of Joining): processes, training updates acknowledged, first orders completed."""
+    days = max(7, min(int(days), 365))
+    target_orders = max(1, min(int(target_orders), 100))
+    today = datetime.now(IST).date()
+    cols = [u for u in _batch_visible_colleagues(db, current_user) if u.employment_status != "Inactive" and u.doj and u.doj >= today - timedelta(days=days)]
+    for c in cols:
+        c.processes
+    ids = [c.id for c in cols]
+    W = models.WorkOrder
+    done = {}
+    for o in db.query(W.assigned_to_id, W.process_id, W.posted_date, W.time_taken_seconds).filter(W.assigned_to_id.in_(ids or [-1]), W.posting_status == "Completed").all():
+        done.setdefault(o[0], []).append(o)
+    req = db.query(models.ProcessUpdate).filter(models.ProcessUpdate.ack_required.is_(True), models.ProcessUpdate.status == "Active").all()
+    acks = {}
+    for a in db.query(models.ProcessUpdateAck.update_id, models.ProcessUpdateAck.user_id).filter(models.ProcessUpdateAck.user_id.in_(ids or [-1])).all():
+        acks.setdefault(a[1], set()).add(a[0])
+    first_login = {}
+    for uid, mn in db.query(models.SessionLog.user_id, func.min(models.SessionLog.login_at)).filter(models.SessionLog.user_id.in_(ids or [-1])).group_by(models.SessionLog.user_id).all():
+        first_login[uid] = mn
+    out = []
+    for c in sorted(cols, key=lambda x: x.doj, reverse=True):
+        pids = {p.id for p in c.processes}
+        my_up = [u for u in req if u.process_id in pids and (u.created_at is None or u.created_at.date() >= c.doj - timedelta(days=30))]
+        got = acks.get(c.id, set())
+        d = done.get(c.id, [])
+        times = [x[3] for x in d if (x[3] or 0) >= 30]
+        steps = [
+            {"key": "profile", "label": "Profile complete (email, shift, Team Lead)", "ok": bool(c.email and c.shift and c.reporting_manager), "detail": ""},
+            {"key": "processes", "label": "Process assigned", "ok": bool(pids), "detail": ", ".join(sorted(p.name for p in c.processes))},
+            {"key": "login", "label": "Has logged in", "ok": c.id in first_login or bool(c.last_login_date), "detail": (first_login[c.id] + timedelta(hours=5, minutes=30)).strftime("%d %b") if c.id in first_login else ""},
+            {"key": "training", "label": "Training updates acknowledged", "ok": bool(my_up) and all(u.id in got for u in my_up) or not my_up,
+             "detail": f"{sum(1 for u in my_up if u.id in got)} of {len(my_up)}" if my_up else "No updates to acknowledge"},
+            {"key": "orders", "label": f"First {target_orders} orders completed", "ok": len(d) >= target_orders, "detail": f"{len(d)} completed" + (f", avg {round(sum(times) / len(times) / 60, 1)} min" if times else "")},
+        ]
+        out.append({"id": c.id, "name": c.full_name, "team_lead": c.reporting_manager or "", "doj": c.doj.isoformat(), "days": (today - c.doj).days, "steps": steps,
+                    "progress": round(100 * sum(1 for s in steps if s["ok"]) / len(steps)), "first_order": min((x[2] for x in d if x[2]), default=None) and min(x[2] for x in d if x[2]).isoformat()})
+    return {"days": days, "target_orders": target_orders, "joiners": out, "no_doj": sum(1 for u in _batch_visible_colleagues(db, current_user) if u.employment_status != "Inactive" and not u.doj)}
+
+
+def _bell_seen(db: Session, user: models.User, kind: str):
+    v = _setting(db, f"bellseen_{user.id}_{kind}", "")
+    try:
+        return datetime.fromisoformat(v) if v else None
+    except ValueError:
+        return None
+
+
+@app.post("/notifications/seen")
+def notifications_seen(payload: dict, current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
+    """Mark 'reply / decision' notifications as read so they stop counting on the bell."""
+    for k in payload.get("kinds") or []:
+        if k in ("query", "request"):
+            _set_setting(db, f"bellseen_{current_user.id}_{k}", datetime.utcnow().isoformat())
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/notifications")
+def notifications(current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
+    """Everything that needs this user's attention, grouped. 'go' tells the screen where to open."""
+    role = current_user.role
+    items = []
+    def add(kind, title, count, detail="", go=""):
+        if count:
+            items.append({"kind": kind, "title": title, "count": count, "detail": detail, "go": go})
+    now = datetime.utcnow()
+    if role == "colleague":
+        pids = [p.id for p in current_user.processes]
+        if pids:
+            req = db.query(models.ProcessUpdate).filter(models.ProcessUpdate.process_id.in_(pids), models.ProcessUpdate.ack_required.is_(True), models.ProcessUpdate.status == "Active",
+                                                        models.ProcessUpdate.created_at >= now - timedelta(days=90)).all()
+            got = {a for (a,) in db.query(models.ProcessUpdateAck.update_id).filter(models.ProcessUpdateAck.user_id == current_user.id).all()}
+            pend = [u for u in req if u.id not in got]
+            if pend:
+                rem = db.query(models.UpdateReminder).filter(models.UpdateReminder.user_id == current_user.id, models.UpdateReminder.update_id.in_([u.id for u in pend])).order_by(models.UpdateReminder.sent_at.desc()).first()
+                add("ack", "Process updates waiting for your acknowledgement", len(pend), (f"Reminder from {rem.sent_by_name}. " if rem else "") + (pend[0].message or "")[:80], "home")
+        since = now - timedelta(days=7)
+        sq = max(since, _bell_seen(db, current_user, "query") or since)
+        sr = max(since, _bell_seen(db, current_user, "request") or since)
+        add("query", "Replies to your questions", db.query(models.BreakQuery).filter(models.BreakQuery.user_id == current_user.id, models.BreakQuery.status == "Resolved", models.BreakQuery.replied_at > sq).count(), "New since you last looked", "breaks")
+        add("request", "Decisions on your break requests", db.query(models.BreakRequest).filter(models.BreakRequest.user_id == current_user.id, models.BreakRequest.status.in_(["Approved", "Rejected"]), models.BreakRequest.decided_at > sr).count(), "New since you last looked", "breaks")
+    elif role in ("team_lead", "admin", "manager", "super_admin"):
+        ids = [u.id for u in _batch_visible_colleagues(db, current_user)]
+        add("request", "Break requests waiting for your decision", db.query(models.BreakRequest).filter(models.BreakRequest.user_id.in_(ids or [-1]), models.BreakRequest.status == "Pending").count(), "Approve or reject", "requests")
+        add("query", "Colleague questions waiting for a reply", db.query(models.BreakQuery).filter(models.BreakQuery.user_id.in_(ids or [-1]), models.BreakQuery.status == "Open").count(), "About adjustments, leave or shift changes", "queries")
+        W = models.WorkOrder
+        scoped = _orders_dash_scope(db, current_user, None)
+        esc = scoped(db.query(W).filter(or_(W.escalated.is_(True), W.onshore_status.in_(("red", "yellow"))), W.submitted.is_(False))).all()
+        mine = [o for o in esc if "Team Lead" in _holders(o)]
+        add("escalation", "Escalations waiting for a Team Lead", len(mine), "Clarification / onshore reply needs your action", "escalations")
+        try:
+            od = _esc_overdue_rows(db, _esc_open_orders(db, scoped), _esc_rem_settings(db)) if _esc_rem_settings(db)["enabled"] else []
+            add("escalation", "Escalations waiting too long with Onshore / Recon / Calling", len(od), "Past the time limit - send a reminder", "aging")
+        except Exception as e:
+            print("[bell] overdue:", e)
+        if role == "super_admin" and _sqlite_path() and _list_backups():
+            rs = _restore_state(db)
+            if rs["last"] and not rs["last"].get("ok"):
+                add("backup", "Backup restore test FAILED", 1, "Open Admin, Backup to see why", "backup")
+            elif rs["due"]:
+                add("backup", "Backup restore test is due", 1, "Never tested" if not rs["last"] else f"Last tested {rs['days_since']} days ago", "backup")
+        un = [r for r in _unack_scan(db, current_user) if r["pending"]]
+        add("ack", "Process update acknowledgements pending", sum(len(r["pending"]) for r in un), f"{len(un)} update(s) - send reminders", "unack")
+        warn, late = _sla_days(db)
+        today = datetime.now(IST).date()
+        cache = {}
+        late_n = sum(1 for (rd,) in scoped(db.query(W.received_date).filter(W.received_date.isnot(None), W.submitted.is_(False), func.coalesce(W.posting_status, "") != "Completed")).all() if _order_age(rd, today, cache) >= late)
+        add("aging", "Late orders", late_n, f"{late}+ business days old", "aging")
+        if role == "super_admin" and _sqlite_path():
+            items_b = _list_backups()
+            last = datetime.fromisoformat(items_b[0]["at"]) if items_b else None
+            days = (datetime.now(IST).replace(tzinfo=None) - last).days if last else None
+            if days is None or days >= 7:
+                add("backup", "Database backup overdue", 1, "No backup for a week" if days is not None else "No backup made yet", "backup")
+    return {"total": sum(i["count"] for i in items), "items": items}
+
+
+# ======================================================================
+# Data clean-up: archive old orders (Super Admin)
+# ======================================================================
+def _archive_dir() -> str:
+    p = _sqlite_path()
+    base = os.path.dirname(p) if p else os.getcwd()
+    d = os.path.join(base, "archives")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _archive_query(db: Session, months: int, process_id: Optional[int]):
+    W = models.WorkOrder
+    cutoff = datetime.utcnow() - timedelta(days=30 * months)
+    q = db.query(W).filter(W.submitted.is_(True), W.submitted_at.isnot(None), W.submitted_at < cutoff)
+    if process_id is not None:
+        q = q.filter(W.process_id == process_id)
+    return q, cutoff
+
+
+def _check_months(months: int) -> int:
+    if months < 3 or months > 120:
+        raise HTTPException(status_code=400, detail="Archive orders older than 3 to 120 months (nothing newer than 3 months is ever archived)")
+    return months
+
+
+def _archive_execute(db: Session, actor, months: int, pid: Optional[int], orders: list, auto: bool = False) -> dict:
+    """Safety backup, CSV file, then delete. Nothing is deleted unless both the backup and the file succeed."""
+    W = models.WorkOrder
+    backup = None
+    if _sqlite_path():
+        try:
+            backup = _make_backup("pre")["name"]
+        except Exception as e:
+            raise HTTPException(status_code=500, detail="Could not take the safety backup, so nothing was deleted: " + str(e))
+    name = f"archive_{datetime.now(IST).strftime('%Y%m%d_%H%M%S')}_{len(orders)}orders.csv"
+    path = os.path.join(_archive_dir(), name)
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        f.write(_archive_csv(db, orders))
+    if not os.path.exists(path) or os.path.getsize(path) < 20:
+        raise HTTPException(status_code=500, detail="Could not save the archive file, so nothing was deleted")
+    ids = [o.id for o in orders]
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        db.query(models.Posting835Line).filter(models.Posting835Line.order_id.in_(chunk)).delete(synchronize_session=False)
+        db.query(models.OnshoreAttachment).filter(models.OnshoreAttachment.order_id.in_(chunk)).delete(synchronize_session=False)
+        db.query(models.OnshoreMessage).filter(models.OnshoreMessage.order_id.in_(chunk)).delete(synchronize_session=False)
+        db.query(models.ClarificationDetail).filter(models.ClarificationDetail.order_id.in_(chunk)).delete(synchronize_session=False)
+        db.query(models.EscalationDetail).filter(models.EscalationDetail.order_id.in_(chunk)).delete(synchronize_session=False)
+        db.query(W).filter(W.id.in_(chunk)).delete(synchronize_session=False)
+    _audit(db, actor, "Archive", ("Auto-archived old orders" if auto else "Archived and deleted old orders"), None, None,
+           f"{len(ids)} order(s) older than {months} months" + (f" (one process)" if pid else " (all processes)") + f"; file {name}" + (f"; backup {backup}" if backup else ""))
+    db.commit()
+    if _sqlite_path():
+        try:
+            with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                conn.exec_driver_sql("VACUUM")
+        except Exception as e:
+            print("[archive] vacuum skipped:", e)
+    return {"archived": len(ids), "file": name, "backup": backup}
+
+
+ARCH_KEYS = {"auto": "archive_auto", "months": "archive_auto_months", "last": "archive_auto_last", "result": "archive_auto_result"}
+
+
+def _arch_settings(db: Session) -> dict:
+    try:
+        months = int(_setting(db, ARCH_KEYS["months"], "12"))
+    except ValueError:
+        months = 12
+    return {"auto": _setting(db, ARCH_KEYS["auto"], "0") == "1", "months": max(3, min(120, months)),
+            "last": _setting(db, ARCH_KEYS["last"], ""), "result": _setting(db, ARCH_KEYS["result"], ""),
+            "supported": bool(_sqlite_path())}
+
+
+def _auto_archive(force: bool = False):
+    """Weekly, leader only. Same steps as the manual archive (backup, CSV, delete); never newer than 3 months."""
+    db = SessionLocal()
+    try:
+        st = _arch_settings(db)
+        if (not st["auto"] and not force) or not st["supported"]:
+            return
+        today = datetime.now(IST).date().isoformat()
+        if st["last"] == today:
+            return
+        _set_setting(db, ARCH_KEYS["last"], today); db.commit()
+        q, _c = _archive_query(db, st["months"], None)
+        orders = q.order_by(models.WorkOrder.id).all()
+        if not orders:
+            _set_setting(db, ARCH_KEYS["result"], f"{today}: nothing older than {st['months']} months"); db.commit()
+            return
+        try:
+            res = _archive_execute(db, None, st["months"], None, orders, auto=True)
+            msg = f"{today}: archived {res['archived']} orders to {res['file']}"
+        except Exception as e:
+            db.rollback()
+            msg = f"{today}: FAILED, nothing deleted ({getattr(e, 'detail', e)})"
+            logging.getLogger("workflowhub").error("auto archive failed: %s", msg)
+        _set_setting(db, ARCH_KEYS["result"], msg); db.commit()
+    finally:
+        db.close()
+
+
+@app.get("/system/health")
+def system_health(current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    """One screen for the Super Admin: is anything going wrong? Problems are listed first, in plain words."""
+    issues = []
+    now = datetime.now(IST)
+    p = _sqlite_path()
+    # database
+    dbinfo = {"kind": "SQLite file" if p else "PostgreSQL", "size": None, "free_disk": None}
+    try:
+        if p:
+            dbinfo["size"] = os.path.getsize(p) + (os.path.getsize(p + "-wal") if os.path.exists(p + "-wal") else 0)
+            dbinfo["free_disk"] = shutil.disk_usage(os.path.dirname(p)).free
+            if dbinfo["free_disk"] < 1024 ** 3:
+                issues.append(("red", "Disk space is low (under 1 GB free)"))
+        else:
+            dbinfo["size"] = db.execute(sa_text("SELECT pg_database_size(current_database())")).scalar()
+    except Exception:
+        pass
+    t0 = time.perf_counter()
+    db.execute(sa_text("SELECT 1"))
+    dbinfo["ping_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+    M = models
+    rows = {"Orders": db.query(func.count(M.WorkOrder.id)).scalar() or 0, "Users": db.query(func.count(M.User.id)).scalar() or 0,
+            "Activity log entries": db.query(func.count(M.AuditEvent.id)).scalar() or 0, "Quality errors": db.query(func.count(M.QualityError.id)).scalar() or 0,
+            "835 posting lines": db.query(func.count(M.Posting835Line.id)).scalar() or 0}
+    cutoff = datetime.utcnow() - timedelta(minutes=5)
+    online = db.query(func.count(func.distinct(M.SessionLog.user_id))).filter(M.SessionLog.logout_at.is_(None), M.SessionLog.last_seen >= cutoff).scalar() or 0
+    old = db.query(func.count(M.WorkOrder.id)).filter(M.WorkOrder.submitted.is_(True), M.WorkOrder.submitted_at < datetime.utcnow() - timedelta(days=365)).scalar() or 0
+    if old > 5000:
+        issues.append(("amber", f"{old} submitted orders are over 12 months old - consider archiving (Admin > Data clean-up)"))
+    # backups
+    bk = {"supported": bool(p)}
+    if p:
+        items = _list_backups()
+        last = datetime.fromisoformat(items[0]["at"]) if items else None
+        days = (now.replace(tzinfo=None) - last).days if last else None
+        rs = _restore_state(db)
+        bk.update({"last": items[0]["at"] if items else None, "days_since": days, "count": len(items), "auto": _backup_settings(db)["auto"],
+                   "restore_ok": (rs["last"] or {}).get("ok"), "restore_at": (rs["last"] or {}).get("at"), "restore_due": rs["due"]})
+        if not items:
+            issues.append(("red", "No backup has ever been made"))
+        elif days is not None and days >= 2:
+            issues.append(("red" if days >= 7 else "amber", f"Last backup was {days} days ago"))
+        if rs["last"] and not rs["last"].get("ok"):
+            issues.append(("red", "The last restore test FAILED - a backup may not be usable"))
+        elif rs["due"]:
+            issues.append(("amber", "A restore test is due (Admin > Backup)"))
+    # email
+    em = {"configured": email_utils.is_configured(), "last_ok": email_utils.last_result.get("ok_at"), "last_try": email_utils.last_result.get("at"),
+          "last_ok_flag": email_utils.last_result.get("ok"), "error": email_utils.last_result.get("error", "")}
+    if not em["configured"]:
+        issues.append(("amber", "Email (SMTP) is not set up - no reminders or summaries will be sent"))
+    elif em["last_ok_flag"] is False:
+        issues.append(("red", "The last email failed: " + (em["error"] or "unknown reason")))
+    # errors today / yesterday
+    er = {"today": 0, "yesterday": 0, "warnings_today": 0, "last": None}
+    try:
+        for i, day in enumerate((now.strftime("%Y-%m-%d"), (now - timedelta(days=1)).strftime("%Y-%m-%d"))):
+            ents = _read_log_entries(day)
+            n = [e for e in ents if e["level"] == "ERROR"]
+            er["today" if i == 0 else "yesterday"] = len(n)
+            if i == 0:
+                er["warnings_today"] = len([e for e in ents if e["level"] == "WARNING"])
+                if n:
+                    er["last"] = {"at": n[-1]["at"], "text": n[-1]["text"].split("\n")[0][:240]}
+    except Exception:
+        pass
+    if er["today"]:
+        issues.append(("red" if er["today"] >= 5 else "amber", f"{er['today']} error(s) logged today (see System log)"))
+    # slowest endpoints (this server process since it started)
+    eps = []
+    with _EP_LOCK:
+        for k, e in _EP.items():
+            r = sorted(e["recent"])
+            if not r:
+                continue
+            eps.append({"endpoint": k, "calls": e["n"], "avg_ms": round(e["total"] / e["n"]), "p95_ms": round(r[min(len(r) - 1, int(len(r) * 0.95))]),
+                        "max_ms": round(e["max"]), "errors": e["errors"]})
+    eps.sort(key=lambda x: x["p95_ms"], reverse=True)
+    slow = [e for e in eps if e["calls"] >= 3 and e["p95_ms"] >= 1500]
+    if slow:
+        issues.append(("amber", f"{len(slow)} endpoint(s) are slow (95% of calls over 1.5 s): " + ", ".join(e["endpoint"] for e in slow[:3])))
+    ar = _arch_settings(db)
+    if ar["result"] and "FAILED" in ar["result"]:
+        issues.append(("red", "Automatic archiving failed: " + ar["result"]))
+    rank = {"red": 0, "amber": 1}
+    issues.sort(key=lambda x: rank[x[0]])
+    status = "red" if any(i[0] == "red" for i in issues) else ("amber" if issues else "green")
+    return {"status": status, "issues": [{"level": a, "text": b} for a, b in issues], "time": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "uptime_hours": round((now - _STARTED).total_seconds() / 3600, 1), "started": _STARTED.strftime("%Y-%m-%d %H:%M"),
+            "online_now": online, "database": dbinfo, "rows": rows, "backup": bk, "email": em, "errors": er,
+            "slowest": eps[:12], "archive": {"auto": ar["auto"], "result": ar["result"], "supported": ar["supported"]},
+            "note": "Endpoint timings are for this server process since it started (they reset on restart)."}
+
+
+@app.get("/archive/auto")
+def archive_auto_get(current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    return _arch_settings(db)
+
+
+@app.put("/archive/auto")
+def archive_auto_put(payload: dict, current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    if not _sqlite_path():
+        raise HTTPException(status_code=400, detail="Automatic archiving needs the laptop (SQLite) version, because the archive file must be kept on disk")
+    try:
+        months = _check_months(int(payload.get("months", 12)))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid months")
+    on = bool(payload.get("auto"))
+    _set_setting(db, ARCH_KEYS["auto"], "1" if on else "0")
+    _set_setting(db, ARCH_KEYS["months"], str(months))
+    _audit(db, current_user, "Archive", "Automatic archiving " + ("turned on" if on else "turned off"), None, None, f"older than {months} months, Sundays 02:00 IST")
+    db.commit()
+    return _arch_settings(db)
+
+
+@app.post("/archive/auto/run-now")
+def archive_auto_run_now(current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    _set_setting(db, ARCH_KEYS["last"], ""); db.commit()
+    _auto_archive(force=True)
+    return _arch_settings(db)
+
+
+@app.get("/archive/preview")
+def archive_preview(months: int = 12, process_id: Optional[int] = None,
+                    current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    _check_months(months)
+    W = models.WorkOrder
+    q, cutoff = _archive_query(db, months, process_id)
+    ids_q = q.with_entities(W.id)
+    total = db.query(func.count(W.id)).filter(W.id.in_(ids_q.subquery())).scalar() or 0
+    by = db.query(models.Process.name, func.count(W.id), func.coalesce(func.sum(W.trans_count), 0), func.min(W.submitted_at), func.max(W.submitted_at)).join(
+        W, W.process_id == models.Process.id).filter(W.id.in_(ids_q.subquery())).group_by(models.Process.name).order_by(models.Process.name).all()
+    all_orders = db.query(func.count(W.id)).scalar() or 0
+    p = _sqlite_path()
+    return {"months": months, "cutoff": (cutoff + timedelta(hours=5, minutes=30)).date().isoformat(), "count": total, "all_orders": all_orders,
+            "by_process": [{"process": n, "orders": c, "trans": int(t or 0), "from": (a + timedelta(hours=5, minutes=30)).date().isoformat() if a else "", "to": (b + timedelta(hours=5, minutes=30)).date().isoformat() if b else ""} for n, c, t, a, b in by],
+            "db_size": os.path.getsize(p) if p and os.path.exists(p) else None, "sqlite": bool(p),
+            "confirm_text": f"ARCHIVE {total}"}
+
+
+def _archive_csv(db: Session, orders: list) -> str:
+    cols = [c.name for c in models.WorkOrder.__table__.columns]
+    procs = {pp.id: pp.name for pp in db.query(models.Process).all()}
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["process"] + cols)
+    for o in orders:
+        w.writerow([procs.get(o.process_id, "")] + [("" if getattr(o, c) is None else getattr(o, c)) for c in cols])
+    return buf.getvalue()
+
+
+@app.get("/archive/export")
+def archive_export(months: int = 12, process_id: Optional[int] = None,
+                   current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    """Download the orders that would be archived as a CSV (opens in Excel). Nothing is deleted."""
+    _check_months(months)
+    q, _c = _archive_query(db, months, process_id)
+    data = _archive_csv(db, q.order_by(models.WorkOrder.id).all())
+    _audit(db, current_user, "Archive", "Downloaded old-orders export", details=f"older than {months} months")
+    db.commit()
+    return Response(content="﻿" + data, media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="old_orders_{months}m.csv"'})
+
+
+@app.post("/archive/run")
+def archive_run(payload: dict, current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    """
+    Saves the old, already-in-Production orders to a CSV file, takes a database backup (laptop version), then deletes them.
+    The caller must type the exact confirmation text returned by /archive/preview (e.g. "ARCHIVE 1234") for the current count.
+    """
+    try:
+        months = int(payload.get("months", 12))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid months")
+    _check_months(months)
+    pid = payload.get("process_id")
+    pid = int(pid) if pid not in (None, "") else None
+    W = models.WorkOrder
+    q, cutoff = _archive_query(db, months, pid)
+    orders = q.order_by(W.id).all()
+    if not orders:
+        raise HTTPException(status_code=400, detail="There are no orders to archive for that selection")
+    expected = f"ARCHIVE {len(orders)}"
+    if str(payload.get("confirm", "")).strip() != expected:
+        raise HTTPException(status_code=400, detail=f'Confirmation does not match. Type exactly: {expected} (the number of orders can change if people are working - preview again)')
+    return _archive_execute(db, current_user, months, pid, orders)
+
+
+@app.get("/archive/files")
+def archive_files(current_user: models.User = Depends(auth.require_role("super_admin"))):
+    d = _archive_dir()
+    out = []
+    for n in os.listdir(d):
+        if re.fullmatch(r"archive_\d{8}_\d{6}_\d+orders\.csv", n):
+            out.append({"name": n, "size": os.path.getsize(os.path.join(d, n)), "at": datetime.strptime(n[8:23], "%Y%m%d_%H%M%S").isoformat()})
+    return {"folder": d, "files": sorted(out, key=lambda x: x["at"], reverse=True)}
+
+
+@app.get("/archive/download/{name}")
+def archive_download(name: str, current_user: models.User = Depends(auth.require_role("super_admin"))):
+    from fastapi.responses import FileResponse
+    if not re.fullmatch(r"archive_\d{8}_\d{6}_\d+orders\.csv", name or ""):
+        raise HTTPException(status_code=404, detail="File not found")
+    full = os.path.join(_archive_dir(), name)
+    if not os.path.exists(full):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(full, media_type="text/csv", filename=name)
+
+
+# ======================================================================
+# Festival banner for the lock screen (holiday today, or the working day before a holiday)
+# ======================================================================
+# (key, name pattern, title, wish, motif, colour 1, colour 2) - first match wins. ASCII only (the PC helper reads it as plain text).
+_FESTIVALS = [
+    ("diwali", r"diwali|deepavali|deepawali|dipavali", "Happy Diwali!", "May the festival of lights fill your home with joy, prosperity and good health.", "lamp", "#7b2d00", "#f26a21"),
+    ("karthigai", r"karthigai|karthikai|kartik purnima|dev deepawali", "Happy Karthigai Deepam!", "May the glow of the lamps bring light and happiness to your home.", "lamp", "#4a148c", "#ff8f00"),
+    ("pongal", r"pongal|thai pongal|mattu pongal|uzhavar", "Happy Pongal!", "Wishing you a harvest of happiness, prosperity and good health. Pongalo Pongal!", "pot", "#8d4a00", "#f4b400"),
+    ("sankranti", r"sankranti|uttarayan|makara", "Happy Makar Sankranti!", "May the sun bring warmth, success and new beginnings.", "sun", "#e65100", "#ffb300"),
+    ("lohri", r"lohri|bhogi", "Happy Bhogi / Lohri!", "Wishing you warmth, joy and a prosperous season.", "sun", "#bf360c", "#ff9800"),
+    ("tamil_ny", r"tamil new year|puthandu|varusha pirappu|chithirai", "Happy Tamil New Year!", "Iniya Tamil Puthandu Nalvazhthukkal! Wishing you a year of health and happiness.", "flower", "#1b5e20", "#c0a000"),
+    ("vishu", r"vishu", "Happy Vishu!", "Wishing you a bright and prosperous year ahead.", "flower", "#f57f17", "#2e7d32"),
+    ("ugadi", r"ugadi|gudi padwa|yugadi", "Happy Ugadi!", "Wishing you a new year full of fresh beginnings and happiness.", "flower", "#2e7d32", "#fbc02d"),
+    ("newyear", r"new year", "Happy New Year!", "Wishing you a year full of health, happiness and success.", "burst", "#0b2545", "#7b1fa2"),
+    ("republic", r"republic day", "Happy Republic Day!", "Proud to be Indian. Wishing you a joyful Republic Day.", "flag", "#e65100", "#1b7f3b"),
+    ("independence", r"independence day", "Happy Independence Day!", "Wishing you a proud and joyful Independence Day.", "flag", "#e65100", "#1b7f3b"),
+    ("gandhi", r"gandhi jayanti|gandhi", "Gandhi Jayanti", "Remembering Mahatma Gandhi - truth, peace and non-violence.", "star", "#37474f", "#78909c"),
+    ("labour", r"labou?r day|may day|workers", "Happy Labour Day!", "Thank you for your hard work and dedication.", "star", "#0d47a1", "#42a5f5"),
+    ("holi", r"\bholi\b|dhuleti", "Happy Holi!", "May your life be filled with colours of joy and happiness.", "flower", "#ad1457", "#ffb300"),
+    ("navaratri", r"navaratri|navratri|durga", "Happy Navaratri!", "Wishing you nine days of devotion, joy and blessings.", "lamp", "#880e4f", "#ff7043"),
+    ("pooja", r"ayudha|saraswati|vijayadashami|dussehra|dasara|dasera", "Happy Dussehra / Ayudha Pooja!", "Wishing you success and prosperity in everything you do.", "lamp", "#6a1b9a", "#ff8f00"),
+    ("ganesh", r"ganesh|vinayaka|vinayagar", "Happy Vinayaka Chaturthi!", "May Lord Ganesha bless you and remove all obstacles.", "lamp", "#e65100", "#ffca28"),
+    ("janmashtami", r"janmashtami|krishna jayanth|gokulashtami", "Happy Krishna Janmashtami!", "May Lord Krishna's blessings be with you and your family.", "lamp", "#0d47a1", "#4fc3f7"),
+    ("shivratri", r"shivaratri|shivratri", "Maha Shivaratri", "Om Namah Shivaya. Wishing you peace and blessings.", "lamp", "#1a237e", "#7986cb"),
+    ("rakhi", r"raksha bandhan|rakhi", "Happy Raksha Bandhan!", "Celebrating the bond of love between brothers and sisters.", "flower", "#c2185b", "#f8bbd0"),
+    ("onam", r"onam|thiruvonam", "Happy Onam!", "Wishing you a joyful Onam filled with prosperity and happiness.", "flower", "#f9a825", "#2e7d32"),
+    ("christmas", r"christmas|xmas", "Merry Christmas!", "Wishing you peace, joy and happiness this Christmas.", "tree", "#1b5e20", "#c62828"),
+    ("goodfriday", r"good friday", "Good Friday", "Wishing you a peaceful day of reflection.", "star", "#37474f", "#90a4ae"),
+    ("easter", r"easter", "Happy Easter!", "Wishing you a joyful and peaceful Easter.", "flower", "#6a1b9a", "#f48fb1"),
+    ("bakrid", r"bakrid|bakri id|eid.?al.?adha|eid.?ul.?adha|id.?ul.?zuha", "Eid Mubarak!", "Wishing you peace, happiness and blessings on Bakrid.", "crescent", "#004d40", "#26a69a"),
+    ("eid", r"\beid\b|ramzan|ramadan|id.?ul.?fitr|milad|muharram", "Eid Mubarak!", "Wishing you peace, happiness and prosperity.", "crescent", "#004d40", "#26a69a"),
+    ("thanksgiving", r"thanksgiving", "Happy Thanksgiving!", "Grateful for you and your work. Wishing you a warm Thanksgiving.", "sun", "#bf360c", "#ff8f00"),
+    ("memorial", r"memorial day", "Memorial Day", "Remembering and honouring those who served.", "flag", "#b71c1c", "#0d47a1"),
+    ("juneteenth", r"juneteenth", "Juneteenth", "Celebrating freedom and reflection.", "star", "#4e342e", "#a1887f"),
+]
+
+
+def _festival_for(name: str, d: date) -> dict:
+    n = name or ""
+    if re.search(r"independence day", n, re.I) and d.month == 7:
+        return {"key": "independence_us", "title": "Happy Independence Day!", "message": "Wishing you a safe and joyful Fourth of July.", "motif": "burst", "c1": "#b71c1c", "c2": "#0d47a1"}
+    if re.search(r"labor day", n, re.I) and d.month == 9:
+        return {"key": "laborday", "title": "Happy Labor Day!", "message": "Thank you for your hard work. Enjoy your well-earned rest.", "motif": "star", "c1": "#0d47a1", "c2": "#42a5f5"}
+    for key, pat, title, msg, motif, c1, c2 in _FESTIVALS:
+        if re.search(pat, n, re.I):
+            return {"key": key, "title": title, "message": msg, "motif": motif, "c1": c1, "c2": c2}
+    return {"key": "holiday", "title": "Happy Holiday!", "message": "Enjoy your day off and come back refreshed.", "motif": "star", "c1": "#0b2545", "c2": "#1c7ed6"}
+
+
+def _banner_for_day(db: Session, today: date):
+    """The festival banner for the lock screen: today if it is a company holiday, or on the last working day before a holiday."""
+    hol = {h.holiday_date: h.name for h in db.query(models.Holiday).filter(models.Holiday.holiday_date >= today, models.Holiday.holiday_date <= today + timedelta(days=12)).all()}
+    pick, when = None, ""
+    if today in hol:
+        pick, when = today, "today"
+    elif not _is_off_day(today, set(hol)):
+        d = today + timedelta(days=1)
+        run = []
+        while _is_off_day(d, set(hol)) and len(run) < 10:
+            run.append(d)
+            d += timedelta(days=1)
+        first = next((x for x in run if x in hol), None)
+        if first:
+            pick, when = first, ("tomorrow" if first == today + timedelta(days=1) else "ahead")
+    if not pick:
+        return None
+    b = _festival_for(hol[pick], pick)
+    b["holiday"] = hol[pick]
+    b["date"] = pick.isoformat()
+    b["when"] = when
+    b["note"] = ("Office holiday today" if when == "today" else "Holiday tomorrow - enjoy the break" if when == "tomorrow" else "Holiday on " + pick.strftime("%a %d %b") + " - enjoy the break")
+    return b
+
+
+@app.get("/breaks/banner")
+def lock_banner(current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
+    return {"banner": _banner_for_day(db, datetime.now(IST).date())}
+
+
+# ---------------------------------------------------------------------------
+# Error tracking & rework (feeds the Quality part of Performance)
+# ---------------------------------------------------------------------------
+QERR_LOG_ROLES = ("team_lead", "admin", "manager", "quality", "super_admin")
+QERR_VIEW_ROLES = ("colleague", "team_lead", "admin", "manager", "quality", "super_admin")
+QERR_DEFAULT_TYPES = ["Wrong amount", "Wrong account / patient", "Wrong payment code", "Missed posting",
+                      "Duplicate posting", "Wrong adjustment", "Not per guidelines", "Missing note / comment", "Other"]
+QERR_SEVERITIES = ("Minor", "Major", "Critical")
+
+
+def _qerr_types(db: Session) -> list:
+    try:
+        v = json.loads(_setting(db, "qerr_types", "") or "[]")
+        if isinstance(v, list) and v:
+            return [str(x) for x in v]
+    except ValueError:
+        pass
+    return list(QERR_DEFAULT_TYPES)
+
+
+def _qerr_scope_ids(db: Session, user: models.User) -> list:
+    return [u.id for u in _batch_visible_colleagues(db, user)]
+
+
+def _qerr_row(e: models.QualityError, names: dict, pnames: dict) -> dict:
+    return {
+        "id": e.id, "user_id": e.user_id, "colleague": names.get(e.user_id, "?"),
+        "process_id": e.process_id, "process": pnames.get(e.process_id, ""),
+        "order_id": e.order_id, "order_ref": e.order_ref or "", "error_date": e.error_date.isoformat() if e.error_date else None,
+        "error_type": e.error_type, "severity": e.severity or "", "notes": e.notes or "",
+        "rework_count": e.rework_count or 0, "rework_done": bool(e.rework_done),
+        "logged_by": e.logged_by_name or "",
+    }
+
+
+@app.get("/quality/error-types")
+def quality_error_types(current_user: models.User = Depends(auth.require_role(*QERR_VIEW_ROLES)), db: Session = Depends(get_db)):
+    return {"types": _qerr_types(db), "severities": list(QERR_SEVERITIES)}
+
+
+@app.put("/quality/error-types")
+def quality_set_error_types(payload: dict, current_user: models.User = Depends(auth.require_role("admin", "manager", "super_admin")),
+                            db: Session = Depends(get_db)):
+    types = []
+    for t in payload.get("types") or []:
+        t = " ".join(str(t).split())[:80]
+        if t and t not in types:
+            types.append(t)
+    if not types:
+        raise HTTPException(status_code=400, detail="Keep at least one error type")
+    _set_setting(db, "qerr_types", json.dumps(types))
+    _audit(db, current_user, "Quality", "Changed error types", None, None, ", ".join(types)[:300])
+    db.commit()
+    return {"types": types}
+
+
+@app.get("/quality/orders/lookup")
+def quality_order_lookup(q: str, current_user: models.User = Depends(auth.require_role(*QERR_LOG_ROLES)), db: Session = Depends(get_db)):
+    """Find an order by EDM / batch text so an error can be linked to it."""
+    q = (q or "").strip()
+    if len(q) < 2:
+        return []
+    query = db.query(models.WorkOrder).filter(models.WorkOrder.edm.ilike("%" + q + "%"))
+    if current_user.role != "super_admin":
+        pids = [p.id for p in current_user.processes]
+        query = query.filter(models.WorkOrder.process_id.in_(pids or [0]))
+    pn = {p.id: p.name for p in db.query(models.Process).all()}
+    un = {u.id: u.full_name for u in db.query(models.User.id, models.User.full_name).all()}
+    return [{"id": o.id, "edm": o.edm, "process_id": o.process_id, "process": pn.get(o.process_id, ""),
+             "user_id": o.assigned_to_id, "colleague": un.get(o.assigned_to_id) or o.employee_name or "",
+             "date": (o.posted_date or o.received_date).isoformat() if (o.posted_date or o.received_date) else None}
+            for o in query.order_by(models.WorkOrder.id.desc()).limit(15).all()]
+
+
+@app.get("/quality/errors/summary")
+def quality_errors_summary(start_date: Optional[date] = None, end_date: Optional[date] = None, process_id: Optional[int] = None,
+                           current_user: models.User = Depends(auth.require_role(*QERR_VIEW_ROLES)), db: Session = Depends(get_db)):
+    ids = _qerr_scope_ids(db, current_user)
+    q = db.query(models.QualityError).filter(models.QualityError.user_id.in_(ids or [0]))
+    if start_date:
+        q = q.filter(models.QualityError.error_date >= start_date)
+    if end_date:
+        q = q.filter(models.QualityError.error_date <= end_date)
+    if process_id:
+        q = q.filter(models.QualityError.process_id == process_id)
+    rows = q.all()
+    names = {u.id: u.full_name for u in db.query(models.User.id, models.User.full_name).filter(models.User.id.in_(ids or [0])).all()}
+    by_type, by_col, by_proc = {}, {}, {}
+    pn = {p.id: p.name for p in db.query(models.Process).all()}
+    for e in rows:
+        t = by_type.setdefault(e.error_type, {"type": e.error_type, "errors": 0, "rework": 0})
+        t["errors"] += 1; t["rework"] += e.rework_count or 0
+        c = by_col.setdefault(e.user_id, {"user_id": e.user_id, "colleague": names.get(e.user_id, "?"), "errors": 0, "rework": 0,
+                                           "rework_open": 0, "critical": 0, "types": {}})
+        c["errors"] += 1; c["rework"] += e.rework_count or 0
+        if (e.rework_count or 0) > 0 and not e.rework_done:
+            c["rework_open"] += 1
+        if e.severity == "Critical":
+            c["critical"] += 1
+        c["types"][e.error_type] = c["types"].get(e.error_type, 0) + 1
+        p = by_proc.setdefault(e.process_id, {"process": pn.get(e.process_id, "-"), "errors": 0})
+        p["errors"] += 1
+    # accounts audited in the same window (from the Team Lead's batch entries), to give an error rate
+    aq = db.query(models.DailyBatchStat).filter(models.DailyBatchStat.user_id.in_(ids or [0]))
+    if start_date:
+        aq = aq.filter(models.DailyBatchStat.work_date >= start_date)
+    if end_date:
+        aq = aq.filter(models.DailyBatchStat.work_date <= end_date)
+    if process_id:
+        aq = aq.filter(models.DailyBatchStat.process_id == process_id)
+    audited, entered = {}, {}
+    for s_ in aq.all():
+        audited[s_.user_id] = audited.get(s_.user_id, 0) + (s_.accounts_audited or 0)
+        entered[s_.user_id] = entered.get(s_.user_id, 0) + (s_.errors or 0)
+    cols = []
+    for c in by_col.values():
+        c["top_type"] = max(c["types"].items(), key=lambda kv: kv[1])[0] if c["types"] else ""
+        c["audited"] = audited.get(c["user_id"], 0)
+        c["entered_errors"] = entered.get(c["user_id"], 0)
+        c["error_rate"] = round(c["errors"] * 100 / c["audited"], 2) if c["audited"] else None
+        # logged detail vs the figure the Team Lead entered in the Batch dashboard
+        c["gap"] = c["entered_errors"] - c["errors"]
+        del c["types"]
+        cols.append(c)
+    cols.sort(key=lambda c: (-c["errors"], c["colleague"]))
+    return {
+        "total_errors": len(rows), "total_rework": sum(e.rework_count or 0 for e in rows),
+        "rework_open": sum(1 for e in rows if (e.rework_count or 0) > 0 and not e.rework_done),
+        "by_type": sorted(by_type.values(), key=lambda t: -t["errors"]),
+        "by_colleague": cols, "by_process": sorted(by_proc.values(), key=lambda p: -p["errors"]),
+    }
+
+
+@app.get("/quality/errors")
+def quality_errors_list(start_date: Optional[date] = None, end_date: Optional[date] = None, user_id: Optional[int] = None,
+                        process_id: Optional[int] = None, error_type: Optional[str] = None, rework_open: bool = False,
+                        limit: int = 200, offset: int = 0, response: Response = None,
+                        current_user: models.User = Depends(auth.require_role(*QERR_VIEW_ROLES)), db: Session = Depends(get_db)):
+    ids = _qerr_scope_ids(db, current_user)
+    q = db.query(models.QualityError).filter(models.QualityError.user_id.in_(ids or [0]))
+    if user_id:
+        q = q.filter(models.QualityError.user_id == user_id)
+    if start_date:
+        q = q.filter(models.QualityError.error_date >= start_date)
+    if end_date:
+        q = q.filter(models.QualityError.error_date <= end_date)
+    if process_id:
+        q = q.filter(models.QualityError.process_id == process_id)
+    if error_type:
+        q = q.filter(models.QualityError.error_type == error_type)
+    if rework_open:
+        q = q.filter(models.QualityError.rework_count > 0, models.QualityError.rework_done == False)  # noqa: E712
+    total = q.order_by(None).count()
+    rows = q.order_by(models.QualityError.error_date.desc(), models.QualityError.id.desc()).offset(max(0, offset)).limit(max(1, min(limit, 500))).all()
+    if response is not None:
+        response.headers["X-Total-Count"] = str(total)
+    names = {u.id: u.full_name for u in db.query(models.User.id, models.User.full_name).all()}
+    pn = {p.id: p.name for p in db.query(models.Process).all()}
+    return [_qerr_row(e, names, pn) for e in rows]
+
+
+def _qerr_apply(e: models.QualityError, payload: dict, db: Session, user: models.User, creating: bool):
+    types = _qerr_types(db)
+    if "error_type" in payload or creating:
+        t = " ".join(str(payload.get("error_type") or "").split())
+        if not t:
+            raise HTTPException(status_code=400, detail="Choose an error type")
+        if t not in types:
+            raise HTTPException(status_code=400, detail="Unknown error type")
+        e.error_type = t
+    if "severity" in payload:
+        sv = payload.get("severity") or None
+        if sv and sv not in QERR_SEVERITIES:
+            raise HTTPException(status_code=400, detail="Severity must be Minor, Major or Critical")
+        e.severity = sv
+    if "notes" in payload:
+        e.notes = (str(payload.get("notes") or "").strip()[:1000]) or None
+    if "rework_count" in payload:
+        try:
+            n = int(payload.get("rework_count") or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Rework count must be a whole number")
+        if not (0 <= n <= 50):
+            raise HTTPException(status_code=400, detail="Rework count must be between 0 and 50")
+        e.rework_count = n
+    if "rework_done" in payload:
+        e.rework_done = bool(payload.get("rework_done"))
+    if "error_date" in payload and payload.get("error_date"):
+        try:
+            d = date.fromisoformat(str(payload["error_date"])[:10])
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date")
+        if d > _work_today():
+            raise HTTPException(status_code=400, detail="Error date cannot be in the future")
+        e.error_date = d
+
+
+@app.post("/quality/errors")
+def quality_error_create(payload: dict, current_user: models.User = Depends(auth.require_role(*QERR_LOG_ROLES)), db: Session = Depends(get_db)):
+    order = None
+    if payload.get("order_id"):
+        order = db.query(models.WorkOrder).filter(models.WorkOrder.id == int(payload["order_id"])).first()
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        _require_process_access(current_user, order.process_id)
+    uid = payload.get("user_id") or (order.assigned_to_id if order else None)
+    if not uid:
+        raise HTTPException(status_code=400, detail="Choose the colleague who made the error")
+    if int(uid) not in _qerr_scope_ids(db, current_user):
+        raise HTTPException(status_code=403, detail="That colleague is not in your team")
+    pid = order.process_id if order else payload.get("process_id")
+    if pid:
+        _require_process_access(current_user, int(pid))
+    e = models.QualityError(user_id=int(uid), process_id=int(pid) if pid else None,
+                            order_id=order.id if order else None, order_ref=(order.edm if order else (str(payload.get("order_ref") or "").strip()[:120] or None)),
+                            error_date=_work_today(), logged_by_id=current_user.id, logged_by_name=current_user.full_name, rework_count=0, rework_done=False)
+    _qerr_apply(e, payload, db, current_user, True)
+    db.add(e)
+    _audit(db, current_user, "Quality", "Logged an error", db.query(models.User).filter(models.User.id == e.user_id).first(), e.error_date,
+           f"{e.error_type}" + (f", order {e.order_ref}" if e.order_ref else "") + f", rework {e.rework_count}")
+    db.commit()
+    return {"id": e.id}
+
+
+def _qerr_get(db: Session, user: models.User, eid: int) -> models.QualityError:
+    e = db.query(models.QualityError).filter(models.QualityError.id == eid).first()
+    if not e:
+        raise HTTPException(status_code=404, detail="Not found")
+    if e.user_id not in _qerr_scope_ids(db, user):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    return e
+
+
+@app.patch("/quality/errors/{eid}")
+def quality_error_update(eid: int, payload: dict, current_user: models.User = Depends(auth.require_role(*QERR_LOG_ROLES)), db: Session = Depends(get_db)):
+    e = _qerr_get(db, current_user, eid)
+    _qerr_apply(e, payload, db, current_user, False)
+    e.updated_at = datetime.utcnow()
+    _audit(db, current_user, "Quality", "Updated an error", None, e.error_date, f"#{e.id} {e.error_type}, rework {e.rework_count}{' (done)' if e.rework_done else ''}")
+    db.commit()
+    return {"ok": True}
+
+
+@app.delete("/quality/errors/{eid}")
+def quality_error_delete(eid: int, current_user: models.User = Depends(auth.require_role(*QERR_LOG_ROLES)), db: Session = Depends(get_db)):
+    e = _qerr_get(db, current_user, eid)
+    _audit(db, current_user, "Quality", "Deleted an error entry", None, e.error_date, f"#{e.id} {e.error_type}, order {e.order_ref or '-'}")
+    db.delete(e)
+    db.commit()
+    return {"deleted": 1}
+
+
+# ---------------------------------------------------------------------------
+# Forecast against daily targets (today's pace + projected month-end)
+# ---------------------------------------------------------------------------
+FC_ROLES = ("team_lead", "admin", "manager", "super_admin")
+
+
+def _fc_shift(db: Session):
+    start = (_setting(db, "forecast_shift_start", "09:00") or "09:00").strip()
+    try:
+        hh, mm = [int(x) for x in start.split(":")[:2]]
+        assert 0 <= hh < 24 and 0 <= mm < 60
+    except Exception:
+        hh, mm, start = 9, 0, "09:00"
+    try:
+        hours = float(_setting(db, "forecast_shift_hours", "") or STANDARD_SHIFT_HOURS)
+        assert 1 <= hours <= 16
+    except Exception:
+        hours = STANDARD_SHIFT_HOURS
+    return start, hh, mm, hours
+
+
+@app.put("/settings/forecast")
+def set_forecast_settings(payload: dict, current_user: models.User = Depends(auth.require_role("admin", "manager", "super_admin")),
+                          db: Session = Depends(get_db)):
+    start = str(payload.get("start") or "").strip()
+    try:
+        hh, mm = [int(x) for x in start.split(":")[:2]]
+        assert 0 <= hh < 24 and 0 <= mm < 60
+        hours = float(payload.get("hours"))
+        assert 1 <= hours <= 16
+    except Exception:
+        raise HTTPException(status_code=400, detail="Enter the shift start as HH:MM and the shift length as hours (1-16)")
+    _set_setting(db, "forecast_shift_start", "%02d:%02d" % (hh, mm))
+    _set_setting(db, "forecast_shift_hours", str(hours))
+    _audit(db, current_user, "Settings", "Changed forecast shift", None, None, f"start {hh:02d}:{mm:02d}, {hours} h")
+    db.commit()
+    return {"ok": True}
+
+
+def _fc_workdays(d1: date, d2: date, hol: set) -> list:
+    out, d = [], d1
+    while d <= d2:
+        if not _is_off_day(d, hol):
+            out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
+@app.get("/forecast")
+def forecast_view(process_id: Optional[int] = None,
+                  current_user: models.User = Depends(auth.require_role(*FC_ROLES)), db: Session = Depends(get_db)):
+    """Per process: is the team on pace today against the daily target, and where is the month heading."""
+    today = _work_today()
+    now_ist = datetime.now(IST).replace(tzinfo=None)
+    start_txt, hh, mm, shift_hours = _fc_shift(db)
+    shift_start = datetime(today.year, today.month, today.day, hh, mm)
+    frac = max(0.0, min(1.0, (now_ist - shift_start).total_seconds() / 3600.0 / shift_hours))
+    hours_left = max(0.0, shift_hours * (1 - frac))
+    m1 = today.replace(day=1)
+    m2 = (date(today.year + (today.month == 12), (today.month % 12) + 1, 1) - timedelta(days=1))
+    hol = _hol_set(db, m1, m2)
+    work_all = _fc_workdays(m1, m2, hol)
+    past = [d for d in work_all if d < today]
+    future = [d for d in work_all if d > today]
+    today_is_work = not _is_off_day(today, hol)
+
+    colleagues = [u for u in _batch_visible_colleagues(db, current_user) if u.employment_status != "Inactive"]
+    all_access = current_user.role in ("admin", "manager", "super_admin")
+    procs = db.query(models.Process).order_by(models.Process.name).all()
+    if not all_access:
+        mine = {p.id for p in current_user.processes}
+        procs = [p for p in procs if p.id in mine]
+    if process_id:
+        procs = [p for p in procs if p.id == process_id]
+
+    cids = [u.id for u in colleagues]
+    login = {}
+    for uid, d in db.query(models.LoginDay.user_id, models.LoginDay.login_date).filter(
+            models.LoginDay.user_id.in_(cids or [0]), models.LoginDay.login_date >= m1, models.LoginDay.login_date <= m2).all():
+        login.setdefault(uid, set()).add(_as_date(d))
+    leave = {}
+    for uid, d in db.query(models.LeaveDay.user_id, models.LeaveDay.leave_date).filter(
+            models.LeaveDay.user_id.in_(cids or [0]), models.LeaveDay.leave_date >= m1, models.LeaveDay.leave_date <= m2).all():
+        leave.setdefault(uid, set()).add(_as_date(d))
+    done = {}      # (process, user, date) -> trans   (summed in the database)
+    for pid_, uid_, pd_, tc_ in db.query(models.WorkOrder.process_id, models.WorkOrder.assigned_to_id, models.WorkOrder.posted_date,
+                                         func.coalesce(func.sum(models.WorkOrder.trans_count), 0)).filter(
+            models.WorkOrder.posting_status == "Completed", models.WorkOrder.posted_date >= m1, models.WorkOrder.posted_date <= m2,
+            models.WorkOrder.assigned_to_id.in_(cids or [0])).group_by(models.WorkOrder.process_id, models.WorkOrder.assigned_to_id, models.WorkOrder.posted_date).all():
+        done[(pid_, uid_, _as_date(pd_))] = int(tc_ or 0)
+
+    out = []
+    for p in procs:
+        team = [u for u in colleagues if any(x.id == p.id for x in u.processes)]
+        tgt = p.daily_target
+        row = {"process_id": p.id, "process": p.name, "target": tgt, "team_size": len(team)}
+        if not team:
+            row["status"] = "No colleagues"
+            out.append(row); continue
+        present_today = [u for u in team if today in login.get(u.id, ()) and today not in leave.get(u.id, ())]
+        today_actual = sum(done.get((p.id, u.id, today), 0) for u in team)
+        # month so far (before today)
+        pres_by_day = {d: sum(1 for u in team if d in login.get(u.id, ()) and d not in leave.get(u.id, ())) for d in past}
+        mtd_before = sum(done.get((p.id, u.id, d), 0) for u in team for d in past)
+        # work done on off days still counts toward the month
+        off_done = sum(v for (pid, uid, d), v in done.items() if pid == p.id and uid in {u.id for u in team} and d < today and _is_off_day(d, hol))
+        mtd_before += off_done
+        row.update({"today_actual": today_actual, "present_today": len(present_today), "on_leave_today": sum(1 for u in team if today in leave.get(u.id, ()))})
+        if not tgt:
+            row["status"] = "No daily target set"
+            row.update({"month_actual": mtd_before + today_actual})
+            out.append(row); continue
+        today_target = tgt * len(present_today) if today_is_work else 0
+        expected_now = today_target * frac
+        ratio = (today_actual / expected_now) if expected_now > 0 else None
+        if not today_is_work:
+            status = "Off day"
+        elif not present_today:
+            status = "Nobody logged in yet"
+        elif frac <= 0:
+            status = "Shift not started"
+        elif ratio is None:
+            status = "On pace"
+        elif ratio >= 0.95:
+            status = "On pace"
+        elif ratio >= 0.8:
+            status = "Slightly behind"
+        else:
+            status = "Behind"
+        need_per_hour = round((today_target - today_actual) / max(hours_left, 0.25), 1) if today_target > today_actual and frac > 0 else 0
+        run_rate = (today_actual / (frac * shift_hours)) if frac * shift_hours >= 0.5 else None
+        today_proj = round(today_actual / frac) if frac >= 0.25 and today_actual else None
+        # month
+        days_with_people = [d for d in past if pres_by_day[d] > 0]
+        avg_pres = (sum(pres_by_day[d] for d in days_with_people) / len(days_with_people)) if days_with_people else len(present_today) or len(team)
+        past_target = sum(tgt * pres_by_day[d] for d in past)
+        month_target = past_target + (tgt * len(present_today) if today_is_work else 0) + tgt * avg_pres * len(future)
+        avg_daily = (mtd_before / len(days_with_people)) if days_with_people else None
+        if today_is_work:
+            t_est = max(today_actual, today_proj) if today_proj else max(today_actual, avg_daily or 0)
+        else:
+            t_est = today_actual
+        projected = mtd_before + t_est + (avg_daily or 0) * len(future)
+        row.update({
+            "status": status, "today_target": today_target, "expected_now": round(expected_now), "pace_pct": round(ratio * 100) if ratio is not None else None,
+            "need_per_hour": need_per_hour, "run_rate": round(run_rate, 1) if run_rate is not None else None, "today_projected": today_proj,
+            "month_actual": mtd_before + today_actual, "month_target": round(month_target), "month_projected": round(projected),
+            "month_projected_pct": round(projected * 100 / month_target) if month_target else None,
+            "workdays_left": len(future), "workdays_done": len(past),
+            "people": sorted([{"id": u.id, "name": u.full_name, "done": done.get((p.id, u.id, today), 0), "expected_now": round(tgt * frac),
+                               "target": tgt, "present": u in present_today,
+                               "pace_pct": round(done.get((p.id, u.id, today), 0) * 100 / (tgt * frac)) if (tgt * frac) > 0 and u in present_today else None}
+                              for u in team], key=lambda r: (not r["present"], r["pace_pct"] if r["pace_pct"] is not None else 999, r["name"])),
+        })
+        out.append(row)
+    return {"as_of": now_ist.strftime("%Y-%m-%d %H:%M"), "today": today.isoformat(), "shift_start": start_txt, "shift_hours": shift_hours,
+            "shift_elapsed_pct": round(frac * 100), "month": today.strftime("%B %Y"), "processes": out,
+            "can_edit_shift": current_user.role in ("admin", "manager", "super_admin")}
+
+
+# ---------------------------------------------------------------------------
+# Client-wise dashboard: volume, turnaround, escalation rate, effort, inactive-date tracking
+# ---------------------------------------------------------------------------
+@app.get("/clients/dashboard")
+def clients_dashboard(process_id: Optional[int] = None, period: str = "month",
+                      current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+                      db: Session = Depends(get_db)):
+    today = _work_today()
+    if period == "week":
+        d1, label = today - timedelta(days=today.weekday()), "This week"
+    elif period == "last_month":
+        last = today.replace(day=1) - timedelta(days=1)
+        d1, today_end, label = last.replace(day=1), last, last.strftime("%B %Y")
+    elif period == "quarter":
+        d1, label = today - timedelta(days=90), "Last 90 days"
+    elif period == "month":
+        d1, label = today.replace(day=1), today.strftime("%B %Y") + " (so far)"
+    else:
+        raise HTTPException(status_code=400, detail="period must be week, month, last_month or quarter")
+    d2 = today_end if period == "last_month" else today
+    W = models.WorkOrder
+    scoped = _orders_dash_scope(db, current_user, process_id)
+    clients = db.query(models.Client).all()
+    by_no = {_norm_facility(c.facility_no): c for c in clients}
+    nc = {}
+    for c in clients:
+        nc[_norm_text(c.client_name)] = nc.get(_norm_text(c.client_name), 0) + 1
+    by_name = {_norm_text(c.client_name): c for c in clients if nc[_norm_text(c.client_name)] == 1}
+    cache = {}
+
+    def client_of(div, dname):
+        k = (div or "", dname or "")
+        if k not in cache:
+            c = _client_for_row(div, by_no, by_name)
+            if c is None and dname:
+                c = _client_for_row(dname, by_no, by_name)
+            cache[k] = c
+        return cache[k]
+
+    inactive_dates = {c.id: c.inactive_date for c in clients if c.status == "Inactive" and c.inactive_date}
+    Ev = models.EscalationEvent
+    esc_sub = db.query(Ev.order_id).distinct().subquery()
+    completed = case((W.posting_status == "Completed", 1), else_=0)
+    base = db.query(W.division, W.division_name, func.count(W.id), func.sum(completed), func.coalesce(func.sum(W.trans_count), 0),
+                    func.coalesce(func.sum(W.tat_days), 0), func.count(W.tat_days), func.coalesce(func.sum(W.time_taken_seconds), 0),
+                    func.count(esc_sub.c.order_id)).outerjoin(esc_sub, esc_sub.c.order_id == W.id).filter(
+        W.received_date >= d1, W.received_date <= d2)
+    grouped = scoped(base).group_by(W.division, W.division_name).all()
+    # most recent order per client (all time, same scope) for dormancy
+    last_seen = {}
+    for div, dn, mx in scoped(db.query(W.division, W.division_name, func.max(W.received_date)).group_by(W.division, W.division_name)).all():
+        c = client_of(div, dn)
+        if c is not None and mx and (c.id not in last_seen or mx > last_seen[c.id]):
+            last_seen[c.id] = _as_date(mx)
+
+    agg = {}
+    def slot(c):
+        key = c.id if c else 0
+        return agg.setdefault(key, {"client": c, "orders": 0, "completed": 0, "open": 0, "trans": 0, "tat_sum": 0, "tat_n": 0, "esc": 0, "secs": 0, "after_inactive": 0})
+    for div, dn, n, comp, trans, tat_s, tat_n, secs, esc in grouped:
+        c = client_of(div, dn)
+        g = slot(c)
+        g["orders"] += n; g["completed"] += int(comp or 0); g["open"] += n - int(comp or 0)
+        g["trans"] += int(trans or 0); g["tat_sum"] += tat_s or 0; g["tat_n"] += tat_n or 0
+        g["secs"] += int(secs or 0); g["esc"] += esc or 0
+    # orders received after a client's inactive date (only the few inactive clients are looked at)
+    if inactive_dates:
+        for div, dn, n, mx in scoped(db.query(W.division, W.division_name, func.count(W.id), func.max(W.received_date)).filter(
+                W.received_date >= d1, W.received_date <= d2)).group_by(W.division, W.division_name).all():
+            c = client_of(div, dn)
+            if c is not None and c.id in inactive_dates:
+                cnt = scoped(db.query(func.count(W.id)).filter(W.division == div, W.division_name == dn if dn is not None else W.division_name.is_(None),
+                                                               W.received_date >= d1, W.received_date <= d2, W.received_date > inactive_dates[c.id])).scalar() or 0
+                slot(c)["after_inactive"] += cnt
+    total_secs = sum(g["secs"] for g in agg.values()) or 0
+    total_orders = sum(g["orders"] for g in agg.values()) or 0
+    rows = []
+    for key, g in agg.items():
+        c = g["client"]
+        rows.append({
+            "client_id": c.id if c else None, "facility_no": c.facility_no if c else "", "client": c.client_name if c else "(not in client list)",
+            "status": c.status if c else "", "inactive_date": c.inactive_date.isoformat() if c and c.inactive_date else None,
+            "orders": g["orders"], "completed": g["completed"], "open": g["open"], "trans": g["trans"],
+            "avg_tat": round(g["tat_sum"] / g["tat_n"], 1) if g["tat_n"] else None,
+            "escalated": g["esc"], "esc_rate": round(g["esc"] * 100 / g["orders"], 1) if g["orders"] else 0,
+            "effort_hours": round(g["secs"] / 3600, 1), "effort_share": round(g["secs"] * 100 / total_secs, 1) if total_secs else None,
+            "order_share": round(g["orders"] * 100 / total_orders, 1) if total_orders else None,
+            "min_per_order": round(g["secs"] / 60 / g["completed"], 1) if g["completed"] and g["secs"] else None,
+            "orders_after_inactive": g["after_inactive"],
+            "last_order": last_seen.get(c.id).isoformat() if c and last_seen.get(c.id) else None,
+        })
+    rows.sort(key=lambda r: (-r["effort_hours"], -r["orders"], r["client"]))
+    # inactive-date tracking (independent of the period's volume)
+    tracking = []
+    seen_ids = {r["client_id"] for r in rows}
+    for c in clients:
+        ls = last_seen.get(c.id)
+        days = (today - ls).days if ls else None
+        if c.status == "Inactive":
+            after = next((r["orders_after_inactive"] for r in rows if r["client_id"] == c.id), 0)
+            if after or (ls and c.inactive_date and ls > c.inactive_date):
+                tracking.append({"client_id": c.id, "facility_no": c.facility_no, "client": c.client_name, "kind": "Inactive but still sending work",
+                                 "inactive_date": c.inactive_date.isoformat() if c.inactive_date else None, "last_order": ls.isoformat() if ls else None,
+                                 "days": days, "detail": f"{after} order(s) received after the inactive date in this period" if after else "Orders received after the inactive date"})
+        else:
+            if days is not None and days >= 30:
+                tracking.append({"client_id": c.id, "facility_no": c.facility_no, "client": c.client_name, "kind": "Active but no work for 30+ days",
+                                 "inactive_date": None, "last_order": ls.isoformat(), "days": days, "detail": "Consider marking the client Inactive if it has stopped sending work"})
+    tracking.sort(key=lambda r: (r["kind"], -(r["days"] or 0)))
+    tot = {"orders": total_orders, "completed": sum(g["completed"] for g in agg.values()), "escalated": sum(g["esc"] for g in agg.values()),
+           "effort_hours": round(total_secs / 3600, 1), "clients": len([r for r in rows if r["client_id"]])}
+    tot["esc_rate"] = round(tot["escalated"] * 100 / total_orders, 1) if total_orders else 0
+    return {"label": label, "from": d1.isoformat(), "to": d2.isoformat(), "rows": rows, "tracking": tracking, "totals": tot}
+
+
+# ---------------------------------------------------------------------------
+# Escalation reasons report + auto-reminders for teams that are taking too long
+# ---------------------------------------------------------------------------
+ESC_TEAMS = ("onshore", "recon", "calling")
+ESC_TEAM_LABEL = {"onshore": "Onshore", "recon": "Recon", "calling": "Calling"}
+
+
+def _client_resolver(db: Session):
+    clients = db.query(models.Client).all()
+    by_no = {_norm_facility(c.facility_no): c for c in clients}
+    nc = {}
+    for c in clients:
+        nc[_norm_text(c.client_name)] = nc.get(_norm_text(c.client_name), 0) + 1
+    by_name = {_norm_text(c.client_name): c for c in clients if nc[_norm_text(c.client_name)] == 1}
+    cache = {}
+
+    def resolve(div, dname=None):
+        k = (div or "", dname or "")
+        if k not in cache:
+            c = _client_for_row(div, by_no, by_name)
+            if c is None and dname:
+                c = _client_for_row(dname, by_no, by_name)
+            cache[k] = c
+        return cache[k]
+    return resolve
+
+
+@app.get("/escalations/reasons")
+def escalation_reasons(process_id: Optional[int] = None, period: str = "month",
+                       current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+                       db: Session = Depends(get_db)):
+    """Escalations raised in the period counted by category, client and process, with the repeat problems (same client + category, same order)."""
+    today = _work_today()
+    if period == "week":
+        d1, d2, label = today - timedelta(days=today.weekday()), today, "This week"
+    elif period == "last_month":
+        last = today.replace(day=1) - timedelta(days=1)
+        d1, d2, label = last.replace(day=1), last, last.strftime("%B %Y")
+    elif period == "quarter":
+        d1, d2, label = today - timedelta(days=90), today, "Last 90 days"
+    elif period == "month":
+        d1, d2, label = today.replace(day=1), today, today.strftime("%B %Y") + " (so far)"
+    else:
+        raise HTTPException(status_code=400, detail="period must be week, month, last_month or quarter")
+    E = models.EscalationEvent
+    q = db.query(E).filter(E.raised_date >= d1, E.raised_date <= d2)
+    if process_id is not None:
+        q = q.filter(E.process_id == process_id)
+    if current_user.role == "team_lead":
+        q = q.filter(E.team_lead_id == current_user.id)
+        mine = [p.id for p in current_user.processes]
+        q = q.filter(E.process_id.in_(mine or [0]))
+    events = q.all()
+    oids = list({e.order_id for e in events})
+    info = {}
+    for i in range(0, len(oids), 800):
+        for o in db.query(models.WorkOrder.id, models.WorkOrder.edm, models.WorkOrder.division, models.WorkOrder.division_name).filter(models.WorkOrder.id.in_(oids[i:i + 800])).all():
+            info[o.id] = o
+    resolve = _client_resolver(db)
+    pn = {p.id: p.name for p in db.query(models.Process).all()}
+    cats, clients, procs, combos, orders = {}, {}, {}, {}, {}
+    for e, cat in [(e, c) for e in events for c in _event_cats(e)]:
+        o = info.get(e.order_id)
+        c = resolve(o.division, o.division_name) if o else None
+        ckey = (c.facility_no, c.client_name) if c else ("", "(unknown / order removed)" if not o else "(not in client list)")
+        g = cats.setdefault(cat, {"category": cat, "count": 0, "open": 0, "days": 0, "closed": 0})
+        g["count"] += 1
+        if e.closed_date:
+            g["closed"] += 1
+            g["days"] += _count_business_days_ex_holidays(e.raised_date, e.closed_date)
+        else:
+            g["open"] += 1
+        cl = clients.setdefault(ckey, {"facility_no": ckey[0], "client": ckey[1], "count": 0, "cats": {}})
+        cl["count"] += 1
+        cl["cats"][cat] = cl["cats"].get(cat, 0) + 1
+        pr = procs.setdefault(e.process_id, {"process": pn.get(e.process_id, "-"), "count": 0, "cats": {}})
+        pr["count"] += 1
+        pr["cats"][cat] = pr["cats"].get(cat, 0) + 1
+        k = (ckey, cat)
+        combos[k] = combos.get(k, 0) + 1
+        orders.setdefault(e.order_id, []).append(cat)
+    total = sum(g["count"] for g in cats.values()) or 0       # an escalation with two reasons counts under both
+    cat_rows = [{"category": g["category"], "count": g["count"], "share": round(g["count"] * 100 / total, 1) if total else 0, "open": g["open"],
+                 "avg_days": round(g["days"] / g["closed"], 1) if g["closed"] else None} for g in cats.values()]
+    cat_rows.sort(key=lambda r: -r["count"])
+    top = lambda d: max(d.items(), key=lambda kv: kv[1])[0] if d else ""
+    cli_rows = [{"facility_no": v["facility_no"], "client": v["client"], "count": v["count"], "share": round(v["count"] * 100 / total, 1) if total else 0,
+                 "top_category": top(v["cats"]), "top_count": max(v["cats"].values())} for v in clients.values()]
+    cli_rows.sort(key=lambda r: (-r["count"], r["client"]))
+    proc_rows = [{"process": v["process"], "count": v["count"], "top_category": top(v["cats"])} for v in procs.values()]
+    proc_rows.sort(key=lambda r: -r["count"])
+    repeats = [{"facility_no": k[0][0], "client": k[0][1], "category": k[1], "count": n} for k, n in combos.items() if n >= 2]
+    repeats.sort(key=lambda r: (-r["count"], r["client"]))
+    again = []
+    for oid, cl_ in orders.items():
+        if len(cl_) >= 2:
+            o = info.get(oid)
+            again.append({"order_id": oid if o else None, "edm": (o.edm if o else "") or "", "times": len(cl_), "categories": ", ".join(sorted(set(cl_)))})
+    again.sort(key=lambda r: -r["times"])
+    return {"label": label, "from": d1.isoformat(), "to": d2.isoformat(), "total": total, "orders_escalated": len(orders),
+            "by_category": cat_rows, "by_client": cli_rows[:50], "by_process": proc_rows, "repeat_problems": repeats[:30], "orders_escalated_again": again[:30]}
+
+
+ESC_REM_DEFAULTS = {"enabled": "1", "auto_email": "0", "email_team": "1", "email_tl": "1", "onshore": "24", "recon": "24", "calling": "24", "repeat": "24"}
+
+
+def _esc_rem_settings(db: Session) -> dict:
+    out = {}
+    for k, dv in ESC_REM_DEFAULTS.items():
+        v = _setting(db, "escrem_" + k, dv)
+        out[k] = (v == "1") if k in ("enabled", "auto_email", "email_team", "email_tl") else float(v or dv)
+    out["smtp_configured"] = email_utils.is_configured()
+    return out
+
+
+@app.get("/settings/esc-reminders")
+def get_esc_reminder_settings(current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")), db: Session = Depends(get_db)):
+    d = _esc_rem_settings(db)
+    d["can_edit"] = current_user.role in ("admin", "manager", "super_admin")
+    return d
+
+
+@app.put("/settings/esc-reminders")
+def set_esc_reminder_settings(payload: dict, current_user: models.User = Depends(auth.require_role("admin", "manager", "super_admin")), db: Session = Depends(get_db)):
+    for k in ("enabled", "auto_email", "email_team", "email_tl"):
+        if k in payload:
+            _set_setting(db, "escrem_" + k, "1" if payload[k] else "0")
+    for k in ("onshore", "recon", "calling", "repeat"):
+        if k in payload:
+            try:
+                v = float(payload[k])
+                assert 1 <= v <= 720
+            except Exception:
+                raise HTTPException(status_code=400, detail="Hours must be between 1 and 720")
+            _set_setting(db, "escrem_" + k, str(v))
+    _audit(db, current_user, "Settings", "Changed escalation reminder settings", None, None, json.dumps({k: payload[k] for k in payload if k in ESC_REM_DEFAULTS})[:300])
+    db.commit()
+    return _esc_rem_settings(db)
+
+
+def _esc_overdue_rows(db: Session, orders, cfg: dict) -> list:
+    now_ist = datetime.now(IST).replace(tzinfo=None)
+    ids = [o.id for o in orders]
+    last_msg, last_rem = {}, {}
+    for i in range(0, len(ids), 800):
+        chunk = ids[i:i + 800]
+        for m in db.query(models.OnshoreMessage).filter(models.OnshoreMessage.order_id.in_(chunk)).order_by(models.OnshoreMessage.id).all():
+            last_msg[(m.order_id, m.track or None)] = m.created_at
+        for r in db.query(models.EscalationReminder).filter(models.EscalationReminder.order_id.in_(chunk)).order_by(models.EscalationReminder.id).all():
+            last_rem[(r.order_id, r.track or None)] = r
+    pn = {p.id: p.name for p in db.query(models.Process).all()}
+    tls = {u.id: u for u in db.query(models.User).filter(models.User.role == "team_lead").all()}
+    rows = []
+    for o in orders:
+        if o.onshore_status not in ("with_onshore", "blue", "orange"):
+            continue
+        team = o.onshore_team if o.onshore_team in ESC_TEAMS else "onshore"
+        trk = getattr(o, "track", None)
+        since = last_msg.get((o.id, trk)) or o.onshore_sent_at
+        if not since:
+            continue
+        hrs = (now_ist - since).total_seconds() / 3600
+        limit = cfg[team]
+        if hrs < limit:
+            continue
+        r = last_rem.get((o.id, trk))
+        tl = tls.get(o.team_lead_id)
+        rows.append({"id": o.id, "edm": o.edm or ("#%d" % o.id), "process": pn.get(o.process_id, ""), "process_id": o.process_id, "category": o.escalation_category or "",
+                     "track": trk, "team": team, "team_label": ESC_TEAM_LABEL[team], "waiting_hours": round(hrs, 1), "limit_hours": limit, "over_by": round(hrs - limit, 1),
+                     "since": since.strftime("%Y-%m-%d %H:%M"), "team_lead": tl.full_name if tl else "", "team_lead_email": tl.email if tl else None,
+                     "reminded_at": r.sent_at.strftime("%Y-%m-%d %H:%M") if r else None, "reminded_hours_ago": round((now_ist - r.sent_at).total_seconds() / 3600, 1) if r else None,
+                     "reminders_sent": 0})
+    cnt = {}
+    if rows:
+        for oid, tk, n in db.query(models.EscalationReminder.order_id, models.EscalationReminder.track, func.count(models.EscalationReminder.id)).filter(
+                models.EscalationReminder.order_id.in_([r["id"] for r in rows])).group_by(models.EscalationReminder.order_id, models.EscalationReminder.track).all():
+            cnt[(oid, tk or None)] = n
+        for r in rows:
+            r["reminders_sent"] = cnt.get((r["id"], r["track"]), 0)
+    rows.sort(key=lambda r: -r["over_by"])
+    return rows
+
+
+def _esc_open_orders(db: Session, scoped=None):
+    W = models.WorkOrder
+    q = db.query(W).options(selectinload(W.escalation_detail)).filter(
+        or_(W.onshore_status.in_(("with_onshore", "blue", "orange")), W.id.in_(_has_extra_state(db))), W.submitted.is_(False))
+    if scoped is not None:
+        q = scoped(q)
+    return [t for o in q.all() for t in _order_tracks(o) if t.onshore_status in _WAITING]
+
+
+@app.get("/escalations/overdue")
+def escalations_overdue(process_id: Optional[int] = None,
+                        current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")), db: Session = Depends(get_db)):
+    cfg = _esc_rem_settings(db)
+    scoped = _orders_dash_scope(db, current_user, process_id)
+    rows = _esc_overdue_rows(db, _esc_open_orders(db, scoped), cfg)
+    return {"settings": cfg, "rows": rows, "by_team": {ESC_TEAM_LABEL[t]: sum(1 for r in rows if r["team"] == t) for t in ESC_TEAMS}}
+
+
+def _esc_send(db: Session, rows: list, cfg: dict, actor_name: str, auto: bool) -> dict:
+    """Emails one digest per receiving team member (and per Team Lead) and records a reminder per order. Flags work even without SMTP."""
+    now_ist = datetime.now(IST).replace(tzinfo=None)
+    smtp = email_utils.is_configured()
+    sent = failed = 0
+    for team in ESC_TEAMS:
+        part = [r for r in rows if r["team"] == team]
+        if not part:
+            continue
+        lines = "\n".join(f"- {r['edm']} ({r['process']}{', ' + r['category'] if r['category'] else ''}) waiting {r['waiting_hours']} h, limit {r['limit_hours']:g} h" for r in part)
+        body = f"{len(part)} escalation(s) have been waiting with {ESC_TEAM_LABEL[team]} longer than the agreed time:\n\n{lines}\n\nPlease reply in WorkFlow Hub."
+        n_rec = 0
+        if smtp and cfg["email_team"]:
+            for u in db.query(models.User).filter(models.User.role == team, models.User.email.isnot(None)).all():
+                if u.employment_status == "Inactive":
+                    continue
+                if email_utils.send_email(u.email, f"Reminder: {len(part)} escalation(s) waiting for {ESC_TEAM_LABEL[team]}", body):
+                    n_rec += 1; sent += 1
+                else:
+                    failed += 1
+        if smtp and cfg["email_tl"]:
+            by_tl = {}
+            for r in part:
+                if r["team_lead_email"]:
+                    by_tl.setdefault(r["team_lead_email"], []).append(r)
+            for mail, rs in by_tl.items():
+                tl_lines = "\n".join(f"- {r['edm']} ({r['process']}) waiting {r['waiting_hours']} h with {ESC_TEAM_LABEL[team]}" for r in rs)
+                if email_utils.send_email(mail, f"FYI: {len(rs)} escalation(s) overdue with {ESC_TEAM_LABEL[team]}", f"These escalations of your team are past the {ESC_TEAM_LABEL[team]} time limit:\n\n{tl_lines}"):
+                    n_rec += 1; sent += 1
+                else:
+                    failed += 1
+        for r in part:
+            db.add(models.EscalationReminder(order_id=r["id"], track=r.get("track"), team=team, sent_at=now_ist, hours_waiting=r["waiting_hours"], recipients=n_rec,
+                                             emailed=n_rec > 0, auto=auto, sent_by_name=actor_name))
+    db.commit()
+    return {"orders": len(rows), "emails_sent": sent, "emails_failed": failed, "smtp_configured": smtp}
+
+
+@app.post("/escalations/overdue/remind")
+def escalations_overdue_remind(payload: dict, process_id: Optional[int] = None,
+                               current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")), db: Session = Depends(get_db)):
+    cfg = _esc_rem_settings(db)
+    scoped = _orders_dash_scope(db, current_user, process_id)
+    rows = _esc_overdue_rows(db, _esc_open_orders(db, scoped), cfg)
+    want = payload.get("order_ids")
+    if want:
+        want = {int(x) for x in want}
+        rows = [r for r in rows if r["id"] in want]
+    if not rows:
+        raise HTTPException(status_code=400, detail="Nothing is overdue")
+    res = _esc_send(db, rows, cfg, current_user.full_name, False)
+    _audit(db, current_user, "Escalation", "Sent escalation reminders", None, None, f"{res['orders']} order(s), {res['emails_sent']} email(s)")
+    db.commit()
+    return res
+
+
+def _esc_auto_reminders():
+    db = SessionLocal()
+    try:
+        cfg = _esc_rem_settings(db)
+        if not (cfg["enabled"] and cfg["auto_email"] and cfg["smtp_configured"]):
+            return
+        now = datetime.now(IST)
+        if _is_off_day(now.date(), _hol_set(db, now.date(), now.date())):
+            return
+        rows = _esc_overdue_rows(db, _esc_open_orders(db), cfg)
+        rows = [r for r in rows if r["reminded_hours_ago"] is None or r["reminded_hours_ago"] >= cfg["repeat"]]
+        if rows:
+            print("[esc reminders]", _esc_send(db, rows, cfg, "Auto reminder", True))
+    finally:
+        db.close()
+
+
+@app.get("/breaks/audit")
+def break_audit_log(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    category: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = 200,
+    offset: int = 0,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Audit log (newest first), one page at a time (limit/offset). Admin / Manager / Super Admin: everything. Team Lead: their own actions and anything about their team."""
+    today = datetime.now(IST).date()
+    try:
+        d1 = date.fromisoformat(date_from) if date_from else today - timedelta(days=30)
+        d2 = date.fromisoformat(date_to) if date_to else today
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date")
+    lo, hi = _ist_bounds(d1, d2)
+    qq = db.query(models.AuditEvent).filter(models.AuditEvent.at >= lo, models.AuditEvent.at < hi)
+    if current_user.role == "team_lead":
+        ids = [u.id for u in _batch_visible_colleagues(db, current_user)]
+        qq = qq.filter(or_(models.AuditEvent.actor_id == current_user.id, models.AuditEvent.target_user_id.in_(ids or [-1])))
+    if category:
+        qq = qq.filter(models.AuditEvent.category == category)
+    needle = (q or "").strip()
+    if needle:
+        like = "%" + needle.replace("%", "").replace("_", "") + "%"
+        A = models.AuditEvent
+        qq = qq.filter(or_(A.actor_name.ilike(like), A.category.ilike(like), A.action.ilike(like), A.target_name.ilike(like), A.details.ilike(like), A.ref_date.ilike(like)))
+    total = qq.order_by(None).count()
+    page = max(1, min(limit, 500))
+    rows = qq.order_by(models.AuditEvent.id.desc()).offset(max(0, offset)).limit(page).all()
+    out = [{"id": e.id, "at": e.at.isoformat() + "Z", "actor": e.actor_name or "", "role": e.actor_role or "", "category": e.category, "action": e.action,
+            "target": e.target_name or "", "ref_date": e.ref_date or "", "details": e.details or ""} for e in rows]
+    cats = [c for (c,) in db.query(models.AuditEvent.category).distinct().all()]
+    return {"from": d1.isoformat(), "to": d2.isoformat(), "categories": sorted(cats), "rows": out, "total": total, "offset": max(0, offset), "has_more": max(0, offset) + len(out) < total}
+
+
+@app.get("/breaks/calendar")
+def break_calendar(
+    month: Optional[str] = None,
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    Attendance calendar: one row per colleague, one cell per day of the month.
+    ok = logged in, nothing flagged; warn = 1 exception; bad = 2 or more; off = weekend / holiday; none = no login on a working day.
+    Colleague: own row. Team Lead: their team. Admin / Super Admin: everyone.
+    """
+    today = datetime.now(IST).date()
+    try:
+        y, mo = (int(x) for x in month.split("-")) if month else (today.year, today.month)
+        first = date(y, mo, 1)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="month must look like 2026-10")
+    last = date(y + (mo == 12), mo % 12 + 1, 1) - timedelta(days=1)
+    upto = min(last, today)
+    ndays = last.day
+    if current_user.role == "colleague":
+        users = [current_user]
+    else:
+        users = [u for u in _batch_visible_colleagues(db, current_user) if u.employment_status != "Inactive"]
+    users.sort(key=lambda u: ((u.reporting_manager or ""), u.full_name))
+    hol = _hol_set(db, first, last)
+    days = _collect_days(db, [u.id for u in users], first, upto) if upto >= first else {}
+    lvmap = {(lv.user_id, lv.leave_date): lv for lv in db.query(models.LeaveDay).filter(models.LeaveDay.leave_date >= first, models.LeaveDay.leave_date <= last, models.LeaveDay.user_id.in_([u.id for u in users] or [-1])).all()}
+    scs = db.query(models.ShiftChange).filter(models.ShiftChange.date_from <= last, models.ShiftChange.date_to >= first, models.ShiftChange.user_id.in_([u.id for u in users] or [-1])).order_by(models.ShiftChange.id).all()
+    out = []
+    for u in users:
+        cells = {}
+        mysc = [x for x in scs if x.user_id == u.id]
+        for i in range(ndays):
+            d = first + timedelta(days=i)
+            iso = d.isoformat()
+            off = _is_off_day(d, hol)
+            v = days.get((u.id, d))
+            lv = lvmap.get((u.id, d))
+            if v and v["first_login"] is not None and d <= today:
+                flags, _late = _day_flags(v, u.shift, d, off, today)
+                cells[iso] = {"s": "ok" if not flags else "warn" if len(flags) == 1 else "bad", "f": flags, "adj": bool(v["adj"]), "in": _ist_dt(v["first_login"]).strftime("%I:%M %p")}
+            elif lv:
+                cells[iso] = {"s": "leave", "k": lv.kind, "n": lv.note or "", "id": lv.id}
+            elif d > today:
+                cells[iso] = {"s": "future"}
+            elif off:
+                cells[iso] = {"s": "off"}
+            else:
+                cells[iso] = {"s": "pending" if d == today else "none"}
+            if lv and cells[iso]["s"] != "leave":
+                cells[iso]["k"] = lv.kind; cells[iso]["id"] = lv.id
+            for x in mysc:
+                if x.date_from <= d <= x.date_to:
+                    cells[iso]["sc"] = x.shift.split(" (")[0] + (" - " + x.note if x.note else "") + (" (set by " + x.created_by_name + ")" if x.created_by_name else "")
+        out.append({"user_id": u.id, "employee": u.full_name, "team_lead": u.reporting_manager or "", "cells": cells})
+    return {"month": first.strftime("%B %Y"), "first": first.isoformat(), "days": ndays, "today": today.isoformat(), "rows": out,
+            "holidays": sorted(x.isoformat() for x in hol)}
+
+
+@app.get("/breaks/live")
+def break_live(
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Today, right now: who is working, on a break, logged out or not logged in yet. Team Lead -> team, Admin / Super Admin -> all."""
+    now = datetime.utcnow()
+    today = datetime.now(IST).date()
+    now_ist = datetime.now(IST)
+    users = [u for u in _batch_visible_colleagues(db, current_user) if u.employment_status != "Inactive"]
+    ids = [u.id for u in users]
+    days = _collect_days(db, ids, today, today)
+    away = {a.user_id: a for a in db.query(models.AwayNow).filter(models.AwayNow.user_id.in_(ids or [-1])).all()}
+    off = _is_off_day(today, _hol_set(db, today, today))
+    ovm = {c_.user_id: c_.shift for c_ in db.query(models.ShiftChange).filter(models.ShiftChange.date_from <= today, models.ShiftChange.date_to >= today, models.ShiftChange.user_id.in_(ids or [-1])).order_by(models.ShiftChange.id).all()}
+    leaves = {lv.user_id: lv.kind for lv in db.query(models.LeaveDay).filter(models.LeaveDay.leave_date == today, models.LeaveDay.user_id.in_(ids or [-1])).all()}
+    out = []
+    for u in users:
+        d = days.get((u.id, today))
+        a = away.get(u.id)
+        eff = ovm.get(u.id) or u.shift
+        st = _shift_start_minutes(eff)
+        lv = leaves.get(u.id)
+        late = None if (off or lv or not d or "late" in d["excused"]) else _late_minutes(d["first_login"], eff)
+        if a:
+            status = "on_break"
+        elif d and d["live"]:
+            status = "working"
+        elif d:
+            status = "logged_out"
+        elif lv:
+            status = "on_leave"
+        else:
+            status = "not_logged_in"
+        overdue = None      # not logged in yet although the shift has started
+        if status == "not_logged_in" and not off and st is not None:
+            over = now_ist.hour * 60 + now_ist.minute - st
+            if over > LATE_GRACE_MIN:
+                overdue = over
+        out.append({
+            "user_id": u.id, "employee": u.full_name, "employee_id": u.employee_id, "team_lead": u.reporting_manager or "",
+            "shift": eff or "", "shift_temp": bool(ovm.get(u.id)), "status": status, "leave_kind": lv,
+            "login": (d["first_login"].isoformat() + "Z") if d and d["first_login"] else None,
+            "late_minutes": late, "not_logged_in_overdue": overdue,
+            "away_since": (a.started_at.isoformat() + "Z") if a else None,
+            "away_minutes": round((now - a.started_at).total_seconds() / 60, 1) if a else None,
+            "away_no_signal": round((now - a.updated_at).total_seconds() / 60, 1) if a else None,
+            "tea_lunch": round(d["tea_lunch"], 1) if d else 0, "other": round(d["other"], 1) if d else 0,
+            "meeting": round(d["meeting"], 1) if d else 0, "breaks": d["breaks"] if d else 0,
+            "clocked": d["clocked"] if d else 0, "production": round(d["production"], 1) if d else 0,
+        })
+    return {"date": today.isoformat(), "off_day": off, "grace": LATE_GRACE_MIN, "rows": out}
+
+
+@app.get("/breaks/my-month")
+def break_my_month(
+    current_user: models.User = Depends(auth.require_role("colleague")),
+    db: Session = Depends(get_db),
+):
+    """A colleague's own numbers: today against the limits, and the month so far."""
+    today = datetime.now(IST).date()
+    first = today.replace(day=1)
+    days = _collect_days(db, [current_user.id], first, today)
+    hol = _hol_set(db, first, today)
+    t = days.get((current_user.id, today))
+    my_leaves = {lv.leave_date: lv.kind for lv in db.query(models.LeaveDay).filter(models.LeaveDay.user_id == current_user.id, models.LeaveDay.leave_date >= first, models.LeaveDay.leave_date <= today).all()}
+    work_days = sum(1 for i in range((today - first).days + 1) if not _is_off_day(first + timedelta(days=i), hol) and (first + timedelta(days=i)) not in my_leaves)
+    m = {"present": 0, "done": 0, "clocked": 0.0, "production": 0.0, "breaks": 0.0, "late_dates": [], "over_dates": [], "under_clocked": 0, "under_prod": 0}
+    for (uid, d), v in sorted(days.items(), key=lambda x: x[0][1]):
+        off = _is_off_day(d, hol)
+        flags, late = _day_flags(v, current_user.shift, d, off, today)
+        m["breaks"] += v["brk_total"]
+        if not off and v["first_login"] is not None:
+            m["present"] += 1
+            if not (d >= today and v["live"]):       # today's unfinished day would drag the averages down
+                m["done"] += 1
+                m["clocked"] += v["clocked"]; m["production"] += v["production"]
+        if late is not None:
+            m["late_dates"].append(d.isoformat())
+        if any(x in flags for x in ("Tea + Lunch over 1h", "Other break over 30m", "Single break over 2h")):
+            m["over_dates"].append(d.isoformat())
+        if "Clocked under 9h" in flags:
+            m["under_clocked"] += 1
+        if "Production under 7:30h" in flags:
+            m["under_prod"] += 1
+    return {
+        "month": today.strftime("%B %Y"), "date": today.isoformat(), "off_day": _is_off_day(today, hol), "grace": LATE_GRACE_MIN,
+        "shift": current_user.shift or "", "work_days": work_days, "leave_days": len(my_leaves),
+        "today": {"tea_lunch": round(t["tea_lunch"], 1) if t else 0, "other": round(t["other"], 1) if t else 0,
+                  "meeting": round(t["meeting"], 1) if t else 0, "clocked": t["clocked"] if t else 0, "production": round(t["production"], 1) if t else 0,
+                  "login": (t["first_login"].isoformat() + "Z") if t and t["first_login"] else None},
+        "limits": {"tea_lunch": LIM_TEA_LUNCH, "other": LIM_OTHER, "clocked": LIM_CLOCKED, "production": LIM_PRODUCTION},
+        "month_stats": {"present": m["present"], "clocked": round(m["clocked"], 1), "production": round(m["production"], 1), "breaks": round(m["breaks"], 1),
+                        "avg_clocked": round(m["clocked"] / m["done"], 1) if m["done"] else 0,
+                        "avg_production": round(m["production"] / m["done"], 1) if m["done"] else 0,
+                        "late_days": len(m["late_dates"]), "late_dates": m["late_dates"], "over_days": len(m["over_dates"]), "over_dates": m["over_dates"],
+                        "under_clocked": m["under_clocked"], "under_prod": m["under_prod"]},
+    }
+
+
+@app.get("/breaks/month-pack")
+def break_month_pack(
+    month: Optional[str] = None,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Month-end pack for HR: one row per colleague with attendance, leave, breaks by type, hours and adjustments."""
+    today = datetime.now(IST).date()
+    try:
+        y, mo = (int(x) for x in month.split("-")) if month else (today.year, today.month)
+        first = date(y, mo, 1)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="month must look like 2026-10")
+    last_full = date(y + (mo == 12), mo % 12 + 1, 1) - timedelta(days=1)
+    last = min(last_full, today)
+    if last < first:
+        return {"month": first.strftime("%B %Y"), "rows": []}
+    users = [u for u in _batch_visible_colleagues(db, current_user) if u.employment_status != "Inactive"]
+    ids = [u.id for u in users]
+    days = _collect_days(db, ids, first, last)
+    hol = _hol_set(db, first, last)
+    lv = {}
+    for x in db.query(models.LeaveDay).filter(models.LeaveDay.leave_date >= first, models.LeaveDay.leave_date <= last, models.LeaveDay.user_id.in_(ids or [-1])).all():
+        lv.setdefault(x.user_id, {})[x.leave_date] = x.kind
+    adjn = {}
+    for a in db.query(models.BreakAdjustment).filter(models.BreakAdjustment.adj_date >= first, models.BreakAdjustment.adj_date <= last, models.BreakAdjustment.user_id.in_(ids or [-1])).all():
+        adjn[a.user_id] = adjn.get(a.user_id, 0) + 1
+    workdays = [first + timedelta(days=i) for i in range((last - first).days + 1)]
+    workdays = [d for d in workdays if not _is_off_day(d, hol)]
+    rows = []
+    for u in sorted(users, key=lambda x: ((x.reporting_manager or ""), x.full_name)):
+        mine = {d: v for (uid, d), v in days.items() if uid == u.id and v["first_login"] is not None}
+        ul = lv.get(u.id, {})
+        r = {"employee": u.full_name, "employee_id": u.employee_id or "", "team_lead": u.reporting_manager or "", "shift": u.shift or "",
+             "working_days": sum(1 for d in workdays if d not in ul), "days_present": 0, "leave": 0, "sick": 0, "training": 0, "other_leave": 0,
+             "no_login_days": 0, "late_days": 0, "tea": [0, 0], "lunch": [0, 0], "other": [0, 0], "meeting": [0, 0],
+             "break_limit_days": 0, "long_break_days": 0, "no_logout_days": 0, "short_hours_days": 0, "exception_days": 0, "left_early_days": 0, "overtime": 0.0,
+             "clocked": 0.0, "production": 0.0, "done": 0, "adjustments": adjn.get(u.id, 0)}
+        for k in ul.values():
+            key = {"Leave": "leave", "Sick": "sick", "Training": "training"}.get(k, "other_leave")
+            r[key] += 1
+        for d in workdays:
+            if d not in ul and d not in mine and d < today:
+                r["no_login_days"] += 1
+        for d, v in sorted(mine.items()):
+            flags, late = _day_flags(v, u.shift, d, _is_off_day(d, hol), today)
+            if not (_is_off_day(d, hol) or d in ul):
+                r["days_present"] += 1
+            if "Late login" in flags: r["late_days"] += 1
+            if any(x in flags for x in ("Tea + Lunch over 1h", "Other break over 30m")): r["break_limit_days"] += 1
+            if "Single break over 2h" in flags: r["long_break_days"] += 1
+            if "No logout recorded" in flags: r["no_logout_days"] += 1
+            if "Clocked under 9h" in flags or "Production under 7:30h" in flags: r["short_hours_days"] += 1
+            if "Left early" in flags: r["left_early_days"] += 1
+            if flags: r["exception_days"] += 1
+            if not (_is_off_day(d, hol) or d in ul or (d >= today and v["live"])):
+                r["overtime"] += max(0.0, v["clocked"] - LIM_CLOCKED)
+            for bt, (c, m) in v["bt"].items():
+                key = {"Tea Break": "tea", "Lunch Break": "lunch", "Dinner Break": "lunch", "Other Break": "other"}.get(bt, "meeting")
+                r[key][0] += c; r[key][1] += round(m)
+            if not (_is_off_day(d, hol) or d in ul or (d >= today and v["live"])):
+                r["done"] += 1; r["clocked"] += v["clocked"]; r["production"] += v["production"]
+        r["overtime_h"] = round(r["overtime"] / 60, 1)
+        r["total_clocked_h"] = round(r["clocked"] / 60, 1)
+        r["total_production_h"] = round(r["production"] / 60, 1)
+        r["avg_clocked_h"] = round(r["clocked"] / r["done"] / 60, 2) if r["done"] else 0
+        r["avg_production_h"] = round(r["production"] / r["done"] / 60, 2) if r["done"] else 0
+        rows.append(r)
+    return {"month": first.strftime("%B %Y"), "through": last.isoformat(), "rows": rows}
+
+
+@app.get("/breaks/exceptions")
+def break_exceptions(
+    month: Optional[str] = None,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """
+    Monthly exception report: every person-day that broke a rule (late login, Tea + Lunch over 1h,
+    Other over 30m, clocked under 9h, production under 7:30h) with the break reasons given.
+    month = YYYY-MM (default: the current IST month).
+    """
+    today = datetime.now(IST).date()
+    try:
+        y, mo = (int(x) for x in month.split("-")) if month else (today.year, today.month)
+        first = date(y, mo, 1)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="month must look like 2026-10")
+    last = (date(y + (mo == 12), mo % 12 + 1, 1) - timedelta(days=1))
+    last = min(last, today)
+    if last < first:
+        return {"month": first.strftime("%B %Y"), "rows": [], "summary": []}
+    users = {u.id: u for u in _batch_visible_colleagues(db, current_user)}
+    ids = None if current_user.role in ("admin", "manager", "super_admin") else list(users)
+    days = _collect_days(db, ids, first, last)
+    hol = _hol_set(db, first, last)
+    if ids is None:
+        users = {u.id: u for u in db.query(models.User).filter(models.User.id.in_({k[0] for k in days} or {-1})).all()}
+    rows, summ = [], {}
+    for (uid, d), v in sorted(days.items(), key=lambda x: (x[0][1], (users.get(x[0][0]).full_name if users.get(x[0][0]) else ""))):
+        u = users.get(uid)
+        if not u:
+            continue
+        off = _is_off_day(d, hol)
+        flags, late = _day_flags(v, u.shift, d, off, today)
+        if not flags:
+            continue
+        rows.append({
+            "date": d.isoformat(), "employee": u.full_name, "employee_id": u.employee_id or "", "team_lead": u.reporting_manager or "",
+            "shift": u.shift or "", "login": _ist_dt(v["first_login"]).strftime("%H:%M") if v["first_login"] else "",
+            "logout": _ist_dt(v["last_logout"]).strftime("%H:%M") if v["last_logout"] else "", "late_minutes": late or 0,
+            "tea_lunch": round(v["tea_lunch"]), "other": round(v["other"]), "meeting": round(v["meeting"]),
+            "clocked": round(v["clocked"]), "production": round(v["production"]),
+            "flags": ", ".join(flags), "reasons": "; ".join(v["reasons"]),
+            "adjusted": "; ".join(v["adj"]),
+        })
+        sm = summ.setdefault(uid, {"employee": u.full_name, "team_lead": u.reporting_manager or "", "shift": u.shift or "", "exception_days": 0,
+                                   "late": 0, "tea_lunch": 0, "other": 0, "clocked": 0, "production": 0, "long": 0, "no_logout": 0, "early": 0})
+        sm["exception_days"] += 1
+        sm["late"] += "Late login" in flags
+        sm["tea_lunch"] += "Tea + Lunch over 1h" in flags
+        sm["other"] += "Other break over 30m" in flags
+        sm["clocked"] += "Clocked under 9h" in flags
+        sm["production"] += "Production under 7:30h" in flags
+        sm["long"] += "Single break over 2h" in flags
+        sm["no_logout"] += "No logout recorded" in flags
+        sm["early"] += "Left early" in flags
+    adjs = []
+    for a in db.query(models.BreakAdjustment).filter(models.BreakAdjustment.adj_date >= first, models.BreakAdjustment.adj_date <= last).order_by(models.BreakAdjustment.adj_date, models.BreakAdjustment.id).all():
+        u = users.get(a.user_id)
+        if u:
+            adjs.append({"date": a.adj_date.isoformat(), "employee": u.full_name, "team_lead": u.reporting_manager or "", "excused": a.excused or "",
+                         "retype": (a.old_type + " -> " + a.new_type) if a.new_type else "", "note": a.note, "by": a.created_by_name or ""})
+    return {"month": first.strftime("%B %Y"), "rows": rows, "adjustments": adjs, "summary": sorted(summ.values(), key=lambda x: (-x["exception_days"], x["employee"]))}
 
 
 @app.get("/auth/me/photo")
@@ -671,7 +4916,7 @@ def away_start(payload: schemas.AwayIn, current_user: models.User = Depends(auth
 
 @app.get("/breaks/away")
 def away_list(
-    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """Colleagues away right now: Team Lead -> their team, Admin / Super Admin -> everyone."""
@@ -745,7 +4990,7 @@ def reset_password_with_token(payload: schemas.ResetPasswordWithTokenRequest, db
 @app.get("/users/team-leads", response_model=List[schemas.UserOut])
 def list_team_leads(
     process_id: int,
-    current_user: models.User = Depends(auth.require_role("admin", "team_lead", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("admin", "manager", "team_lead", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -793,8 +5038,8 @@ def create_user(
     for this deployment) — the temporary password is returned in this
     response so the Super Admin can relay it to the new user directly.
     """
-    if payload.role not in ("colleague", "team_lead", "admin", "quality", "onshore", "recon", "calling", "super_admin"):
-        raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', 'admin', 'quality', 'onshore', 'recon', 'calling', or 'super_admin'")
+    if payload.role not in ("colleague", "team_lead", "admin", "manager", "quality", "onshore", "recon", "calling", "super_admin"):
+        raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', 'admin', 'manager', 'quality', 'onshore', 'recon', 'calling', or 'super_admin'")
     if db.query(models.User).filter(models.User.username == payload.username).first():
         raise HTTPException(status_code=400, detail="username already exists")
 
@@ -818,6 +5063,8 @@ def create_user(
     if payload.process_ids:
         user.processes = db.query(models.Process).filter(models.Process.id.in_(payload.process_ids)).all()
     db.add(user)
+    db.flush()
+    _audit(db, current_user, "Profile", "Created profile", user, details=f"Role {user.role}; status {user.employment_status}; shift {user.shift or 'not set'}; Team Lead {user.reporting_manager or '-'}")
     db.commit()
     db.refresh(user)
     sent, note = _send_account_email(user, temp_password)
@@ -835,9 +5082,11 @@ def update_user(
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    if payload.role not in ("colleague", "team_lead", "admin", "quality", "onshore", "recon", "calling", "super_admin"):
-        raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', 'admin', 'quality', 'onshore', 'recon', 'calling', or 'super_admin'")
+    if payload.role not in ("colleague", "team_lead", "admin", "manager", "quality", "onshore", "recon", "calling", "super_admin"):
+        raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', 'admin', 'manager', 'quality', 'onshore', 'recon', 'calling', or 'super_admin'")
 
+    _before = {"name": user.full_name, "role": user.role, "email": user.email or "", "designation": user.designation or "", "Team Lead": user.reporting_manager or "",
+               "shift": user.shift or "", "status": user.employment_status, "employee id": user.employee_id or "", "processes": ", ".join(sorted(p.name for p in user.processes))}
     user.full_name = payload.full_name
     user.role = payload.role
     user.email = payload.email
@@ -847,9 +5096,22 @@ def update_user(
     user.designation = payload.designation
     user.reporting_manager = payload.reporting_manager
     user.shift = _clean_shift(payload.shift)
+    if payload.employment_status == "Inactive" and user.id == current_user.id:
+        raise HTTPException(status_code=400, detail="You cannot make your own profile Inactive")
+    if payload.employment_status == "Inactive" and user.employment_status != "Inactive":
+        # Lock the profile: end any open session and clear the Away Now entry.
+        now = datetime.utcnow()
+        for sl in db.query(models.SessionLog).filter(models.SessionLog.user_id == user.id, models.SessionLog.logout_at.is_(None)).all():
+            sl.logout_at = min(now, sl.last_seen) if sl.last_seen else now
+        _away_clear(db, user.id)
     user.employment_status = payload.employment_status
     user.employee_id = payload.employee_id
     user.processes = db.query(models.Process).filter(models.Process.id.in_(payload.process_ids)).all()
+    _after = {"name": user.full_name, "role": user.role, "email": user.email or "", "designation": user.designation or "", "Team Lead": user.reporting_manager or "",
+              "shift": user.shift or "", "status": user.employment_status, "employee id": user.employee_id or "", "processes": ", ".join(sorted(p.name for p in user.processes))}
+    _diff = [f"{k}: {_before[k] or '-'} -> {_after[k] or '-'}" for k in _after if _before[k] != _after[k]]
+    if _diff:
+        _audit(db, current_user, "Profile", "Edited profile", user, details="; ".join(_diff))
     db.commit()
     db.refresh(user)
     return user
@@ -867,6 +5129,7 @@ def reset_password(
     temp_password = auth.generate_temp_password()
     user.password_hash = auth.hash_password(temp_password)
     user.must_change_password = True
+    _audit(db, current_user, "Profile", "Reset password", user, details="Temporary password issued")
     db.commit()
     sent, note = _send_account_email(user, temp_password)
     return {"username": user.username, "temporary_password": temp_password, "email_sent": sent, "email_note": note}
@@ -995,6 +5258,7 @@ def set_business_day(
     if minutes > 12 * 60:
         raise HTTPException(status_code=400, detail="The day change time must be between 00:00 and 12:00")
     row = db.query(models.AppSetting).filter(models.AppSetting.key == BUSINESS_DAY_SETTING_KEY).first()
+    _audit(db, current_user, "Setting", "Changed business day change time", details=f"{_fmt_hhmm(int(row.value)) if row and (row.value or '').isdigit() else 'default'} -> {_fmt_hhmm(minutes)}")
     if row:
         row.value = str(minutes)
     else:
@@ -1054,6 +5318,7 @@ def add_holiday(payload: schemas.HolidayIn, current_user: models.User = Depends(
     h = models.Holiday(holiday_date=payload.holiday_date, name=name, created_by_name=current_user.full_name,
                        created_at=datetime.now(IST).replace(tzinfo=None))
     db.add(h)
+    _audit(db, current_user, "Holiday", "Added holiday", ref_date=payload.holiday_date, details=name)
     db.commit()
     db.refresh(h)
     _holiday_cache["at"] = 0.0
@@ -1072,6 +5337,7 @@ def update_holiday(holiday_id: int, payload: schemas.HolidayIn,
     clash = db.query(models.Holiday).filter(models.Holiday.holiday_date == payload.holiday_date, models.Holiday.id != holiday_id).first()
     if clash:
         raise HTTPException(status_code=409, detail="A holiday is already listed on that date")
+    _audit(db, current_user, "Holiday", "Changed holiday", ref_date=payload.holiday_date, details=f"{h.holiday_date} {h.name} -> {payload.holiday_date} {name}")
     h.holiday_date = payload.holiday_date
     h.name = name
     db.commit()
@@ -1086,6 +5352,7 @@ def delete_holiday(holiday_id: int, current_user: models.User = Depends(auth.req
     h = db.query(models.Holiday).filter(models.Holiday.id == holiday_id).first()
     if not h:
         raise HTTPException(status_code=404, detail="Holiday not found")
+    _audit(db, current_user, "Holiday", "Removed holiday", ref_date=h.holiday_date, details=h.name)
     db.delete(h)
     db.commit()
     _holiday_cache["at"] = 0.0
@@ -1118,6 +5385,7 @@ def _open_session(db: Session, user_id: int):
         now = datetime.utcnow()
         for s in db.query(models.SessionLog).filter(models.SessionLog.user_id == user_id, models.SessionLog.logout_at.is_(None)).all():
             s.logout_at = s.last_seen
+            s.auto_closed = True              # never logged out: the browser was closed or the PC went off
         db.add(models.SessionLog(user_id=user_id, login_at=now, last_seen=now))
         db.commit()
     except Exception:
@@ -1151,6 +5419,7 @@ def session_end(current_user: models.User = Depends(auth.require_role("colleague
             s.logout_at = now
         else:                            # older ones were left open by a closed browser: they ended at their last heartbeat
             s.logout_at = s.last_seen
+            s.auto_closed = True
     _away_clear(db, current_user.id)
     db.commit()
     return {"ok": True}
@@ -1160,7 +5429,7 @@ def session_end(current_user: models.User = Depends(auth.require_role("colleague
 def clocked_hours(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
-    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -1192,13 +5461,13 @@ def clocked_hours(
             end = s.login_at
         ist_day = (s.login_at.replace(tzinfo=timezone.utc).astimezone(IST)).date().isoformat()
         live = s.logout_at is None and (now - s.last_seen) < timedelta(minutes=5)
-        by.setdefault((s.user_id, ist_day), []).append((s.login_at, end, live))
+        by.setdefault((s.user_id, ist_day), []).append((s.login_at, end, live, bool(s.auto_closed) or (s.logout_at is None and not live)))
     users = {u.id: u for u in db.query(models.User).filter(models.User.id.in_({k[0] for k in by} or {-1})).all()}
     out = []
     for (uid, day), ivs in by.items():
         ivs.sort()
         merged = []
-        for a, b, _ in ivs:
+        for a, b, _, _nl in ivs:
             if merged and a <= merged[-1][1]:
                 merged[-1][1] = max(merged[-1][1], b)
             else:
@@ -1208,12 +5477,13 @@ def clocked_hours(
             "user_id": uid, "employee": u.full_name if u else "", "team_lead": (u.reporting_manager if u else None) or "",
             "date": day, "first_login": ivs[0][0].isoformat(), "last_logout": merged[-1][1].isoformat(),
             "minutes": round(sum((b - a).total_seconds() for a, b in merged) / 60, 2), "ongoing": any(x[2] for x in ivs),
+            "no_logout": any(x[3] for x in ivs) and day < today.isoformat(),
         })
     return out
 
 
-PERF_ROLES = ("colleague", "team_lead", "admin", "super_admin")   # data: colleagues see only themselves
-PERF_RATE_ROLES = ("team_lead", "admin", "super_admin")
+PERF_ROLES = ("colleague", "team_lead", "admin", "manager", "super_admin")   # data: colleagues see only themselves
+PERF_RATE_ROLES = ("team_lead", "admin", "manager", "super_admin")
 PERF_FIELDS = ("pk", "shift", "flex", "me")
 
 
@@ -1261,7 +5531,7 @@ def performance_data(current_user: models.User = Depends(auth.require_role(*PERF
 def _performance_data(current_user: models.User, db: Session):
     colleagues = _batch_visible_colleagues(db, current_user)
     ids = [u.id for u in colleagues]
-    out = {"employees": [], "rows": [], "ratings": {}, "can_rate": current_user.role in PERF_RATE_ROLES, "role": current_user.role,
+    out = {"employees": [], "rows": [], "ratings": {}, "can_rate": current_user.role in PERF_RATE_ROLES, "role": "admin" if current_user.role == "manager" else current_user.role,
            "rate_year": _perf_prev_month()[0], "rate_month": _perf_prev_month()[1], "attendance_since": None}
     if not ids:
         return out
@@ -1275,7 +5545,7 @@ def _performance_data(current_user: models.User, db: Session):
     months = {}          # (uid, y, m) -> record
 
     def rec(uid, y, m):
-        return months.setdefault((uid, y, m), {"emp": uid, "year": y, "m": m, "pt": None, "pa": None, "qa": None, "qd": None, "aw": None, "awd": None})
+        return months.setdefault((uid, y, m), {"emp": uid, "year": y, "m": m, "pt": None, "pa": None, "qa": None, "qd": None, "aw": None, "awd": None, "qe": None, "qr": None})
 
     # Production + Quality from the Batch Count Dashboard rows
     for r in _batch_base_rows(db, current_user, None, None, None, None):
@@ -1290,6 +5560,15 @@ def _performance_data(current_user: models.User, db: Session):
         if r["accounts_audited"] and r["accounts_audited"] > 0 and r["errors"] is not None:
             x["qa"] = (x["qa"] or 0) + r["accounts_audited"]
             x["qd"] = (x["qd"] or 0) + r["errors"]
+
+    # Logged error detail (type / rework) per month, shown beside the Quality figures
+    for e in db.query(models.QualityError).filter(models.QualityError.user_id.in_(ids)).all():
+        d = _as_date(e.error_date)
+        if d is None:
+            continue
+        x = rec(e.user_id, d.year, d.month - 1)
+        x["qe"] = (x["qe"] or 0) + 1
+        x["qr"] = (x["qr"] or 0) + (e.rework_count or 0)
 
     # Attendance from login days
     first = _as_date(db.query(func.min(models.LoginDay.login_date)).scalar())
@@ -1317,7 +5596,7 @@ def _performance_data(current_user: models.User, db: Session):
                     x["aw"], x["awd"] = wd, worked   # not capped: logins on holidays/weekends count
                 y, m = (y + 1, 1) if m == 12 else (y, m + 1)
 
-    out["rows"] = [v for v in months.values() if any(v[k] for k in ("pt", "qa", "aw"))]
+    out["rows"] = [v for v in months.values() if any(v[k] for k in ("pt", "qa", "aw", "qe"))]
     for r in db.query(models.PerformanceRating).filter(models.PerformanceRating.user_id.in_(ids)).all():
         out["ratings"].setdefault(str(r.user_id), {})[f"{r.year}-{r.month}"] = {k: getattr(r, k) for k in PERF_FIELDS}
     return out
@@ -1386,7 +5665,7 @@ def _p835_lines_total(db, order_id) -> float:
 
 
 @app.get("/orders/{order_id}/posting-835")
-def get_posting_835(order_id: int, current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "super_admin")),
+def get_posting_835(order_id: int, current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "manager", "super_admin")),
                     db: Session = Depends(get_db)):
     order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
     if not order or (current_user.role == "colleague" and order.assigned_to_id != current_user.id):
@@ -1444,7 +5723,7 @@ def save_posting_835(order_id: int, payload: dict, current_user: models.User = D
 
 @app.get("/posting-835")
 def list_posting_835(process_id: Optional[int] = None, date_from: Optional[date] = None, date_to: Optional[date] = None,
-                     current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+                     current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
                      db: Session = Depends(get_db)):
     L = models.Posting835Line
     q = db.query(L)
@@ -1704,7 +5983,7 @@ def _attach_ack_info(db: Session, current_user: models.User, process_id: int, ro
     by_update = {}
     for a in acks:
         by_update.setdefault(a.update_id, {})[a.user_id] = a
-    scope = _ack_scope_colleagues(db, current_user, process_id) if current_user.role in ("team_lead", "admin", "super_admin") else []
+    scope = _ack_scope_colleagues(db, current_user, process_id) if current_user.role in ("team_lead", "admin", "manager", "super_admin") else []
     scope_ids = {u.id for u in scope}
     for r in rows:
         got = by_update.get(r.id, {})
@@ -1732,7 +6011,7 @@ def acknowledge_process_update(update_id: int, current_user: models.User = Depen
 
 
 @app.get("/process-updates/{update_id}/acknowledgements")
-def process_update_acknowledgements(update_id: int, current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+def process_update_acknowledgements(update_id: int, current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
                                     db: Session = Depends(get_db)):
     """Who has / hasn't acknowledged an update (Team Lead: their team; Admin / Super Admin: all colleagues of the process)."""
     upd = db.query(models.ProcessUpdate).filter(models.ProcessUpdate.id == update_id).first()
@@ -1756,7 +6035,7 @@ def process_update_acknowledgements(update_id: int, current_user: models.User = 
 @app.post("/process-updates", response_model=List[schemas.ProcessUpdateOut])
 def create_process_update(
     payload: schemas.ProcessUpdateCreate,
-    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     if not payload.process_ids:
@@ -1802,7 +6081,7 @@ def create_process_update(
 def edit_process_update(
     update_id: int,
     payload: schemas.ProcessUpdateEdit,
-    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -1849,7 +6128,7 @@ MAX_ATTACHMENTS_PER_UPDATE = 5
 def upload_process_update_attachments(
     update_id: int,
     files: List[UploadFile] = File(...),
-    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -1929,7 +6208,7 @@ def get_process_update_attachment(
 @app.get("/users/colleagues", response_model=List[schemas.UserOut])
 def list_colleagues(
     process_id: int,
-    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -1967,7 +6246,7 @@ def run_assignment(
 def reassign_order(
     order_id: int,
     payload: schemas.ReassignRequest,
-    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -2005,6 +6284,7 @@ def reassign_order(
 
     reasons = _order_lock_reasons(order) if _audit_applies(current_user) else []
     before = _order_snapshot(order) if reasons else None
+    _old_name = order.employee_name or "unassigned"
 
     order.assigned_to_id = new_colleague.id
     order.assigned_date = _work_today()
@@ -2014,6 +6294,7 @@ def reassign_order(
     _start_timer(order)
     if reasons:
         _log_order_change(db, current_user, order, "reassign", reasons, before)
+    _audit_order(db, current_user, "Reassigned order", order, f"{_old_name} -> {new_colleague.full_name}")
     db.commit()
     db.refresh(order)
     return order
@@ -2023,7 +6304,7 @@ def reassign_order(
 def transfer_orders(
     process_id: int,
     payload: schemas.TransferOrdersRequest,
-    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -2081,6 +6362,9 @@ def transfer_orders(
         order.posting_status = None
         order.last_edited_by = current_user.username
 
+    if orders:
+        _audit(db, current_user, "Order", "Transferred orders to another Team Lead", None, None,
+               f"{len(orders)} order(s) moved to {to_lead.full_name} (from Team Lead id {from_team_lead_id}); e.g. " + ", ".join(str(o.edm or o.id) for o in orders[:5]))
     db.commit()
     _auto_assign_open_slots(db, process_id)
     return {"transferred": len(orders)}
@@ -2110,6 +6394,10 @@ def delete_all_orders(
                 models.WorkOrder.submitted == True),  # noqa: E712
         ).all():
             _log_order_change(db, current_user, o, "delete", _order_lock_reasons(o), _order_snapshot(o))
+    _n_del = db.query(models.WorkOrder).filter(models.WorkOrder.process_id == process_id).count()
+    _pname = db.query(models.Process.name).filter(models.Process.id == process_id).scalar()
+    if _n_del:
+        _audit(db, current_user, "Order", "Deleted ALL orders of a process", None, None, f"{_n_del} order(s) deleted from {_pname}")
     # A bulk .delete() skips the ORM cascade, so the child rows (clarification /
     # escalation details) have to go first or Postgres rejects the delete with a
     # foreign-key error (the "Internal Server Error").
@@ -2127,7 +6415,7 @@ def delete_all_orders(
 @app.delete("/orders/{order_id}")
 def delete_one_order(
     order_id: int,
-    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """Deletes a single order — for cleaning up a bad test/import row without wiping the whole queue."""
@@ -2138,6 +6426,7 @@ def delete_one_order(
     reasons = _order_lock_reasons(order) if _audit_applies(current_user) else []
     if reasons:
         _log_order_change(db, current_user, order, "delete", reasons, _order_snapshot(order))
+    _audit_order(db, current_user, "Deleted order", order, f"status {order.posting_status or 'Pending'}, amount {order.amount}")
     db.delete(order)
     db.commit()
     return {"deleted": 1}
@@ -2191,6 +6480,11 @@ def _cell_text(v) -> str:
     return str(v).strip()
 
 
+class _InvRows(list):
+    """List of inventory rows that also remembers which internal fields the header mapped to."""
+    fields: set = set()
+
+
 def _read_inventory_rows(raw: bytes, filename: str, ecom: bool = False):
     """
     Reads the uploaded inventory (.xlsx or .csv) into a list of dicts keyed by
@@ -2223,7 +6517,8 @@ def _read_inventory_rows(raw: bytes, filename: str, ecom: bool = False):
     if header_idx is None:
         raise HTTPException(status_code=400, detail="Could not find the header row (Batch, Status, Created, Images, Docs, Def Doc Type, ...)")
 
-    rows = []
+    rows = _InvRows()
+    rows.fields = set(mapping.values())
     for r in matrix[header_idx + 1:]:
         if not any(c for c in r):
             continue
@@ -2337,7 +6632,7 @@ def import_inventory(
     process_id: int,
     file: UploadFile = File(...),
     on_behalf_of_team_lead_id: Optional[int] = Form(None),
-    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin", "admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin", "admin", "manager")),
     db: Session = Depends(get_db),
 ):
     """
@@ -2373,7 +6668,7 @@ def import_inventory(
     fixed_team_lead_id = None       # set when the whole file is imported for one Team Lead
     if current_user.role == "team_lead":
         fixed_team_lead_id = current_user.id
-    elif current_user.role == "admin" and on_behalf_of_team_lead_id is not None:
+    elif current_user.role in ("admin", "manager") and on_behalf_of_team_lead_id is not None:
         delegate = (
             db.query(models.User)
             .filter(
@@ -2529,9 +6824,207 @@ def import_inventory(
                 continue
             logged.add(key)
             db.add(e)
+    _pn = db.query(models.Process.name).filter(models.Process.id == process_id).scalar()
+    _audit(db, current_user, "Order", "Imported inventory file", None, None,
+           f"{_pn}: file {(file.filename or '')[:60]} - {counts['imported']} imported of {counts['total_rows']} rows ({counts['skipped_duplicate_open'] + counts['skipped_duplicate_completed'] + counts['skipped_duplicate_in_file']} duplicates skipped)")
     db.commit()
     _auto_assign_open_slots(db, process_id)
     return counts
+
+
+@app.post("/orders/import-check")
+def import_check(
+    process_id: int,
+    file: UploadFile = File(...),
+    on_behalf_of_team_lead_id: Optional[int] = Form(None),
+    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin", "admin", "manager")),
+    db: Session = Depends(get_db),
+):
+    """
+    Dry run of /orders/import: nothing is saved. Reports missing columns, odd dates / amounts,
+    how many rows have no assigned client, and what the real import would skip (with samples).
+    """
+    _require_process_access(current_user, process_id)
+    fixed_tl = None
+    if current_user.role == "team_lead":
+        fixed_tl = current_user.id
+    elif current_user.role in ("admin", "manager") and on_behalf_of_team_lead_id is not None:
+        fixed_tl = on_behalf_of_team_lead_id
+    process = db.query(models.Process).filter(models.Process.id == process_id).first()
+    is_edm = bool(process and process.name.strip().upper() == "EDM")
+    is_cb = bool(process and process.name.strip().lower() == "cb unmatched posting")
+    is_ecom = _is_ecom_process(process)
+
+    try:
+        rows = _read_inventory_rows(file.file.read(), file.filename, ecom=is_ecom)
+    except HTTPException as e:
+        return {"can_import": False, "fatal": e.detail, "warnings": [], "counts": {}, "samples": {}, "missing_columns": [], "total_rows": 0}
+
+    fields = set(rows.fields)
+    label = {"edm": "Batch / EDM", "created": "Created", "def_doc_type": "Def Doc Type", "amount": "Amount",
+             "description": "Description", "run": "Run", "not_posted_amount": "NotPosted$", "offset_amount": "Offset $",
+             "division": "Division"}
+    required = ["edm", "division"] if is_ecom else ["edm"]
+    recommended = (["run", "not_posted_amount", "offset_amount"] if is_ecom
+                   else ["created", "def_doc_type", "amount", "description"])
+    miss_req = [label[f] for f in required if f not in fields and not (f == "division" and ("description" in fields or "division_name" in fields))]
+    miss_rec = [label[f] for f in recommended if f not in fields]
+    if is_edm and "def_doc_type" not in fields and "Def Doc Type" not in miss_rec:
+        miss_rec.append("Def Doc Type")
+
+    clients = db.query(models.Client).all()
+    by_no = {_norm_facility(c.facility_no): c for c in clients}
+    nc = {}
+    for c in clients:
+        nc[_norm_text(c.client_name)] = nc.get(_norm_text(c.client_name), 0) + 1
+    by_name = {_norm_text(c.client_name): c for c in clients if nc[_norm_text(c.client_name)] == 1}
+    client_tl = {a.client_id: a.team_lead_id for a in db.query(models.ClientProcessTeamLead).filter(
+        models.ClientProcessTeamLead.process_id == process_id).all()}
+    today = _work_today()
+    existing = {}
+    if is_edm or is_ecom:
+        cutoff = today - relativedelta(months=DUPLICATE_LOOKBACK_MONTHS)
+        for o in db.query(models.WorkOrder.edm, models.WorkOrder.posting_status, models.WorkOrder.run).filter(
+            models.WorkOrder.process_id == process_id, models.WorkOrder.received_date >= cutoff,
+            models.WorkOrder.edm.isnot(None)).all():
+            existing.setdefault(_dup_key(o.edm, o.run, is_ecom), []).append(o)
+
+    counts = {"total_rows": 0, "will_import": 0, "skipped_bar_grp": 0, "skipped_doc_type": 0,
+              "skipped_other_team_lead": 0, "skipped_unassigned_client": 0, "skipped_duplicate_open": 0,
+              "skipped_duplicate_in_file": 0, "skipped_duplicate_completed": 0,
+              "blank_edm": 0, "bad_dates": 0, "bad_amounts": 0, "negative_amounts": 0, "zero_amounts": 0,
+              "future_dates": 0, "old_dates": 0, "unknown_clients": 0, "no_team_lead_clients": 0}
+    samples = {}
+    unassigned_vals = {}
+    amounts = []
+
+    def sample(kind, n, row, why):
+        lst = samples.setdefault(kind, [])
+        if len(lst) < 8:
+            lst.append({"row": n, "edm": row.get("edm") or "", "division": row.get("division") or "", "why": why})
+
+    seen = set()
+    for n, row in enumerate(rows, start=1):
+        counts["total_rows"] += 1
+        if not _norm_edm(row.get("edm")):
+            counts["blank_edm"] += 1
+            sample("blank_edm", n, row, "Batch / EDM is empty")
+        # odd dates
+        for col, nm in (("created", "Created"), ("deposit_date", "Deposit Date")):
+            v = (row.get(col) or "").strip()
+            if not v:
+                continue
+            try:
+                d = (_parse_dt(v) if col == "created" else _parse_date(v))
+                dd = d.date() if isinstance(d, datetime) else d
+                if dd > today + timedelta(days=1):
+                    counts["future_dates"] += 1; sample("future_dates", n, row, f"{nm} {v} is in the future")
+                elif dd < today - timedelta(days=400):
+                    counts["old_dates"] += 1; sample("old_dates", n, row, f"{nm} {v} is over a year old")
+            except (ValueError, OverflowError, TypeError):
+                counts["bad_dates"] += 1; sample("bad_dates", n, row, f"{nm} '{v}' is not a date")
+        # odd amounts
+        for col, nm in (("amount", "Amount"), ("not_posted_amount", "NotPosted$"), ("offset_amount", "Offset $")):
+            v = (row.get(col) or "").strip()
+            if not v:
+                continue
+            try:
+                a = float(_clean_number(v))
+                if col == "amount":
+                    amounts.append((n, a, row))
+                    if a < 0:
+                        counts["negative_amounts"] += 1; sample("negative_amounts", n, row, f"{nm} {v} is negative")
+                    elif a == 0:
+                        counts["zero_amounts"] += 1; sample("zero_amounts", n, row, f"{nm} is zero")
+            except (ValueError, TypeError):
+                counts["bad_amounts"] += 1; sample("bad_amounts", n, row, f"{nm} '{v}' is not a number")
+
+        # same skip rules as the real import
+        if _norm_text(row.get("bar_grp")) in SKIP_BAR_GRPS:
+            counts["skipped_bar_grp"] += 1; sample("skipped_bar_grp", n, row, "Bar Grp is excluded"); continue
+        if is_edm and _norm_text(row.get("def_doc_type")) not in EDM_ALLOWED_DOC_TYPES:
+            counts["skipped_doc_type"] += 1; sample("skipped_doc_type", n, row, f"Def Doc Type '{row.get('def_doc_type') or ''}' not imported"); continue
+        if is_cb and _norm_text(row.get("def_doc_type")) not in CB_UNMATCHED_ALLOWED_DOC_TYPES:
+            counts["skipped_doc_type"] += 1; sample("skipped_doc_type", n, row, f"Def Doc Type '{row.get('def_doc_type') or ''}' not imported"); continue
+        client = _client_for_row(row.get("division"), by_no, by_name)
+        if client is None and is_ecom and row.get("division_name"):
+            client = _client_for_row(row.get("division_name"), by_no, by_name)
+        row_tl = client_tl.get(client.id) if client else None
+        if row_tl is None:
+            counts["skipped_unassigned_client"] += 1
+            if client is None:
+                counts["unknown_clients"] += 1
+            else:
+                counts["no_team_lead_clients"] += 1
+            key = (row.get("division") or row.get("division_name") or "(blank)").strip() or "(blank)"
+            unassigned_vals[key] = unassigned_vals.get(key, 0) + 1
+            sample("skipped_unassigned_client", n, row, "Client not in client list" if client is None else f"{client.client_name}: no Team Lead for this process")
+            continue
+        if fixed_tl is not None and row_tl != fixed_tl:
+            counts["skipped_other_team_lead"] += 1; continue
+        k = _dup_key(row.get("edm"), row.get("run"), is_ecom)
+        if (is_edm or is_ecom) and _norm_edm(row.get("edm")):
+            if k in seen:
+                counts["skipped_duplicate_in_file"] += 1; sample("skipped_duplicate_in_file", n, row, "Repeated in this file"); continue
+            seen.add(k)
+            prior = existing.get(k)
+            if prior:
+                if any(o.posting_status == "Completed" for o in prior):
+                    counts["skipped_duplicate_completed"] += 1; sample("skipped_duplicate_completed", n, row, "Already Completed")
+                else:
+                    counts["skipped_duplicate_open"] += 1; sample("skipped_duplicate_open", n, row, "Already in the system")
+                continue
+        counts["will_import"] += 1
+
+    # amount outliers: > 20x the median of positive amounts
+    pos = sorted(a for _, a, _ in amounts if a > 0)
+    outliers = 0
+    if len(pos) >= 10:
+        med = pos[len(pos) // 2]
+        for n, a, row in amounts:
+            if med > 0 and a > med * 20:
+                outliers += 1
+                sample("amount_outliers", n, row, f"Amount {a:,.2f} is over 20x the typical {med:,.2f}")
+    counts["amount_outliers"] = outliers
+
+    total = max(counts["total_rows"], 1)
+    warnings = []
+    def warn(level, text):
+        warnings.append({"level": level, "text": text})
+    if miss_req:
+        warn("error", "Missing required column(s): " + ", ".join(miss_req) + ". Check the header row of the file.")
+    if miss_rec:
+        warn("warn", "Column(s) not found: " + ", ".join(miss_rec) + ". Those fields will be blank on the imported orders.")
+    if counts["total_rows"] == 0:
+        warn("error", "The file has a header but no data rows.")
+    if counts["blank_edm"]:
+        warn("warn", f"{counts['blank_edm']} row(s) have no Batch / EDM.")
+    if counts["bad_dates"]:
+        warn("warn", f"{counts['bad_dates']} date value(s) cannot be read and will be left blank.")
+    if counts["future_dates"]:
+        warn("warn", f"{counts['future_dates']} date(s) are in the future.")
+    if counts["old_dates"]:
+        warn("info", f"{counts['old_dates']} date(s) are more than a year old.")
+    if counts["bad_amounts"]:
+        warn("warn", f"{counts['bad_amounts']} amount(s) are not numbers and will be left blank.")
+    if counts["negative_amounts"]:
+        warn("info", f"{counts['negative_amounts']} negative amount(s).")
+    if counts["zero_amounts"]:
+        warn("info", f"{counts['zero_amounts']} zero amount(s).")
+    if outliers:
+        warn("warn", f"{outliers} amount(s) look unusually large compared with the rest of the file.")
+    un = counts["skipped_unassigned_client"]
+    if un:
+        pct = round(un * 100 / total)
+        warn("error" if pct >= 20 else "warn", f"{un} row(s) ({pct}%) belong to a client with no Team Lead for this process and will be skipped"
+             + (f" - e.g. {', '.join(list(unassigned_vals)[:5])}" if unassigned_vals else "") + ".")
+    if counts["will_import"] == 0 and counts["total_rows"] > 0:
+        warn("error", "Nothing in this file would be imported.")
+    top_un = sorted(unassigned_vals.items(), key=lambda kv: -kv[1])[:10]
+    fatal = bool(miss_req) or counts["total_rows"] == 0
+    return {"can_import": not fatal, "fatal": None, "warnings": warnings, "counts": counts, "samples": samples,
+            "missing_columns": miss_req + miss_rec, "unassigned_clients": [{"value": k, "rows": v} for k, v in top_un],
+            "total_rows": counts["total_rows"], "will_import": counts["will_import"]}
 
 
 # Import Exceptions list: Team Leads see their own "already completed" notices;
@@ -2542,7 +7035,7 @@ def list_import_exceptions(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     process_id: Optional[int] = None,
-    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -2593,7 +7086,7 @@ def _exception_row(e: models.ImportException) -> dict:
 @app.post("/import-exceptions/delete")
 def delete_import_exceptions(
     payload: schemas.ImportExceptionIds,
-    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """Removes the selected exception entries. A Team Lead may only remove their own 'already completed' notices."""
@@ -2758,6 +7251,45 @@ def _parse_float(v: Optional[str]) -> Optional[float]:
 # Assignment logic — one open file per colleague at a time (round-robin)
 # ---------------------------------------------------------------------------
 
+# ---- EDM division hold: some divisions are not handed to colleagues until N business days after their Created date ----
+HOLD_KEYS = {"divs": "edm_hold_divisions", "days": "edm_hold_days"}
+
+
+def _hold_cfg(db: Session):
+    raw = _setting(db, HOLD_KEYS["divs"], "")
+    divs = {_norm_text(x) for x in raw.split("\n") if x.strip()}
+    try:
+        days = max(1, min(30, int(_setting(db, HOLD_KEYS["days"], "5"))))
+    except ValueError:
+        days = 5
+    return divs, days
+
+
+def _hold_release_date(created, days: int):
+    """The first business day on which an order created on `created` may be assigned: business day number days+1 after it."""
+    d = created.date() if isinstance(created, datetime) else created
+    if not d:
+        return None
+    hol = _holiday_dates()
+    n = 0
+    while n < days + 1:
+        d += timedelta(days=1)
+        if d.weekday() < 5 and d not in hol:
+            n += 1
+    return d
+
+
+def _order_hold_until(order, cfg, today=None):
+    """Release date if this EDM order is still on hold today, else None."""
+    divs, days = cfg
+    if not divs or order.created is None or ((order.process.name if order.process else "") or "").strip().upper() != "EDM":
+        return None
+    if _norm_text(order.division) not in divs and _norm_text(order.division_name) not in divs:
+        return None
+    rel = _hold_release_date(order.created, days)
+    return rel if rel and (today or _work_today()) < rel else None
+
+
 def _auto_assign_open_slots(db: Session, process_id: int):
     """
     For every colleague who has access to this process, has logged in today (IST), and currently has no
@@ -2809,6 +7341,13 @@ def _auto_assign_open_slots(db: Session, process_id: int):
     )
     if not candidates:
         return
+
+    hold = _hold_cfg(db)
+    if hold[0]:
+        today_w = _work_today()
+        candidates = [c for c in candidates if _order_hold_until(c, hold, today_w) is None]
+        if not candidates:
+            return
 
     team_lead_ids = {c.team_lead_id for c in candidates if c.team_lead_id is not None}
     team_lead_names = {}
@@ -2919,10 +7458,44 @@ def list_orders(
             )
         )
     orders = query.order_by(models.WorkOrder.id.asc()).all()
-    if current_user.role in ("admin", "super_admin"):
+    if current_user.role in ("admin", "manager", "super_admin"):
         _attach_team_leads(db, orders, prefer="owner")     # so the screen can group by Team Lead
     _attach_team_files(db, orders)
+    if current_user.role != "colleague":
+        hold = _hold_cfg(db)
+        if hold[0]:
+            today_w = _work_today()
+            for o in orders:
+                o.held_until = _order_hold_until(o, hold, today_w) if o.assigned_to_id is None else None
     return orders
+
+
+@app.get("/orders/edm-hold")
+def edm_hold_get(current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")), db: Session = Depends(get_db)):
+    divs, days = _hold_cfg(db)
+    p = db.query(models.Process).filter(func.upper(models.Process.name) == "EDM").first()
+    known = []
+    if p:
+        rows = (db.query(models.WorkOrder.division, models.WorkOrder.division_name, func.count(models.WorkOrder.id))
+                .filter(models.WorkOrder.process_id == p.id).group_by(models.WorkOrder.division, models.WorkOrder.division_name).all())
+        known = sorted(({"division": d or "", "division_name": n or "", "orders": c} for d, n, c in rows if (d or n)), key=lambda x: (x["division_name"] or x["division"]).lower())
+    return {"days": days, "selected": [x for x in _setting(db, HOLD_KEYS["divs"], "").split("\n") if x.strip()], "known": known}
+
+
+@app.put("/orders/edm-hold")
+def edm_hold_put(payload: dict, current_user: models.User = Depends(auth.require_role("admin", "manager", "super_admin")), db: Session = Depends(get_db)):
+    try:
+        days = int(payload.get("days", 5))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Days must be a number")
+    if not 1 <= days <= 30:
+        raise HTTPException(status_code=400, detail="Days must be between 1 and 30")
+    sel = [str(x).strip() for x in (payload.get("divisions") or []) if str(x).strip()]
+    _set_setting(db, HOLD_KEYS["divs"], "\n".join(dict.fromkeys(sel)))
+    _set_setting(db, HOLD_KEYS["days"], str(days))
+    _audit(db, current_user, "Orders", "EDM division hold updated", None, None, f"{len(sel)} division(s), {days} business days")
+    db.commit()
+    return {"ok": True}
 
 
 @app.get("/orders/production", response_model=List[schemas.WorkOrderOut])
@@ -3007,7 +7580,7 @@ def list_production_orders(
             query = query.filter(cond)
 
     orders = query.order_by(models.WorkOrder.posted_date.asc(), models.WorkOrder.id.asc()).all()
-    if current_user.role in ("admin", "quality", "super_admin"):
+    if current_user.role in ("admin", "manager", "quality", "super_admin"):
         _attach_team_leads(db, orders, prefer="colleague")
     return orders
 
@@ -3016,7 +7589,7 @@ def list_production_orders(
 def list_escalations(
     process_id: int,
     resolved: bool = False,
-    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -3055,12 +7628,23 @@ def list_escalations(
         query = query.filter(models.WorkOrder.team_lead_id == current_user.id)
     order_col = models.WorkOrder.issue_raised_date
     orders = query.order_by(order_col.desc() if resolved else order_col.asc()).all()
-    if current_user.role in ("admin", "super_admin"):
+    if current_user.role in ("admin", "manager", "super_admin"):
         _attach_team_leads(db, orders, prefer="owner")
     _attach_team_files(db, orders)
     if resolved:
         return _resolved_query_rows(db, orders)
-    return orders
+    # one row per open reason: an order with two reasons shows twice, each with its own team and status
+    dets = _details_by_order(db, [o.id for o in orders])
+    items = []
+    for o in orders:
+        base = schemas.WorkOrderOut.model_validate(o)
+        det = dets.get(o.id)
+        dd = (det.data or {}) if det else {}
+        if not dd.get("_pdone"):
+            items.append(base)
+        for ex in dd.get("_queue") or []:
+            items.append(_extra_view(base, o, ex, det))
+    return items
 
 
 def _resolved_query_rows(db: Session, orders) -> list:
@@ -3125,15 +7709,21 @@ def update_team_lead_fields(
         raise HTTPException(status_code=404, detail="Order not found")
     _require_process_access(current_user, order.process_id)
     reasons = _order_lock_reasons(order) if _audit_applies(current_user) else []
-    before = _order_snapshot(order) if reasons else None
+    before = _order_snapshot(order)
     for field, value in payload.dict(exclude_unset=True).items():
         setattr(order, field, value)
     order.last_edited_by = current_user.username
     if reasons:
         _log_order_change(db, current_user, order, "edit", reasons, before)
+    _d = _order_diff_text(before, order)
+    if _d:
+        _audit_order(db, current_user, "Edited order", order, _d)
     db.commit()
     db.refresh(order)
     return order
+
+
+EDM_ALREADY_POSTED_NOTE = "Already posted under BAR BATCH"
 
 
 @app.patch("/orders/{order_id}/colleague", response_model=schemas.WorkOrderOut)
@@ -3218,15 +7808,26 @@ def update_colleague_fields(
     #     comment can be entered at all)
     bar_text = str(final_bar_batch or "").strip()
     problems = []
+    # EDM: Amount > 0, Manual Posted $ = 0, a 7-digit BAR Batch, Trans Count > 0 and Completed means the money was already
+    # posted under that BAR Batch. It saves, with Poster Comment defaulting to EDM_ALREADY_POSTED_NOTE.
+    edm_already = bool(
+        ((order.process.name if order.process else "") or "").strip().upper() == "EDM"
+        and order.amount is not None and float(order.amount) > 0 and abs(float(final_posted_amount)) < 0.005
+        and bar_text.isdigit() and len(bar_text) == 7 and int(bar_text) > 0
+        and final_trans_count and final_trans_count > 0 and final_status == "Completed")
+    if edm_already and not str(payload_data.get("poster_comment", order.poster_comment) or "").strip():
+        payload_data["poster_comment"] = EDM_ALREADY_POSTED_NOTE
     if not ecom_order:
         if abs(float(final_posted_amount)) < 0.005:
-            if bar_text not in ("0", "00", "0000000"):
+            # CB Unmatched Posting: with Posted $ 0 the BAR Batch may also be a real 7-digit batch number
+            unmatched_ok = "UNMATCHED" in str(getattr(order.process, "name", "") or "").upper() and bar_text.isdigit() and len(bar_text) == 7
+            if bar_text not in ("0", "00", "0000000") and not unmatched_ok and not edm_already:
                 problems.append("BAR Batch must be 0 when Posted $ is 0")
         else:
             if not (bar_text.isdigit() and len(bar_text) == 7 and int(bar_text) > 0):
                 problems.append("BAR Batch must be a 7-digit number when Posted $ is not 0")
         bar_positive = bar_text.isdigit() and int(bar_text) > 0
-        if bar_positive and not (final_trans_count and final_trans_count > 0):
+        if bar_positive and not (final_trans_count and final_trans_count > 0) and "UNMATCHED" not in str(getattr(order.process, "name", "") or "").upper():   # CB Unmatched Posting: Trans Count 0 is fine
             problems.append("Trans Count must be greater than 0 when BAR Batch is greater than 0")
     final_835 = payload_data.get("posted_835_amount", order.posted_835_amount)
     if final_835 is not None and float(final_835) < 0:
@@ -3241,9 +7842,10 @@ def update_colleague_fields(
     if pending_base is not None and final_status in ("Completed", "Clarification"):
         pending_now = pending_base - float(final_posted_amount) - float(final_835 or 0)
         final_comment = payload_data.get("poster_comment", order.poster_comment)
-        if abs(pending_now) >= 0.005 and not (final_comment or "").strip():
+        comment_optional = "UNMATCHED" in str(getattr(order.process, "name", "") or "").upper()   # CB Unmatched Posting: comment not mandatory
+        if abs(pending_now) >= 0.005 and not (final_comment or "").strip() and not comment_optional and not edm_already:
             problems.append("Poster Comment is required when Pending $ is not 0")
-        if abs(pending_now) >= 0.005 and final_status == "Completed" and ((order.process.name if order.process else "") or "").strip().upper() == "EDM":
+        if abs(pending_now) >= 0.005 and final_status == "Completed" and not edm_already and ((order.process.name if order.process else "") or "").strip().upper() == "EDM":
             problems.append("Posting Status can't be Completed while Pending $ is not 0")
     if problems:
         raise HTTPException(status_code=400, detail="Cannot save \u2014 " + "; ".join(problems))
@@ -3365,6 +7967,9 @@ def update_colleague_fields(
         manual_values = {k: detail.data.get(k) for k in manual_keys}
         merged = _compute_escalation_auto_fields(category, order, current_user)
         merged.update(manual_values)
+        q_now = _refresh_queue((detail.data or {}).get("_queue"), order, current_user)
+        if q_now:
+            merged["_queue"] = q_now
         detail.data = merged
         detail.posted_by_name = current_user.full_name
         detail.updated_at = datetime.now(IST)
@@ -3428,7 +8033,7 @@ def list_order_changes(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     process_id: Optional[int] = None,
-    current_user: models.User = Depends(auth.require_role("admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -3456,7 +8061,7 @@ def list_order_changes(
 def _require_view_access(user: models.User, process_id: int):
     """Viewing a process's queues: Admin and Quality may view every process
     (read-only); everyone else needs the process assigned to them."""
-    if user.role not in ("admin", "quality"):
+    if user.role not in ("admin", "manager", "quality"):
         _require_process_access(user, process_id)
 
 
@@ -3539,11 +8144,11 @@ def _orders_dash_scope(db: Session, user: models.User, process_id: Optional[int]
         Team Lead via team_lead_id
       * Team Lead -> only the processes they have access to
     """
-    all_access = user.role in ("admin", "super_admin")
+    all_access = user.role in ("admin", "manager", "super_admin")
     if process_id is not None and not all_access:
         _require_process_access(user, process_id)
     cond = _team_orders_condition(db, user, include_unowned=True)   # None for admin / super_admin
-    tl_cond = _tl_condition(db, team_lead_id) if (team_lead_id is not None and user.role in ("admin", "super_admin")) else None
+    tl_cond = _tl_condition(db, team_lead_id) if (team_lead_id is not None and user.role in ("admin", "manager", "super_admin")) else None
     my_process_ids = [p.id for p in user.processes]
 
     def scoped(q):
@@ -3573,7 +8178,7 @@ def orders_dashboard(
     end_date: Optional[date] = None,
     process_id: Optional[int] = None,
     team_lead_id: Optional[int] = None,
-    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -3632,7 +8237,7 @@ def orders_dashboard_by_team_lead(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     process_id: Optional[int] = None,
-    current_user: models.User = Depends(auth.require_role("admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -3693,7 +8298,7 @@ def orders_dashboard_details(
     end_date: Optional[date] = None,
     process_id: Optional[int] = None,
     team_lead_id: Optional[int] = None,
-    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -3818,7 +8423,7 @@ def _eligible_team_lead(db: Session, team_lead_id: int) -> models.User:
 
 @app.get("/clients", response_model=schemas.ClientListResponse)
 def list_clients(
-    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """Everything the Clients screens need in one call: clients (with their
@@ -3843,6 +8448,7 @@ def create_client(
 ):
     client = models.Client(**_clean_client_fields(db, payload, None))
     db.add(client)
+    _audit(db, current_user, "Client", "Added client", None, None, f"{client.facility_no} - {client.client_name} ({client.status})")
     db.commit()
     db.refresh(client)
     return _client_payload(db, [client])[0]
@@ -3902,6 +8508,8 @@ def bulk_assign_clients(
                 else:
                     db.add(models.ClientProcessTeamLead(client_id=c.id, process_id=pid, team_lead_id=payload.team_lead_id))
                 updated += 1
+    _tl_label = db.query(models.User.full_name).filter(models.User.id == payload.team_lead_id).scalar() if payload.team_lead_id else "no Team Lead"
+    _audit(db, current_user, "Client", "Bulk changed client Team Lead", None, None, f"{len(clients)} client(s), {len(target_ids)} process(es) -> {_tl_label}; e.g. " + ", ".join(c.facility_no for c in clients[:6]))
     db.commit()
     return {"updated": updated, "skipped_processes": skipped}
 
@@ -3918,8 +8526,12 @@ def update_client(
     client = db.query(models.Client).filter(models.Client.id == client_id).first()
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
+    _was = {"facility_no": client.facility_no, "client_name": client.client_name, "status": client.status, "inactive_date": client.inactive_date}
     for k, v in _clean_client_fields(db, payload, client_id).items():
         setattr(client, k, v)
+    _ch = [f"{k}: {_was[k]} -> {getattr(client, k)}" for k in _was if _was[k] != getattr(client, k)]
+    if _ch:
+        _audit(db, current_user, "Client", "Edited client", None, None, f"{_was['facility_no']} - {_was['client_name']}: " + "; ".join(_ch))
     db.commit()
     db.refresh(client)
     return _client_payload(db, [client])[0]
@@ -3937,6 +8549,12 @@ def save_client_assignments(
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
     known = {p.id for p in db.query(models.Process).all()}
+    _tlnames = {u.id: u.full_name for u in db.query(models.User).filter(models.User.role == "team_lead").all()}
+    _pnames = {p.id: p.name for p in db.query(models.Process).all()}
+    _old = {r.process_id: r.team_lead_id for r in db.query(models.ClientProcessTeamLead).filter_by(client_id=client_id).all()}
+    _chg = [f"{_pnames.get(pid, pid)}: {_tlnames.get(_old.get(pid), 'none')} -> {_tlnames.get(tl_id, 'none')}" for pid, tl_id in payload.assignments.items() if _old.get(pid) != tl_id]
+    if _chg:
+        _audit(db, current_user, "Client", "Changed client Team Lead", None, None, f"{client.facility_no} - {client.client_name}: " + "; ".join(_chg))
     for pid, tl_id in payload.assignments.items():
         if pid not in known:
             raise HTTPException(status_code=400, detail="Unknown process")
@@ -4003,7 +8621,7 @@ def _batch_aggregate(group: list) -> dict:
 
 def _batch_base_rows(db: Session, current_user: models.User, start_date, end_date, process_id, user_id) -> list:
     """One row per colleague / process / date with completed work (before any Overall rows)."""
-    if process_id is not None and current_user.role != "admin":
+    if process_id is not None and current_user.role not in ("admin", "manager"):
         _require_process_access(current_user, process_id)   # Admin / Super Admin see every process
 
     colleagues = {u.id: u for u in _batch_visible_colleagues(db, current_user)}
@@ -4100,7 +8718,7 @@ def batch_dashboard(
     end_date: Optional[date] = None,
     process_id: Optional[int] = None,
     user_id: Optional[int] = None,
-    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -4152,7 +8770,7 @@ def batch_dashboard_by_team_lead(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     process_id: Optional[int] = None,
-    current_user: models.User = Depends(auth.require_role("admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -4183,7 +8801,7 @@ def batch_dashboard_by_team_lead(
 @app.put("/batch-dashboard", response_model=schemas.BatchDashboardRow)
 def save_batch_stat(
     payload: schemas.BatchStatUpdate,
-    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -4199,7 +8817,7 @@ def save_batch_stat(
     sent = set(data.keys()) & (colleague_fields | lead_fields)
     if not sent:
         raise HTTPException(status_code=400, detail="Nothing to save")
-    is_override = current_user.role in ("admin", "super_admin")   # may edit saved rows and every field
+    is_override = current_user.role in ("admin", "manager", "super_admin")   # may edit saved rows and every field
 
     if current_user.role == "colleague":
         if sent & lead_fields:
@@ -4337,7 +8955,7 @@ def _hours_approval_rows(db: Session, current_user: models.User, status: str):
 @app.get("/batch-dashboard/hours-approvals", response_model=List[schemas.HoursApprovalOut])
 def list_hours_approvals(
     status: str = "Pending",
-    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """Hours entries over 8 hours/day waiting (or decided). Team Lead: their team; Admin / Super Admin: everyone."""
@@ -4505,7 +9123,7 @@ def correct_completed_order(
         )
 
     reasons = _order_lock_reasons(order) if _audit_applies(current_user) else []   # state BEFORE the fix
-    before = _order_snapshot(order) if reasons else None
+    before = _order_snapshot(order)
 
     for field, value in payload_data.items():
         setattr(order, field, value)
@@ -4520,6 +9138,9 @@ def correct_completed_order(
 
     if reasons:
         _log_order_change(db, current_user, order, "correction", reasons, before)
+    _d = _order_diff_text(before, order)
+    if _d:
+        _audit_order(db, current_user, "Corrected order", order, _d)
     db.commit()
     db.refresh(order)
     return order
@@ -4529,7 +9150,7 @@ def correct_completed_order(
 def production_edit(
     order_id: int,
     payload: schemas.ProductionEdit,
-    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -4545,7 +9166,7 @@ def production_edit(
     order = q.first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    if current_user.role != "admin":
+    if current_user.role not in ("admin", "manager"):
         _require_process_access(current_user, order.process_id)
     if not order.submitted:
         raise HTTPException(status_code=400, detail="Only rows already submitted to Production can be edited here")
@@ -4564,6 +9185,9 @@ def production_edit(
         order.tat_days = _count_business_days_ex_holidays(_tat_start(order), order.posted_date) - _pause_business_days(db, order)
 
     _log_order_change(db, current_user, order, "production_edit", reasons, before)
+    _d = _order_diff_text(before, order)
+    if _d:
+        _audit_order(db, current_user, "Edited order in Production", order, _d)
     db.commit()
     db.refresh(order)
     return order
@@ -4574,6 +9198,7 @@ def resolve_escalation(
     order_id: int,
     ventra_comment: str = Form(""),
     files: List[UploadFile] = File(default=[]),
+    track: str = "",
     current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
     db: Session = Depends(get_db),
 ):
@@ -4589,15 +9214,16 @@ def resolve_escalation(
     _require_process_access(current_user, order.process_id)
     if not order.escalated:
         raise HTTPException(status_code=400, detail="This order isn't currently escalated")
+    tr = _track_for(db, order, track)
     blobs = _read_onshore_files(files)
 
-    if order.onshore_status in ("with_onshore", "yellow", "blue", "orange"):
+    if tr.get("onshore_status") in ("with_onshore", "yellow", "blue", "orange"):
         raise HTTPException(status_code=400, detail="This escalation is with another team \u2014 it can be resolved once they respond (red)")
-    if order.onshore_status == "red":
-        # The Onshore team's answer becomes the VENTRA Comment, and their circle turns green.
-        comment = (order.onshore_comment or "").strip()
-        order.onshore_status = "green"
-        res_msg = _add_onshore_message(db, current_user, order, "resolved", comment)
+    if tr.get("onshore_status") == "red":
+        # The team's answer becomes the VENTRA Comment, and their circle turns green.
+        comment = (tr.get("onshore_comment") or "").strip()
+        tr.set("onshore_status", "green")
+        res_msg = _add_onshore_message(db, current_user, order, "resolved", comment, tr.msg_track)
     else:
         comment = (ventra_comment or "").strip()
         res_msg = None
@@ -4605,9 +9231,35 @@ def resolve_escalation(
         raise HTTPException(status_code=400, detail="VENTRA Comment can't be empty")
     if blobs:
         if res_msg is None:
-            res_msg = _add_onshore_message(db, current_user, order, "resolved", comment)
+            res_msg = _add_onshore_message(db, current_user, order, "resolved", comment, tr.msg_track)
         _save_onshore_files(db, current_user, order, res_msg, blobs)
 
+    # An escalation with several reasons runs one hand-off per reason, in parallel. Each is resolved on its own;
+    # the escalation closes (and the order unlocks) only after the last one is resolved.
+    det = tr.det
+    done = []
+    if det and order.escalation_category in ESCALATION_CATEGORY_FIELDS:
+        dd = dict(det.data or {})
+        done = list(dd.get("_done") or [])
+        entry = {"category": tr.category, "comment": comment, "by": current_user.full_name, "at": _work_today().isoformat()}
+        if not tr.primary:
+            entry.update(tr.item)                       # keep the reason's details and its team's history for the Completed tab
+            entry["onshore_status"] = "green" if entry.get("onshore_team") else None
+        done.append(entry)
+        if tr.primary:
+            dd["_pdone"] = True
+        else:
+            dd["_queue"] = [x for x in (dd.get("_queue") or []) if x.get("category") != tr.category]
+        dd["_done"] = done
+        det.data = dd
+        flag_modified(det, "data")
+        if dd.get("_queue") or (not dd.get("_pdone")):
+            order.last_edited_by = current_user.username
+            db.commit()
+            db.refresh(order)
+            return order
+        if len(done) > 1:
+            comment = " | ".join(f"{d['category']}: {d['comment']}" for d in done)
     order.ventra_comment = comment
     order.issue_closed_date = _work_today()
     _close_escalation_event(db, order, current_user, comment)
@@ -4634,10 +9286,10 @@ def resolve_escalation(
 ONSHORE_CATEGORIES = tuple(TEAM_FOR_CATEGORY.keys())
 
 
-def _add_onshore_message(db: Session, user: models.User, order: models.WorkOrder, kind: str, text: Optional[str]):
+def _add_onshore_message(db: Session, user: models.User, order: models.WorkOrder, kind: str, text: Optional[str], track: Optional[str] = None):
     msg = models.OnshoreMessage(
         order_id=order.id, created_at=datetime.now(IST).replace(tzinfo=None),
-        author_id=user.id, author_name=user.full_name, author_role=user.role, kind=kind, text=text,
+        author_id=user.id, author_name=user.full_name, author_role=user.role, kind=kind, text=text, track=track or None,
     )
     db.add(msg)
     db.flush()
@@ -4667,6 +9319,106 @@ def _save_onshore_files(db: Session, user: models.User, order: models.WorkOrder,
         ))
 
 
+_TRACK_STATE = ("onshore_status", "onshore_team", "onshore_comment", "onshore_tl_reply", "onshore_sent_at")
+
+
+class _Track:
+    """
+    One reason of an escalation. The main reason keeps its hand-off state on the order itself; every extra reason
+    (EOB not found AND Invoice Creation, say) keeps its own state inside EscalationDetail.data["_queue"], so each can
+    sit with a different team at the same time.
+    """
+    def __init__(self, order: models.WorkOrder, det, category: str = ""):
+        self.order, self.det, self.category = order, det, (category or "")
+        self.primary = (not self.category) or self.category == order.escalation_category
+        self.item = None
+        if self.primary:
+            self.category = order.escalation_category or ""
+            if det and (det.data or {}).get("_pdone"):
+                raise HTTPException(status_code=400, detail=f"{self.category} has already been resolved on this order")
+        else:
+            q = (det.data or {}).get("_queue") if det else None
+            self.item = next((x for x in (q or []) if x.get("category") == self.category), None)
+            if self.item is None:
+                raise HTTPException(status_code=404, detail="That escalation reason isn't open on this order")
+
+    def get(self, name):
+        if self.primary:
+            return getattr(self.order, name)
+        v = self.item.get(name)
+        if name == "onshore_sent_at" and isinstance(v, str):
+            try:
+                return datetime.fromisoformat(v)
+            except ValueError:
+                return None
+        return v
+
+    def set(self, name, value):
+        if self.primary:
+            setattr(self.order, name, value)
+        else:
+            self.item[name] = value.isoformat() if isinstance(value, datetime) else value
+            flag_modified(self.det, "data")
+
+    @property
+    def msg_track(self):
+        return None if self.primary else self.category
+
+
+def _track_for(db: Session, order: models.WorkOrder, track: str = "") -> _Track:
+    det = db.query(models.EscalationDetail).filter(models.EscalationDetail.order_id == order.id).first()
+    return _Track(order, det, track)
+
+
+def _extra_view(item, order: models.WorkOrder, ex: dict, det):
+    """A copy of an order's row showing one extra reason: its own category, details and hand-off state."""
+    v = item.model_copy(deep=True)
+    v.track = ex.get("category")
+    v.escalation_category = ex.get("category")
+    v.escalation_detail = schemas.EscalationDetailOut(order_id=order.id, category=ex.get("category") or "", data=dict(ex.get("data") or {}), updated_at=det.updated_at)
+    v.onshore_status, v.onshore_team = ex.get("onshore_status"), ex.get("onshore_team")
+    v.onshore_comment, v.onshore_tl_reply = ex.get("onshore_comment"), ex.get("onshore_tl_reply")
+    sent = ex.get("onshore_sent_at")
+    try:
+        v.onshore_sent_at = datetime.fromisoformat(sent) if isinstance(sent, str) else sent
+    except ValueError:
+        v.onshore_sent_at = None
+    return v
+
+
+def _details_by_order(db: Session, ids) -> dict:
+    out = {}
+    ids = list(ids)
+    for i in range(0, len(ids), 800):
+        for d in db.query(models.EscalationDetail).filter(models.EscalationDetail.order_id.in_(ids[i:i + 800])).all():
+            out[d.order_id] = d
+    return out
+
+
+def _q_match(tab: str, my_team, st, team) -> bool:
+    """Same rules as the team queue's SQL filters, for the extra reasons that live inside the details JSON."""
+    if not st:
+        return False
+    if tab == "pending":
+        if my_team == "calling":
+            return team == "calling" and st in ("with_onshore", "blue", "orange")
+        if my_team:
+            return team == my_team and st == "with_onshore"
+        return st in ("with_onshore", "blue", "orange")
+    if st not in (("red", "yellow", "blue", "orange", "with_onshore") if tab == "awaiting" else ("green",)):
+        return False
+    if my_team == "recon":
+        if team not in ("recon", "calling"):
+            return False
+    elif my_team and team != my_team:
+        return False
+    if tab == "awaiting" and my_team:
+        return (st in ("red", "yellow") or team == "calling") if my_team == "recon" else st in ("red", "yellow")
+    if tab == "awaiting":
+        return st in ("red", "yellow", "blue", "orange")
+    return True
+
+
 def _lead_escalation_order(db: Session, user: models.User, order_id: int) -> models.WorkOrder:
     """The escalated order a Team Lead (or Super Admin) is acting on — their own team's only."""
     order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
@@ -4685,6 +9437,7 @@ def send_to_onshore(
     order_id: int,
     note: str = Form(""),
     files: List[UploadFile] = File(default=[]),
+    track: str = "",
     current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
     db: Session = Depends(get_db),
 ):
@@ -4693,18 +9446,19 @@ def send_to_onshore(
     Recon for EOB not found; Onshore for Patient not found, Invoice Creation and Clarification.
     """
     order = _lead_escalation_order(db, current_user, order_id)
-    team = TEAM_FOR_CATEGORY.get(order.escalation_category)
+    tr = _track_for(db, order, track)
+    team = TEAM_FOR_CATEGORY.get(tr.category)
     if not team:
         raise HTTPException(status_code=400, detail="Only EOB not found (Recon) and Patient not found, Invoice Creation, Clarification (Onshore) can be sent to another team")
-    if order.onshore_status is not None:
+    if tr.get("onshore_status") is not None:
         raise HTTPException(status_code=400, detail="This escalation has already been sent to another team")
     blobs = _read_onshore_files(files)
-    order.onshore_status = "with_onshore"
-    order.onshore_team = team
-    order.onshore_sent_at = datetime.now(IST).replace(tzinfo=None)
-    order.onshore_comment = None
-    order.onshore_tl_reply = None
-    msg = _add_onshore_message(db, current_user, order, "sent", (note or "").strip() or None)
+    tr.set("onshore_status", "with_onshore")
+    tr.set("onshore_team", team)
+    tr.set("onshore_sent_at", datetime.now(IST).replace(tzinfo=None))
+    tr.set("onshore_comment", None)
+    tr.set("onshore_tl_reply", None)
+    msg = _add_onshore_message(db, current_user, order, "sent", (note or "").strip() or None, tr.msg_track)
     _save_onshore_files(db, current_user, order, msg, blobs)
     db.commit()
     db.refresh(order)
@@ -4716,20 +9470,22 @@ def onshore_info(
     order_id: int,
     text: str = Form(""),
     files: List[UploadFile] = File(default=[]),
+    track: str = "",
     current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
     db: Session = Depends(get_db),
 ):
     """The team asked for more information (yellow): the Team Lead answers and it returns to that team."""
     order = _lead_escalation_order(db, current_user, order_id)
-    if order.onshore_status != "yellow":
+    tr = _track_for(db, order, track)
+    if tr.get("onshore_status") != "yellow":
         raise HTTPException(status_code=400, detail="The team hasn't asked for information on this order")
     text_ = (text or "").strip()
     if not text_:
         raise HTTPException(status_code=400, detail="Enter the information that was asked for")
     blobs = _read_onshore_files(files)
-    order.onshore_tl_reply = text_
-    order.onshore_status = "with_onshore"
-    msg = _add_onshore_message(db, current_user, order, "tl_info", text_)
+    tr.set("onshore_tl_reply", text_)
+    tr.set("onshore_status", "with_onshore")
+    msg = _add_onshore_message(db, current_user, order, "tl_info", text_, tr.msg_track)
     _save_onshore_files(db, current_user, order, msg, blobs)
     db.commit()
     db.refresh(order)
@@ -4742,6 +9498,7 @@ def onshore_respond(
     comment: str = Form(""),
     status: str = Form(...),
     files: List[UploadFile] = File(default=[]),
+    track: str = "",
     current_user: models.User = Depends(auth.require_role("onshore", "recon", "calling")),
     db: Session = Depends(get_db),
 ):
@@ -4756,8 +9513,10 @@ def onshore_respond(
     order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    waiting = order.onshore_status == "with_onshore" or (order.onshore_status in ("blue", "orange") and order.onshore_team == "calling")
-    if not waiting or order.onshore_team != current_user.role:
+    tr = _track_for(db, order, track)
+    st_, team_ = tr.get("onshore_status"), tr.get("onshore_team")
+    waiting = st_ == "with_onshore" or (st_ in ("blue", "orange") and team_ == "calling")
+    if not waiting or team_ != current_user.role:
         raise HTTPException(status_code=400, detail="This order isn't waiting for your team's response")
     allowed = {"recon": ("red", "yellow", "blue"), "calling": ("red", "yellow", "orange")}.get(current_user.role, ("red", "yellow"))
     if status not in allowed:
@@ -4767,13 +9526,13 @@ def onshore_respond(
         raise HTTPException(status_code=400, detail="Enter a comment")
     blobs = _read_onshore_files(files)
 
-    order.onshore_comment = text_
+    tr.set("onshore_comment", text_)
     if status == "blue":
-        order.onshore_team = "calling"
-        order.onshore_status = "blue"
+        tr.set("onshore_team", "calling")
+        tr.set("onshore_status", "blue")
     else:
-        order.onshore_status = status
-    msg = _add_onshore_message(db, current_user, order, "team_" + status, text_)
+        tr.set("onshore_status", status)
+    msg = _add_onshore_message(db, current_user, order, "team_" + status, text_, tr.msg_track)
     _save_onshore_files(db, current_user, order, msg, blobs)
     db.commit()
     db.refresh(order)
@@ -4783,7 +9542,8 @@ def onshore_respond(
 @app.get("/orders/{order_id}/onshore-history", response_model=List[schemas.OnshoreMessageOut])
 def onshore_history(
     order_id: int,
-    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "super_admin", "onshore", "recon", "calling")),
+    track: str = "",
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "manager", "super_admin", "onshore", "recon", "calling")),
     db: Session = Depends(get_db),
 ):
     """The hand-off history (messages + attachments) of one escalation, for the Team Lead, Admin / Super Admin and the teams."""
@@ -4794,7 +9554,12 @@ def onshore_history(
         raise HTTPException(status_code=403, detail="This order belongs to another Team Lead")
     if current_user.role == "colleague" and order.assigned_to_id != current_user.id:
         raise HTTPException(status_code=403, detail="This order is assigned to another colleague")
-    msgs = db.query(models.OnshoreMessage).filter(models.OnshoreMessage.order_id == order_id).order_by(models.OnshoreMessage.id.asc()).all()
+    mq = db.query(models.OnshoreMessage).filter(models.OnshoreMessage.order_id == order_id)
+    if track and track != order.escalation_category:
+        mq = mq.filter(models.OnshoreMessage.track == track)
+    else:
+        mq = mq.filter(models.OnshoreMessage.track.is_(None))
+    msgs = mq.order_by(models.OnshoreMessage.id.asc()).all()
     atts = {}
     for a in db.query(models.OnshoreAttachment).filter(models.OnshoreAttachment.order_id == order_id).all():
         atts.setdefault(a.message_id, []).append(a)
@@ -4809,7 +9574,7 @@ def onshore_history(
 @app.get("/onshore/attachments/{attachment_id}")
 def get_onshore_attachment(
     attachment_id: int,
-    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "super_admin", "onshore", "recon", "calling")),
+    current_user: models.User = Depends(auth.require_role("colleague", "team_lead", "admin", "manager", "super_admin", "onshore", "recon", "calling")),
     db: Session = Depends(get_db),
 ):
     """Serves an attachment from the hand-off history to the Team Lead, the teams and Admin / Super Admin."""
@@ -4836,7 +9601,7 @@ def onshore_queue(
     tab: str = "pending",
     team: Optional[str] = None,
     process_id: Optional[int] = None,
-    current_user: models.User = Depends(auth.require_role("onshore", "recon", "calling", "super_admin", "admin")),
+    current_user: models.User = Depends(auth.require_role("onshore", "recon", "calling", "super_admin", "admin", "manager")),
     db: Session = Depends(get_db),
 ):
     """
@@ -4879,6 +9644,18 @@ def onshore_queue(
         elif tab == "awaiting":
             q = q.filter(models.WorkOrder.onshore_status.in_(("red", "yellow", "blue", "orange")))
     orders = q.order_by(models.WorkOrder.onshore_sent_at.asc(), models.WorkOrder.id.asc()).all()
+    primary_ids = {o.id for o in orders}
+    # Extra reasons of a multi-reason escalation keep their hand-off state inside the details JSON.
+    xq = db.query(models.WorkOrder).options(
+        selectinload(models.WorkOrder.clarification_detail), selectinload(models.WorkOrder.escalation_detail)
+    ).filter(models.WorkOrder.id.in_(db.query(models.EscalationDetail.order_id).filter(
+        cast(models.EscalationDetail.data, String).like('%"onshore_status"%'))))
+    if process_id is not None:
+        xq = xq.filter(models.WorkOrder.process_id == process_id)
+    for xo in xq.all():
+        if xo.id not in primary_ids:
+            orders.append(xo)
+    dets = _details_by_order(db, [o.id for o in orders])
     _attach_team_leads(db, orders, prefer="owner")
     names = {p.id: p.name for p in db.query(models.Process).all()}
     ids = [o.id for o in orders]
@@ -4888,17 +9665,30 @@ def onshore_queue(
             atts.setdefault(a.message_id, []).append(a)
         for m in db.query(models.OnshoreMessage).filter(models.OnshoreMessage.order_id.in_(ids)).order_by(models.OnshoreMessage.id.asc()).all():
             msgs.setdefault(m.order_id, []).append(m)
-    out = []
-    for o in orders:
-        item = schemas.OnshoreItemOut.model_validate(o)
+
+    def fill(item, o, track):
         item.team_lead_name = getattr(o, "team_lead_name", None)
         item.process_name = names.get(o.process_id)
         item.messages = []
         for m in msgs.get(o.id, []):
+            if (m.track or None) != (track or None):
+                continue
             mo = schemas.OnshoreMessageOut.model_validate(m)
             mo.attachments = [schemas.OnshoreAttachmentOut.model_validate(a) for a in atts.get(m.id, [])]
             item.messages.append(mo)
-        out.append(item)
+        return item
+
+    out = []
+    for o in orders:
+        base = schemas.OnshoreItemOut.model_validate(o)
+        if o.id in primary_ids:
+            out.append(fill(base.model_copy(deep=True), o, None))
+        det = dets.get(o.id)
+        dd = (det.data or {}) if det else {}
+        for ex in list(dd.get("_queue") or []) + [x for x in (dd.get("_done") or []) if x.get("data")]:
+            if _q_match(tab, my_team, ex.get("onshore_status"), ex.get("onshore_team")):
+                out.append(fill(_extra_view(base, o, ex, det), o, ex.get("category")))
+    out.sort(key=lambda it: (str(it.onshore_sent_at or ""), it.id))
     return out
 
 
@@ -5078,6 +9868,44 @@ def _compute_escalation_auto_fields(category: str, order: models.WorkOrder, curr
     return result
 
 
+def _build_esc_fields(category: str, data: dict, order: models.WorkOrder, user: models.User) -> dict:
+    """Auto fields recomputed from the order; only the category's manual fields come from `data`."""
+    fields = ESCALATION_CATEGORY_FIELDS[category]
+    merged = _compute_escalation_auto_fields(category, order, user)
+    manual_kinds = ("manual", "manual_date", "manual_currency", "manual_select")
+    manual_keys = {key for key, _label, kind in fields if kind in manual_kinds}
+    for key in manual_keys:
+        if key in (data or {}):
+            merged[key] = data[key]
+    if "amount" in manual_keys and merged.get("amount") in (None, "") and order.amount is not None:
+        merged["amount"] = str(order.amount)      # Amount defaults to the order's own Amount
+    if "utility_category" in manual_keys and merged.get("utility_category"):
+        if merged["utility_category"] not in UTILITY_CATEGORY_OPTIONS:
+            raise HTTPException(status_code=400, detail=f"utility_category must be one of {UTILITY_CATEGORY_OPTIONS}")
+    return merged
+
+
+def _refresh_queue(queue, order: models.WorkOrder, user: models.User) -> list:
+    """Waiting reasons keep what the colleague typed; their auto fields are re-derived from the order as it is now."""
+    out = []
+    for q in (queue or []):
+        c = q.get("category")
+        if c in ESCALATION_CATEGORY_FIELDS:
+            item = {k: v for k, v in q.items() if k not in ("category", "data")}      # keep the reason's own hand-off state
+            item.update({"category": c, "data": _build_esc_fields(c, q.get("data") or {}, order, user)})
+            out.append(item)
+    return out
+
+
+def _event_cats(e) -> list:
+    """Every reason an escalation carried (an escalation can have several, e.g. EOB not found + Invoice Creation)."""
+    try:
+        allc = json.loads(e.detail_json or "{}").get("_all")
+    except (ValueError, AttributeError):
+        allc = None
+    return list(allc) if allc else [e.category or "(none)"]
+
+
 @app.get("/orders/{order_id}/escalation-detail", response_model=Optional[schemas.EscalationDetailOut])
 def get_escalation_detail(
     order_id: int,
@@ -5121,19 +9949,20 @@ def save_escalation_detail(
     if not fields:
         raise HTTPException(status_code=400, detail=f"No detail form defined for escalation category '{category}'")
 
-    merged = _compute_escalation_auto_fields(category, order, current_user)
-    manual_kinds = ("manual", "manual_date", "manual_currency", "manual_select")
-    manual_keys = {key for key, _label, kind in fields if kind in manual_kinds}
-    for key in manual_keys:
-        if key in payload.data:
-            merged[key] = payload.data[key]
-
-    if "amount" in manual_keys and merged.get("amount") in (None, "") and order.amount is not None:
-        merged["amount"] = str(order.amount)      # Amount defaults to the order's own Amount
-
-    if "utility_category" in manual_keys and merged.get("utility_category"):
-        if merged["utility_category"] not in UTILITY_CATEGORY_OPTIONS:
-            raise HTTPException(status_code=400, detail=f"utility_category must be one of {UTILITY_CATEGORY_OPTIONS}")
+    merged = _build_esc_fields(category, payload.data, order, current_user)
+    # One escalation can carry more than one reason (e.g. EOB not found AND Invoice Creation). The first is worked now;
+    # the others wait in _queue and come up one by one as each is resolved. The escalation closes only after the last.
+    queue, seen = [], {category}
+    for ex in (payload.extras or []):
+        c2 = str((ex or {}).get("category") or "")
+        if not c2 or c2 in seen:
+            continue
+        if c2 not in ESCALATION_CATEGORY_FIELDS:
+            raise HTTPException(status_code=400, detail=f"'{c2}' can't be added as an extra reason")
+        seen.add(c2)
+        queue.append({"category": c2, "data": _build_esc_fields(c2, (ex or {}).get("data") or {}, order, current_user)})
+    if queue:
+        merged["_queue"] = queue
 
     detail = db.query(models.EscalationDetail).filter(models.EscalationDetail.order_id == order_id).first()
     if not detail:
@@ -5152,6 +9981,9 @@ def save_escalation_detail(
 def _open_escalation_event(db: Session, order: models.WorkOrder, user: models.User, snapshot: dict) -> None:
     """A colleague raises a (new) query: log it with its own Issue Raised Date and reset the team hand-off."""
     today = _work_today()
+    qc = [q.get("category") for q in (snapshot.get("_queue") or []) if q.get("category")]
+    if qc:
+        snapshot = dict(snapshot); snapshot["_all"] = [order.escalation_category] + qc
     db.add(models.EscalationEvent(
         order_id=order.id, process_id=order.process_id, team_lead_id=order.team_lead_id,
         category=order.escalation_category, raised_date=today, poster_comment=order.poster_comment,
