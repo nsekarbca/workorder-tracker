@@ -9268,7 +9268,7 @@ function renderGrid(orders, onlyId) {
       if (c.k === "posting_status" && editable) {
         html += `<td><select class="cell-edit ${_statusCls(rawVal)}" data-id="${o.id}" data-field="posting_status" onchange="updateDraft(this)">`;
         const _lp = (isEdmProcess() && role === "colleague") ? livePending(o, drafts[o.id]) : null;
-        const _noComplete = _lp !== null && Math.abs(_lp) >= 0.005 && effectiveValue(o, "posted_amount") !== null && effectiveValue(o, "posted_amount") !== undefined && effectiveValue(o, "posted_amount") !== "";
+        const _noComplete = _lp !== null && Math.abs(_lp) >= 0.005 && effectiveValue(o, "posted_amount") !== null && effectiveValue(o, "posted_amount") !== undefined && effectiveValue(o, "posted_amount") !== "" && !edmAlreadyCandidate(o, drafts[o.id]);
         POSTING_STATUS_OPTIONS.forEach(opt => {
           if (opt === "Completed" && _noComplete && rawVal !== "Completed") return;     // Pending $ left: can't be Completed
           html += `<option value="${opt}" ${opt === rawVal ? "selected" : ""}>${opt}</option>`;
@@ -9632,11 +9632,12 @@ async function openEscalationCategoryModal(orderId, category) {
   // and the escalation closes only after every one of them is resolved.
   const others = Object.keys(ESCALATION_CATEGORY_FIELDS).filter(c => c !== category);
   html += `<div style="grid-column:1/-1; border-top:1px solid #dde; margin-top:6px; padding-top:8px;"><b>Another reason on this same order?</b>
-    <div style="font-size:12px; color:#667; margin-bottom:4px;">Tick it and fill its details. They are handled one after another, and the order comes back to you only after all are resolved.</div>` +
+    <div style="font-size:12px; color:#667; margin-bottom:4px;">Tick it and fill its details, including its own Poster Comment. Each reason goes to its team separately, and the order comes back to you only after all are resolved. The Poster Comment in the order row belongs to ${_esc(category)}.</div>` +
     others.map((c, i) => `<label style="display:block; margin-top:4px;"><input type="checkbox" id="ecx-on-${i}" ${isLocked ? "disabled" : ""} onchange="document.getElementById('ecx-box-${i}').style.display = this.checked ? 'grid' : 'none'"> ${_esc(c)}</label>
       <div id="ecx-box-${i}" class="form-grid" style="display:none; margin:4px 0 6px 22px;">` +
-      ESCALATION_CATEGORY_FIELDS[c].filter(([, , kind]) => ["manual", "manual_date", "manual_currency", "manual_select"].includes(kind)).map(([key, label, kind]) => {
+      ESCALATION_CATEGORY_FIELDS[c].filter(([, , kind]) => ["manual", "manual_date", "manual_currency", "manual_select", "poster_comment"].includes(kind)).map(([key, label, kind]) => {
         const dis = isLocked ? "disabled" : "";
+        if (kind === "poster_comment") return `<label style="grid-column:1/-1;">${label} for ${_esc(c)} <textarea id="ecx-${i}-${key}" rows="2" style="width:100%;" placeholder="Poster Comment for this reason only" ${dis}></textarea></label>`;
         if (kind === "manual_date") return `<label>${label} <input type="date" id="ecx-${i}-${key}" ${dis}></label>`;
         if (kind === "manual_select") return `<label>${label} <select id="ecx-${i}-${key}" ${dis}><option value="">—</option>${UTILITY_CATEGORY_OPTIONS.map(o2 => `<option value="${o2}">${o2}</option>`).join("")}</select></label>`;
         if (kind === "manual_currency") return `<label>${label} <input id="ecx-${i}-${key}" inputmode="decimal" placeholder="$0.00" value="${(key === "amount" && order.amount != null) ? formatCurrency(order.amount) : ""}" ${dis}></label>`;
@@ -9712,13 +9713,17 @@ async function saveEscalationCategoryDetail() {
 const EDM_ALREADY_NOTE = "Already posted under BAR BATCH";
 const edmAutoNote = new Set();     // orders whose Poster Comment was filled in automatically with the note above
 // EDM: Amount > 0, Manual Posted $ = 0, 7-digit BAR Batch, Trans Count > 0 and Completed = already posted under that BAR Batch
-function edmAlreadyPosted(order, draft) {
+function edmAlreadyCandidate(order, draft) {      // Completed is offered once these hold (Trans Count may be 0)
   if (!isEdmProcess() || !order) return false;
   const g = f => (draft && draft[f] !== undefined) ? draft[f] : order[f];
   const posted = g("posted_amount"), bar = String(g("bar_batch") || "").trim(), trans = g("trans_count");
   if (posted === null || posted === undefined || posted === "") return false;
-  return Number(order.amount) > 0 && Math.abs(Number(parseCurrency(posted))) < 0.005 && /^\d{7}$/.test(bar) && Number(bar) > 0
-    && Number(trans) > 0 && g("posting_status") === "Completed";
+  if (trans === null || trans === undefined || trans === "" || isNaN(Number(trans))) return false;
+  return Number(order.amount) > 0 && Math.abs(Number(parseCurrency(posted))) < 0.005 && /^\d{7}$/.test(bar) && Number(bar) > 0;
+}
+function edmAlreadyPosted(order, draft) {
+  const g = f => (draft && draft[f] !== undefined) ? draft[f] : order[f];
+  return edmAlreadyCandidate(order, draft) && g("posting_status") === "Completed";
 }
 const m835Touched = new Set();     // orders whose 835 Posted $ the colleague typed themselves
 function updateDraft(input) {
@@ -9854,7 +9859,7 @@ async function saveRow(orderId, btn) {
   } else if (!/^\d{7}$/.test(barText) || Number(barText) <= 0) {
     problems.push("BAR Batch must be a 7-digit number when Posted $ is not 0");
   }
-  if (!ecom && !isUnmatchedPostingProcess() && /^\d+$/.test(barText) && Number(barText) > 0 && !(Number(finalTrans) > 0)) {
+  if (!ecom && !isUnmatchedPostingProcess() && !edmAlready && /^\d+$/.test(barText) && Number(barText) > 0 && !(Number(finalTrans) > 0)) {
     problems.push("Trans Count must be greater than 0 when BAR Batch is greater than 0");
   }
   const finalComment = draft.poster_comment !== undefined ? draft.poster_comment : order.poster_comment;
