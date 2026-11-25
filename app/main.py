@@ -7814,7 +7814,7 @@ def update_colleague_fields(
         ((order.process.name if order.process else "") or "").strip().upper() == "EDM"
         and order.amount is not None and float(order.amount) > 0 and abs(float(final_posted_amount)) < 0.005
         and bar_text.isdigit() and len(bar_text) == 7 and int(bar_text) > 0
-        and final_trans_count and final_trans_count > 0 and final_status == "Completed")
+        and final_trans_count is not None and final_status == "Completed")      # Trans Count may be 0 here
     if edm_already and not str(payload_data.get("poster_comment", order.poster_comment) or "").strip():
         payload_data["poster_comment"] = EDM_ALREADY_POSTED_NOTE
     if not ecom_order:
@@ -7827,7 +7827,7 @@ def update_colleague_fields(
             if not (bar_text.isdigit() and len(bar_text) == 7 and int(bar_text) > 0):
                 problems.append("BAR Batch must be a 7-digit number when Posted $ is not 0")
         bar_positive = bar_text.isdigit() and int(bar_text) > 0
-        if bar_positive and not (final_trans_count and final_trans_count > 0) and "UNMATCHED" not in str(getattr(order.process, "name", "") or "").upper():   # CB Unmatched Posting: Trans Count 0 is fine
+        if bar_positive and not (final_trans_count and final_trans_count > 0) and not edm_already and "UNMATCHED" not in str(getattr(order.process, "name", "") or "").upper():   # CB Unmatched Posting / EDM already posted: Trans Count 0 is fine
             problems.append("Trans Count must be greater than 0 when BAR Batch is greater than 0")
     final_835 = payload_data.get("posted_835_amount", order.posted_835_amount)
     if final_835 is not None and float(final_835) < 0:
@@ -9868,10 +9868,15 @@ def _compute_escalation_auto_fields(category: str, order: models.WorkOrder, curr
     return result
 
 
-def _build_esc_fields(category: str, data: dict, order: models.WorkOrder, user: models.User) -> dict:
-    """Auto fields recomputed from the order; only the category's manual fields come from `data`."""
+def _build_esc_fields(category: str, data: dict, order: models.WorkOrder, user: models.User, extra: bool = False) -> dict:
+    """Auto fields recomputed from the order; only the category's manual fields come from `data`.
+    For an extra reason of a multi-reason escalation the Poster Comment is its own, typed for that reason."""
     fields = ESCALATION_CATEGORY_FIELDS[category]
     merged = _compute_escalation_auto_fields(category, order, user)
+    if extra:
+        for key, _label, kind in fields:
+            if kind == "poster_comment":
+                merged[key] = str((data or {}).get(key) or "").strip() or None
     manual_kinds = ("manual", "manual_date", "manual_currency", "manual_select")
     manual_keys = {key for key, _label, kind in fields if kind in manual_kinds}
     for key in manual_keys:
@@ -9892,7 +9897,7 @@ def _refresh_queue(queue, order: models.WorkOrder, user: models.User) -> list:
         c = q.get("category")
         if c in ESCALATION_CATEGORY_FIELDS:
             item = {k: v for k, v in q.items() if k not in ("category", "data")}      # keep the reason's own hand-off state
-            item.update({"category": c, "data": _build_esc_fields(c, q.get("data") or {}, order, user)})
+            item.update({"category": c, "data": _build_esc_fields(c, q.get("data") or {}, order, user, extra=True)})
             out.append(item)
     return out
 
@@ -9960,7 +9965,7 @@ def save_escalation_detail(
         if c2 not in ESCALATION_CATEGORY_FIELDS:
             raise HTTPException(status_code=400, detail=f"'{c2}' can't be added as an extra reason")
         seen.add(c2)
-        queue.append({"category": c2, "data": _build_esc_fields(c2, (ex or {}).get("data") or {}, order, current_user)})
+        queue.append({"category": c2, "data": _build_esc_fields(c2, (ex or {}).get("data") or {}, order, current_user, extra=True)})
     if queue:
         merged["_queue"] = queue
 
