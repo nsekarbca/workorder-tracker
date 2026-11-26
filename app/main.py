@@ -6373,7 +6373,7 @@ def transfer_orders(
 @app.delete("/orders/all")
 def delete_all_orders(
     process_id: int,
-    current_user: models.User = Depends(auth.require_role("team_lead", "super_admin")),
+    current_user: models.User = Depends(auth.require_role("super_admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -6410,6 +6410,101 @@ def delete_all_orders(
     deleted_count = db.query(models.WorkOrder).filter(models.WorkOrder.process_id == process_id).delete(synchronize_session=False)
     db.commit()
     return {"deleted": deleted_count}
+
+
+_ORDER_EDIT_FIELDS = ("edm", "status", "created", "received_date", "deposit_date", "amount", "def_doc_type", "description", "division",
+                      "division_name", "run", "inits", "ecom_type", "eobs", "checks", "not_posted", "not_posted_amount", "offset_amount")
+
+
+def _edit_order_fields(order, data: dict, current_user, db: Session):
+    """Shared by the single edit and the bulk edit. Raises HTTPException(400/403)."""
+    if order.submitted:
+        raise HTTPException(status_code=403, detail="Submitted to Production - edit it from the Production screen")
+    data = {k: v for k, v in data.items() if k in _ORDER_EDIT_FIELDS}
+    if "edm" in data:
+        data["edm"] = (data["edm"] or "").strip()
+        if not data["edm"]:
+            raise HTTPException(status_code=400, detail="EDM / Batch cannot be empty")
+        if _norm_edm(data["edm"]) != _norm_edm(order.edm):
+            ecom = ((order.process.name if order.process else "") or "").strip().upper() == "ECOM"
+            run_v = data.get("run", order.run)
+            for o in db.query(models.WorkOrder).filter(models.WorkOrder.process_id == order.process_id, models.WorkOrder.id != order.id).all():
+                if _dup_key(o.edm, o.run, ecom) == _dup_key(data["edm"], run_v, ecom):
+                    raise HTTPException(status_code=400, detail=f"{data['edm']} already exists in this process")
+    if "created" in data and data["created"] is not None:
+        data["created"] = datetime.combine(data["created"], datetime.min.time())
+    before = _order_snapshot(order)
+    for k, v in data.items():
+        if isinstance(v, str):
+            v = v.strip() or None
+        setattr(order, k, v)
+    order.last_edited_by = current_user.username
+    _recalc_pending(order)
+    d = _order_diff_text(before, order)
+    if d:
+        _audit_order(db, current_user, "Edited order details", order, d)
+    return bool(d)
+
+
+@app.patch("/orders/{order_id}/edit", response_model=schemas.WorkOrderOut)
+def edit_order(
+    order_id: int,
+    payload: schemas.OrderEdit,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Correct the import details (EDM, amount, division, dates...) of one order that is not yet in Production."""
+    order = db.query(models.WorkOrder).filter(models.WorkOrder.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    _require_process_access(current_user, order.process_id)
+    _edit_order_fields(order, payload.dict(exclude_unset=True), current_user, db)
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+@app.post("/orders/bulk")
+def bulk_orders(
+    payload: schemas.OrderBulk,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Reassign, delete or edit several orders in one go. Each order is handled on its own; failures are listed, the rest go through."""
+    ids = list(dict.fromkeys(payload.ids))
+    if not ids:
+        raise HTTPException(status_code=400, detail="No orders selected")
+    if len(ids) > 500:
+        raise HTTPException(status_code=400, detail="Select at most 500 orders at a time")
+    if payload.action not in ("reassign", "delete", "edit"):
+        raise HTTPException(status_code=400, detail="action must be reassign, delete or edit")
+    changes = payload.changes.dict(exclude_unset=True) if payload.changes else {}
+    if payload.action == "edit" and not changes:
+        raise HTTPException(status_code=400, detail="Nothing to change")
+    if payload.action == "edit" and "edm" in changes and len(ids) > 1:
+        raise HTTPException(status_code=400, detail="EDM / Batch is unique per order - edit it on one order at a time")
+    if payload.action == "reassign" and not payload.assigned_to_id:
+        raise HTTPException(status_code=400, detail="Choose a colleague")
+    done, failed = 0, []
+    for oid in ids:
+        try:
+            if payload.action == "reassign":
+                reassign_order(oid, schemas.ReassignRequest(assigned_to_id=payload.assigned_to_id), current_user, db)
+            elif payload.action == "delete":
+                delete_one_order(oid, current_user, db)
+            else:
+                order = db.query(models.WorkOrder).filter(models.WorkOrder.id == oid).first()
+                if not order:
+                    raise HTTPException(status_code=404, detail="Order not found")
+                _require_process_access(current_user, order.process_id)
+                _edit_order_fields(order, dict(changes), current_user, db)
+                db.commit()
+            done += 1
+        except HTTPException as e:
+            db.rollback()
+            o = db.query(models.WorkOrder.edm).filter(models.WorkOrder.id == oid).first()
+            failed.append({"id": oid, "edm": o[0] if o else None, "error": str(e.detail)})
+    return {"done": done, "failed": failed}
 
 
 @app.delete("/orders/{order_id}")

@@ -263,6 +263,35 @@ class ReassignRequest(BaseModel):
     assigned_to_id: int
 
 
+# Import-data fields a Team Lead / Admin / Super Admin may correct on one order (or on many at once).
+class OrderEdit(BaseModel):
+    edm: Optional[str] = None
+    status: Optional[str] = None
+    created: Optional[date] = None
+    received_date: Optional[date] = None
+    deposit_date: Optional[date] = None
+    amount: Optional[float] = None
+    def_doc_type: Optional[str] = None
+    description: Optional[str] = None
+    division: Optional[str] = None
+    division_name: Optional[str] = None
+    run: Optional[str] = None
+    inits: Optional[str] = None
+    ecom_type: Optional[str] = None
+    eobs: Optional[int] = None
+    checks: Optional[int] = None
+    not_posted: Optional[int] = None
+    not_posted_amount: Optional[float] = None
+    offset_amount: Optional[float] = None
+
+
+class OrderBulk(BaseModel):
+    action: str                              # reassign | delete | edit
+    ids: List[int]
+    assigned_to_id: Optional[int] = None     # reassign
+    changes: Optional[OrderEdit] = None      # edit (only the fields sent are changed)
+
+
 # Team Lead-initiated (or Super Admin, on a Team Lead's behalf) transfer of
 # a batch of not-yet-completed, not-yet-submitted orders to another Team
 # Lead's queue. Omitting order_ids transfers the whole eligible queue.
