@@ -7255,14 +7255,37 @@ def _parse_float(v: Optional[str]) -> Optional[float]:
 HOLD_KEYS = {"divs": "edm_hold_divisions", "days": "edm_hold_days"}
 
 
-def _hold_cfg(db: Session):
-    raw = _setting(db, HOLD_KEYS["divs"], "")
-    divs = {_norm_text(x) for x in raw.split("\n") if x.strip()}
+def _hold_default_days(db: Session) -> int:
     try:
-        days = max(1, min(30, int(_setting(db, HOLD_KEYS["days"], "5"))))
+        return max(1, min(30, int(_setting(db, HOLD_KEYS["days"], "5"))))
     except ValueError:
-        days = 5
-    return divs, days
+        return 5
+
+
+def _hold_items(db: Session):
+    """Saved lines: 'division' (uses the default days) or 'division|days'. Returns [(value, days)]."""
+    default = _hold_default_days(db)
+    out = []
+    for line in _setting(db, HOLD_KEYS["divs"], "").split("\n"):
+        if not line.strip():
+            continue
+        v, _, d = line.rpartition("|") if "|" in line else (line, "", "")
+        try:
+            days = max(1, min(30, int(d))) if d.strip() else default
+        except ValueError:
+            v, days = line, default
+        if v.strip():
+            out.append((v.strip(), days))
+    return out
+
+
+def _hold_cfg(db: Session):
+    """(map of normalised division -> hold days, default days). Both '0120' and '120' style keys are matched."""
+    m = {}
+    for v, d in _hold_items(db):
+        m[_norm_text(v)] = d
+        m[_norm_facility(_norm_text(v))] = d
+    return m, _hold_default_days(db)
 
 
 def _hold_release_date(created, days: int):
@@ -7281,10 +7304,16 @@ def _hold_release_date(created, days: int):
 
 def _order_hold_until(order, cfg, today=None):
     """Release date if this EDM order is still on hold today, else None."""
-    divs, days = cfg
+    divs, _default = cfg
     if not divs or order.created is None or ((order.process.name if order.process else "") or "").strip().upper() != "EDM":
         return None
-    if _norm_text(order.division) not in divs and _norm_text(order.division_name) not in divs:
+    days = None
+    for v in (order.division, order.division_name):
+        n = _norm_text(v)
+        if n and (n in divs or _norm_facility(n) in divs):
+            days = divs.get(n, divs.get(_norm_facility(n)))
+            break
+    if days is None:
         return None
     rel = _hold_release_date(order.created, days)
     return rel if rel and (today or _work_today()) < rel else None
@@ -7472,28 +7501,63 @@ def list_orders(
 
 @app.get("/orders/edm-hold")
 def edm_hold_get(current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")), db: Session = Depends(get_db)):
-    divs, days = _hold_cfg(db)
+    days = _hold_default_days(db)
     p = db.query(models.Process).filter(func.upper(models.Process.name) == "EDM").first()
     known = []
     if p:
         rows = (db.query(models.WorkOrder.division, models.WorkOrder.division_name, func.count(models.WorkOrder.id))
                 .filter(models.WorkOrder.process_id == p.id).group_by(models.WorkOrder.division, models.WorkOrder.division_name).all())
         known = sorted(({"division": d or "", "division_name": n or "", "orders": c} for d, n, c in rows if (d or n)), key=lambda x: (x["division_name"] or x["division"]).lower())
-    return {"days": days, "selected": [x for x in _setting(db, HOLD_KEYS["divs"], "").split("\n") if x.strip()], "known": known}
+    items = [{"value": v, "days": d} for v, d in _hold_items(db)]
+    return {"days": days, "selected": [i["value"] for i in items], "items": items, "known": known}
+
+
+def _hold_save_items(db: Session, items: list, default_days: int):
+    clean = {}
+    for v, d in items:
+        v = str(v).replace("|", " ").strip()
+        if v:
+            clean[v] = d
+    _set_setting(db, HOLD_KEYS["divs"], "\n".join(f"{v}|{d}" for v, d in clean.items()))
+    _set_setting(db, HOLD_KEYS["days"], str(default_days))
+    return clean
+
+
+def _hold_days_value(x, what="Days"):
+    try:
+        d = int(x)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{what} must be a number")
+    if not 1 <= d <= 30:
+        raise HTTPException(status_code=400, detail=f"{what} must be between 1 and 30")
+    return d
 
 
 @app.put("/orders/edm-hold")
 def edm_hold_put(payload: dict, current_user: models.User = Depends(auth.require_role("admin", "manager", "super_admin")), db: Session = Depends(get_db)):
-    try:
-        days = int(payload.get("days", 5))
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="Days must be a number")
-    if not 1 <= days <= 30:
-        raise HTTPException(status_code=400, detail="Days must be between 1 and 30")
-    sel = [str(x).strip() for x in (payload.get("divisions") or []) if str(x).strip()]
-    _set_setting(db, HOLD_KEYS["divs"], "\n".join(dict.fromkeys(sel)))
-    _set_setting(db, HOLD_KEYS["days"], str(days))
-    _audit(db, current_user, "Orders", "EDM division hold updated", None, None, f"{len(sel)} division(s), {days} business days")
+    default = _hold_days_value(payload.get("days", 5))
+    if payload.get("items") is not None:
+        items = [(str(i.get("value", "")), _hold_days_value(i.get("days", default), "Days")) for i in payload["items"] if isinstance(i, dict)]
+    else:
+        items = [(str(x), default) for x in (payload.get("divisions") or [])]
+    clean = _hold_save_items(db, items, default)
+    _audit(db, current_user, "Orders", "EDM division hold updated", None, None, f"{len(clean)} division(s): " + ", ".join(f"{v}={d}d" for v, d in clean.items())[:400])
+    db.commit()
+    return {"ok": True}
+
+
+@app.put("/orders/edm-hold/division")
+def edm_hold_division(payload: dict, current_user: models.User = Depends(auth.require_role("admin", "manager", "super_admin")), db: Session = Depends(get_db)):
+    """Set (days = 1..30) or remove (days = null / 0) the hold for one division, e.g. from the Clients table."""
+    value = str(payload.get("value", "")).replace("|", " ").strip()
+    if not value:
+        raise HTTPException(status_code=400, detail="Division is required")
+    items = [(v, d) for v, d in _hold_items(db) if _norm_facility(_norm_text(v)) != _norm_facility(_norm_text(value))]
+    raw = payload.get("days")
+    if raw not in (None, "", 0, "0"):
+        items.append((value, _hold_days_value(raw)))
+    _hold_save_items(db, items, _hold_default_days(db))
+    _audit(db, current_user, "Orders", "EDM division hold updated", None, None, f"{value}: " + (f"{raw} business days" if raw not in (None, "", 0, "0") else "hold removed"))
     db.commit()
     return {"ok": True}
 
@@ -8378,10 +8442,14 @@ def _client_payload(db: Session, clients: list) -> list:
     if ids:
         for a in db.query(models.ClientProcessTeamLead).filter(models.ClientProcessTeamLead.client_id.in_(ids)).all():
             assigned.setdefault(a.client_id, []).append({"process_id": a.process_id, "team_lead_id": a.team_lead_id})
+    hold_map, _hd = _hold_cfg(db)
+
+    def _hd_for(c):
+        return hold_map.get(_norm_text(c.facility_no), hold_map.get(_norm_facility(_norm_text(c.facility_no)), hold_map.get(_norm_text(c.client_name))))
     return [
         {
             "id": c.id, "facility_no": c.facility_no, "client_name": c.client_name,
-            "status": c.status, "inactive_date": c.inactive_date,
+            "status": c.status, "inactive_date": c.inactive_date, "edm_hold_days": _hd_for(c),
             "assignments": sorted(assigned.get(c.id, []), key=lambda x: x["process_id"]),
         }
         for c in clients

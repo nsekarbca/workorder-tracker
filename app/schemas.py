@@ -621,6 +621,7 @@ class ClientOut(BaseModel):
     client_name: str
     status: str
     inactive_date: Optional[date] = None
+    edm_hold_days: Optional[int] = None
     assignments: List[ClientAssignment] = []
 
 
