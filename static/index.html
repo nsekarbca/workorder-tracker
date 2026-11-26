@@ -7849,7 +7849,10 @@ async function loadHealth() {
 async function loadHoldSummary() {
   const el = document.getElementById("hold-sum"); if (!el) return;
   const r = await authFetch("/orders/edm-hold"); if (!r.ok) return; const d = await r.json();
-  el.textContent = d.selected.length ? d.selected.length + " division(s) held for " + d.days + " business days (assigned on day " + (d.days + 1) + ")" : "No divisions on hold";
+  if (!d.selected.length) { el.textContent = "No divisions on hold"; return; }
+  const nm = {}; (d.known || []).forEach(k => { const t = ((k.division_name || k.division) + (k.division_name && k.division ? " (" + k.division + ")" : "")); [k.division, k.division_name].forEach(x => { if (x) nm[x.trim().toLowerCase().replace(/\s+/g, " ")] = t; }); });
+  const chips = d.selected.map(x => `<span style="display:inline-block;background:#fff;border:1px solid #b9a8e6;border-radius:10px;padding:1px 8px;margin:2px 3px 0 0;font-size:12px;">${_esc(nm[x.trim().toLowerCase().replace(/\s+/g, " ")] || x)}</span>`).join("");
+  el.innerHTML = `<div>${d.selected.length} division(s) held for ${d.days} business days (assigned on day ${d.days + 1}):</div><div>${chips}</div>`;
 }
 async function openHoldModal() {
   const r = await authFetch("/orders/edm-hold"); if (!r.ok) { alert(await _errText(r)); return; } const d = await r.json();
