@@ -1251,15 +1251,11 @@ td.not-started{color:#9aa3b2;background:#eceff3;opacity:.75;user-select:none;poi
       <button class="action-btn" onclick="saveBusinessDay()">Save Day Change Time</button>
       </div>
       <div id="admin-tab-clients" class="fbar" style="display:none;">
-        <div style="background:#e4e0f7; border-radius:8px; padding:8px 12px; margin-bottom:12px; font-size:13px;">
-          <b>EDM division hold</b> &mdash; orders of the chosen divisions are not given to colleagues until a few business days after their Created date. They show in a purple row in the active queue.
-          <button class="action-btn" style="margin-left:8px;" onclick="openHoldModal()">Choose divisions</button> <span id="hold-sum" style="color:#445;"></span>
-        </div>
         <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:10px;">
           <h3 style="margin:0;">Clients</h3>
           <button class="action-btn" onclick="openClientModal(null)">+ Add Client</button>
           <button class="action-btn" onclick="exportClientsCSV()">Export Excel</button>
-          <span style="font-size:12px; color:#666;">Each client has a Team Lead per process. Pick one in a cell (saves instantly), or tick clients and assign in bulk.</span>
+          <span style="font-size:12px; color:#666;">Each client has a Team Lead per process. Pick one in a cell (saves instantly), or tick clients and assign in bulk. <b>EDM hold (days)</b>: orders of that client are kept back from colleagues for that many business days after the Created date (blank = no hold; they show purple in the active queue).</span>
         </div>
         <div id="client-summary" class="od-tiles"></div>
         <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:8px; font-size:13px;">
@@ -4938,7 +4934,7 @@ function showApp() {
     if (isLeadRole()) {
     document.getElementById("import-btn").style.display = "inline-block";
     document.getElementById("run-assign-btn").style.display = "inline-block";
-    document.getElementById("clear-data-btn").style.display = "inline-block";
+    if (role === "super_admin") document.getElementById("clear-data-btn").style.display = "inline-block";     // Clear All Data: Super Admin only
     document.getElementById("production-btn").style.display = "inline-block";
     document.getElementById("nav-production-btn").style.display = "block";
     document.getElementById("nav-escalations-btn").style.display = "block";
@@ -7662,6 +7658,88 @@ async function clearAllData() {
   loadOrders();
 }
 
+// ---- multi-select + edit of orders (Team Lead / Admin / Super Admin) ----
+let bulkSel = new Set(), bulkVisible = [];
+function orderEditBtn(id) { return `<button class="action-btn" style="padding:4px 8px; font-size:11px;" title="Edit order details" onclick="openOrderEdit([${id}])">✎</button>`; }
+function bulkToggle(id, on) { on ? bulkSel.add(id) : bulkSel.delete(id); const a = document.getElementById("bulk-all"); if (a) a.checked = bulkVisible.length > 0 && bulkVisible.every(i => bulkSel.has(i)); bulkBarUpdate(); }
+function bulkAll(on) { bulkVisible.forEach(i => on ? bulkSel.add(i) : bulkSel.delete(i)); document.querySelectorAll(".bulk-chk").forEach(c => c.checked = on); bulkBarUpdate(); }
+function bulkClear() { bulkSel.clear(); document.querySelectorAll(".bulk-chk").forEach(c => c.checked = false); const a = document.getElementById("bulk-all"); if (a) a.checked = false; bulkBarUpdate(); }
+function bulkBarUpdate() {
+  const el = document.getElementById("bulk-bar"); if (!el) return;
+  if (!bulkSel.size) { el.style.cssText = ""; el.innerHTML = ""; return; }
+  const opts = (colleagueList || []).map(c => `<option value="${c.id}">${_esc(c.full_name)}</option>`).join("");
+  el.style.cssText = "position:sticky; top:0; z-index:20; background:#fff7e0; border:1px solid #e6c860; border-radius:8px; padding:8px 12px; margin:0 0 8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; font-size:13px;";
+  el.innerHTML = `<b>${bulkSel.size} selected</b>
+    <select id="bulk-to"><option value="">Reassign to…</option>${opts}</select><button class="action-btn" onclick="bulkRun('reassign')">Reassign</button>
+    <button class="action-btn" onclick="openOrderEdit([...bulkSel])">✎ Edit selected</button>
+    <button class="action-btn" style="background:var(--red);" onclick="bulkRun('delete')">🗑 Delete selected</button>
+    <button class="action-btn" style="background:#888;" onclick="bulkClear()">Clear selection</button>`;
+}
+async function bulkPost(body) {
+  const r = await authFetch("/orders/bulk", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  if (!r.ok) { alert(await _errText(r)); return null; }
+  const d = await r.json();
+  if (d.failed.length) alert(`${d.done} order(s) done, ${d.failed.length} not done:\n` + d.failed.slice(0, 15).map(f => `${f.edm || "#" + f.id}: ${f.error}`).join("\n"));
+  return d;
+}
+async function bulkRun(action) {
+  const ids = [...bulkSel]; if (!ids.length) return;
+  if (action === "reassign") {
+    const to = parseInt(document.getElementById("bulk-to").value, 10); if (!to) { alert("Choose the colleague to reassign to."); return; }
+    const nm = (colleagueList.find(c => c.id === to) || {}).full_name || "this colleague";
+    if (!confirm(`Reassign ${ids.length} order(s) to ${nm}?`)) return;
+    if (await bulkPost({action, ids, assigned_to_id: to})) { bulkSel.clear(); loadOrders(); }
+  } else {
+    if (!confirm(`Permanently delete ${ids.length} selected order(s)? This cannot be undone.`)) return;
+    if (await bulkPost({action, ids})) { bulkSel.clear(); loadOrders(); }
+  }
+}
+const ORDER_EDIT_FIELDS = [
+  ["edm", "EDM / Batch", "text"], ["division", "Division", "text"], ["division_name", "Division Name", "text"], ["amount", "Amount", "number"],
+  ["status", "Status", "text"], ["def_doc_type", "Def Doc Type", "text"], ["description", "Description", "text"],
+  ["created", "Created", "date"], ["received_date", "Received Date", "date"], ["deposit_date", "Deposit Date", "date"],
+  ["run", "Run", "text"], ["inits", "Inits", "text"], ["ecom_type", "Type (ECOM)", "text"], ["eobs", "EOBs", "number"], ["checks", "Check(s)", "number"],
+  ["not_posted", "Not Posted", "number"], ["not_posted_amount", "Not Posted $", "number"], ["offset_amount", "Offset $", "number"]];
+let orderEditIds = [];
+function openOrderEdit(ids) {
+  orderEditIds = ids.slice();
+  const one = ids.length === 1 ? (currentOrders.find(o => o.id === ids[0])) : null;
+  if (ids.length === 1 && !one) { alert("Order not found - refresh the screen."); return; }
+  const val = (o, k, t) => { if (!o || o[k] === null || o[k] === undefined) return ""; return t === "date" ? String(o[k]).slice(0, 10) : o[k]; };
+  const rows = ORDER_EDIT_FIELDS.filter(f => !(ids.length > 1 && f[0] === "edm")).map(([k, l, t]) =>
+    `<label style="display:flex; flex-direction:column; font-size:12px; color:#445;">${l}<input id="oe-${k}" type="${t}" ${t === "number" ? 'step="any"' : ""} value="${_esc(String(val(one, k, t)))}" style="font-size:13px; padding:4px;"></label>`).join("");
+  let ov = document.getElementById("oe-modal"); if (ov) ov.remove();
+  ov = document.createElement("div"); ov.id = "oe-modal";
+  ov.style.cssText = "position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:9000; display:flex; align-items:center; justify-content:center;";
+  ov.innerHTML = `<div style="background:#fff; border-radius:10px; padding:18px 22px; width:min(620px,94%); max-height:88vh; overflow:auto;">
+    <h3 style="margin-top:0;">${one ? "Edit order " + _esc(one.edm || "#" + one.id) : "Edit " + ids.length + " selected orders"}</h3>
+    <div style="font-size:12px; color:#667; margin-bottom:8px;">${one ? "Change what is wrong and Save. Pending $ is recalculated. Every change is recorded in the activity log." : "Fill only the fields you want to set on <b>all</b> selected orders; blank fields are left as they are."}</div>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">${rows}</div>
+    <div style="margin-top:12px; display:flex; gap:8px; justify-content:flex-end;"><button class="action-btn" style="background:#888;" onclick="document.getElementById('oe-modal').remove()">Cancel</button><button class="action-btn" onclick="saveOrderEdit()">Save</button></div></div>`;
+  document.body.appendChild(ov);
+}
+async function saveOrderEdit() {
+  const ids = orderEditIds, one = ids.length === 1 ? currentOrders.find(o => o.id === ids[0]) : null;
+  const ch = {};
+  for (const [k, l, t] of ORDER_EDIT_FIELDS) {
+    const el = document.getElementById("oe-" + k); if (!el) continue;
+    let v = el.value.trim();
+    if (one) {
+      const old = one[k] === null || one[k] === undefined ? "" : (t === "date" ? String(one[k]).slice(0, 10) : String(one[k]));
+      if (v === old || (t === "number" && v !== "" && old !== "" && parseFloat(v) === parseFloat(old))) continue;
+    } else if (v === "") continue;
+    if (t === "number") { if (v !== "" && isNaN(Number(v))) { alert(l + " must be a number."); return; } ch[k] = v === "" ? null : Number(v); }
+    else ch[k] = v === "" ? null : v;
+  }
+  if (!Object.keys(ch).length) { alert("Nothing changed."); return; }
+  if (!one && !confirm(`Apply this change to ${ids.length} orders?`)) return;
+  if (one) {
+    const r = await authFetch(`/orders/${one.id}/edit`, {method: "PATCH", headers: {"Content-Type": "application/json"}, body: JSON.stringify(ch)});
+    if (!r.ok) { alert(await _errText(r)); return; }
+  } else if (!(await bulkPost({action: "edit", ids, changes: ch}))) return;
+  document.getElementById("oe-modal").remove(); bulkSel.clear(); loadOrders();
+}
+
 async function clearOneOrder(orderId) {
   const sure = confirm("Permanently delete this one order? This cannot be undone.");
   if (!sure) return;
@@ -9232,10 +9310,13 @@ function renderGrid(orders, onlyId) {
     orders = tlSortGroup(activeTl ? orders.filter(o => tlName(o) === activeTl) : orders);
   }
   const groupCounts = (tlAllTeams() && !_oneRow) ? tlCounts(orders) : null;
-  const colspan = cols.length + (shareMode ? 1 : 0) + (hasActionCol ? 1 : 0);
+  const canBulk = role !== "colleague" && hasActionCol && !shareMode;
+  if (!_oneRow) { bulkVisible = orders.map(o => o.id); const have = new Set((currentOrders || []).map(o => o.id)); bulkSel.forEach(i => { if (!have.has(i)) bulkSel.delete(i); }); }
+  const colspan = cols.length + (shareMode ? 1 : 0) + (hasActionCol ? 1 : 0) + (canBulk ? 1 : 0);
   let lastGroup = null;
   let html = "<table><thead><tr>";
   if (shareMode) html += `<th class="col">Share</th>`;
+  if (canBulk) html += `<th class="col"><input type="checkbox" id="bulk-all" title="Select all shown" onchange="bulkAll(this.checked)" ${bulkVisible.length && bulkVisible.every(i => bulkSel.has(i)) ? "checked" : ""}></th>`;
   cols.forEach(c => {
     const arrow = aqSort.key === c.k ? (aqSort.dir === 1 ? " \u25b2" : " \u25bc") : "";
     html += c.k === "time_taken" ? `<th class="${c.group}">${c.label}</th>`
@@ -9265,6 +9346,7 @@ function renderGrid(orders, onlyId) {
       const shareable = (role === "team_lead" ? o.team_lead_id === myUserId : !!o.team_lead_id) && !savedCompleted;
       html += `<td>${shareable ? `<input type="checkbox" onchange="toggleShareRow(${o.id}, this.checked)" ${selectedForShare.has(o.id) ? "checked" : ""}>` : ""}</td>`;
     }
+    if (canBulk) html += `<td><input type="checkbox" class="bulk-chk" ${bulkSel.has(o.id) ? "checked" : ""} onchange="bulkToggle(${o.id}, this.checked)"></td>`;
     cols.forEach(c => {
       const editableBase = (isLeadRole() && (TL_FIELDS.includes(c.k) || (tlCanCorrect && TL_CORRECTION_FIELDS.includes(c.k)))) ||
                             (role === "colleague" && COL_FIELDS.includes(c.k));
@@ -9372,7 +9454,7 @@ function renderGrid(orders, onlyId) {
       }
     } else if (isLeadRole()) {
       if (tlCanCorrect) {
-        html += `<td><button class="action-btn" onclick="saveRow(${o.id}, this)" ${hasDraft ? "" : "disabled"}>Save</button> <button class="action-btn" style="background:var(--red); padding:4px 8px; font-size:11px;" onclick="clearOneOrder(${o.id})">\ud83d\uddd1</button></td>`;
+        html += `<td><button class="action-btn" onclick="saveRow(${o.id}, this)" ${hasDraft ? "" : "disabled"}>Save</button> ${orderEditBtn(o.id)} <button class="action-btn" style="background:var(--red); padding:4px 8px; font-size:11px;" onclick="clearOneOrder(${o.id})">\ud83d\uddd1</button></td>`;
       } else {
         html += `<td><select onchange="reassignOrder(${o.id}, this.value)">`;
         html += `<option value="">Reassign\u2026</option>`;
@@ -9380,20 +9462,20 @@ function renderGrid(orders, onlyId) {
           const isCurrent = c.id === o.assigned_to_id;
           html += `<option value="${c.id}" ${isCurrent ? "selected" : ""}>${c.full_name}${isCurrent ? " (current)" : ""}</option>`;
         });
-        html += `</select> <button class="action-btn" style="background:var(--red); padding:4px 8px; font-size:11px;" onclick="clearOneOrder(${o.id})">\ud83d\uddd1</button></td>`;
+        html += `</select> ${orderEditBtn(o.id)} <button class="action-btn" style="background:var(--red); padding:4px 8px; font-size:11px;" onclick="clearOneOrder(${o.id})">\ud83d\uddd1</button></td>`;
       }
     }
     else if (role === "admin") {
       const delBtn = `<button class="action-btn" style="background:var(--red); padding:4px 8px; font-size:11px;" onclick="clearOneOrder(${o.id})">\ud83d\uddd1</button>`;
       if (savedCompleted) {
-        html += `<td>${delBtn}</td>`;
+        html += `<td>${orderEditBtn(o.id)} ${delBtn}</td>`;
       } else {
         html += `<td><select onchange="reassignOrder(${o.id}, this.value)"><option value="">Reassign\u2026</option>`;
         reassignChoices(o).forEach(c => {
           const isCurrent = c.id === o.assigned_to_id;
           html += `<option value="${c.id}" ${isCurrent ? "selected" : ""}>${c.full_name}${isCurrent ? " (current)" : ""}</option>`;
         });
-        html += `</select> ${delBtn}</td>`;
+        html += `</select> ${orderEditBtn(o.id)} ${delBtn}</td>`;
       }
     }
     html += `</tr>`;
@@ -9427,8 +9509,9 @@ function renderGrid(orders, onlyId) {
     // from an all-locked table.
     document.getElementById("grid-container").innerHTML = _sum + emptyMessage + html;
   } else {
-    document.getElementById("grid-container").innerHTML = _sum + html;
+    document.getElementById("grid-container").innerHTML = _sum + '<div id="bulk-bar"></div>' + html;
   }
+  bulkBarUpdate();
   _applyPendingFocus();
 }
 
