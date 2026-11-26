@@ -5511,12 +5511,12 @@ function renderClientsView() {
 
 function cvListHTML(clients, procF) {
   const procs = cvData.processes.filter(p => !procF || p.id === procF);
-  let html = `<div class="od-scroll"><table><thead><tr><th>Facility No</th><th>Client Name</th><th>Status</th><th>Inactive Date</th>` +
+  let html = `<div class="od-scroll"><table><thead><tr><th>Facility No</th><th>Client Name</th><th>Status</th><th>Inactive Date</th><th>EDM hold</th>` +
     procs.map(p => `<th style="min-width:120px;">${_esc(p.name)}</th>`).join("") + `</tr></thead><tbody>`;
   clients.forEach(c => {
     const inactive = c.status === "Inactive";
     html += `<tr${inactive ? ' style="color:#777;"' : ""}><td>${_esc(c.facility_no)}</td><td>${_esc(c.client_name)}</td><td>${cvBadge(c.status)}</td>` +
-      `<td>${inactive ? _esc(fmtD(c.inactive_date)) : ""}</td>` +
+      `<td>${inactive ? _esc(fmtD(c.inactive_date)) : ""}</td><td>${c.edm_hold_days ? c.edm_hold_days + " days" : ""}</td>` +
       procs.map(p => `<td>${c._a[p.id] ? _esc(cvTlName(c._a[p.id])) : '<span style="color:#b45309;">\u2014</span>'}</td>`).join("") + `</tr>`;
   });
   return html + `</tbody></table></div>`;
@@ -5675,7 +5675,7 @@ function renderClients() {
   if (!rows.length) { wrap.innerHTML = "<p style='padding:12px;'>No clients match these filters.</p>"; updateClientSelCount(); return; }
   const allTicked = rows.every(c => clientSel.has(c.id));
   let html = `<table><thead><tr><th><input type="checkbox" ${allTicked ? "checked" : ""} onchange="clientToggleAll(this.checked)" title="Select all shown"></th>` +
-    `<th>Facility No</th><th>Client Name</th><th>Status</th><th>Inactive Date</th>` +
+    `<th>Facility No</th><th>Client Name</th><th>Status</th><th>Inactive Date</th><th title="EDM only: business days this division is held from its Created date before colleagues get it. Blank = no hold.">EDM hold (days)</th>` +
     clientData.processes.map(p => `<th style="min-width:140px;">${_esc(p.name)}</th>`).join("") + `<th></th></tr></thead><tbody>`;
   rows.forEach(c => {
     const inactive = c.status === "Inactive";
@@ -5683,11 +5683,21 @@ function renderClients() {
       `<td>${_esc(c.facility_no)}</td><td>${_esc(c.client_name)}</td>` +
       `<td><span style="display:inline-block; padding:2px 10px; border-radius:12px; font-size:12px; color:#fff; background:${inactive ? "#dc2626" : "#16a34a"};">${c.status}</span></td>` +
       `<td>${inactive ? _esc(fmtD(c.inactive_date)) : ""}</td>` +
+      `<td style="${c.edm_hold_days ? "background:#e4def7;" : ""}"><input type="number" min="1" max="30" value="${c.edm_hold_days || ""}" placeholder="&mdash;" style="width:56px;" onchange="clientHoldSave(${c.id}, this)"></td>` +
       clientData.processes.map(p => clientCellHTML(c, p)).join("") +
       `<td><button class="action-btn" onclick="openClientModal(${c.id})">Edit</button></td></tr>`;
   });
   wrap.innerHTML = html + `</tbody></table>`;
   updateClientSelCount();
+}
+
+async function clientHoldSave(id, inp) {
+  const c = clientData.clients.find(x => x.id === id); if (!c) return;
+  const v = inp.value.trim(); const days = v === "" ? null : parseInt(v, 10);
+  if (days !== null && !(days >= 1 && days <= 30)) { alert("Enter 1 to 30 business days, or leave blank for no hold."); inp.value = c.edm_hold_days || ""; return; }
+  const r = await authFetch("/orders/edm-hold/division", {method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify({value: c.facility_no, days})});
+  if (!r.ok) { alert(await _errText(r)); inp.value = c.edm_hold_days || ""; return; }
+  c.edm_hold_days = days; inp.parentElement.style.background = days ? "#e4def7" : ""; loadHoldSummary();
 }
 
 // ---- selection + bulk ----
@@ -7849,31 +7859,31 @@ async function loadHealth() {
 async function loadHoldSummary() {
   const el = document.getElementById("hold-sum"); if (!el) return;
   const r = await authFetch("/orders/edm-hold"); if (!r.ok) return; const d = await r.json();
-  if (!d.selected.length) { el.textContent = "No divisions on hold"; return; }
+  if (!d.items.length) { el.textContent = "No divisions on hold (default " + d.days + " business days when you tick one)"; return; }
   const nm = {}; (d.known || []).forEach(k => { const t = ((k.division_name || k.division) + (k.division_name && k.division ? " (" + k.division + ")" : "")); [k.division, k.division_name].forEach(x => { if (x) nm[x.trim().toLowerCase().replace(/\s+/g, " ")] = t; }); });
-  const chips = d.selected.map(x => `<span style="display:inline-block;background:#fff;border:1px solid #b9a8e6;border-radius:10px;padding:1px 8px;margin:2px 3px 0 0;font-size:12px;">${_esc(nm[x.trim().toLowerCase().replace(/\s+/g, " ")] || x)}</span>`).join("");
-  el.innerHTML = `<div>${d.selected.length} division(s) held for ${d.days} business days (assigned on day ${d.days + 1}):</div><div>${chips}</div>`;
+  const chips = d.items.map(i => `<span style="display:inline-block;background:#fff;border:1px solid #b9a8e6;border-radius:10px;padding:1px 8px;margin:2px 3px 0 0;font-size:12px;">${_esc(nm[i.value.trim().toLowerCase().replace(/\s+/g, " ")] || i.value)} &middot; <b>${i.days}</b> days</span>`).join("");
+  el.innerHTML = `<div>${d.items.length} division(s) on hold. Each is given to a colleague on the business day after its own hold days. Change the days per division in the table below (EDM hold column) or with Choose divisions.</div><div>${chips}</div>`;
 }
 async function openHoldModal() {
   const r = await authFetch("/orders/edm-hold"); if (!r.ok) { alert(await _errText(r)); return; } const d = await r.json();
-  const sel = new Set(d.selected.map(x => x.trim().toLowerCase().replace(/\s+/g, " ")));
   const norm = x => String(x || "").trim().toLowerCase().replace(/\s+/g, " ");
-  const rows = d.known.map(k => { const v = k.division_name || k.division; return `<label style="display:flex; gap:6px; padding:2px 0;"><input type="checkbox" class="hold-chk" value="${_esc(v)}" ${sel.has(norm(k.division)) || sel.has(norm(k.division_name)) ? "checked" : ""}> ${_esc(k.division)} ${k.division_name ? "&mdash; " + _esc(k.division_name) : ""} <span style="color:#888;">(${k.orders})</span></label>`; }).join("");
+  const sel = {}; d.items.forEach(i => { sel[norm(i.value)] = i.days; });
+  const rows = d.known.map(k => { const v = k.division_name || k.division; const dd = sel[norm(k.division)] ?? sel[norm(k.division_name)]; return `<div style="display:flex; gap:6px; padding:2px 0; align-items:center;"><label style="display:flex; gap:6px; flex:1;"><input type="checkbox" class="hold-chk" value="${_esc(v)}" ${dd !== undefined ? "checked" : ""}> ${_esc(k.division)} ${k.division_name ? "&mdash; " + _esc(k.division_name) : ""} <span style="color:#888;">(${k.orders})</span></label><input type="number" min="1" max="30" class="hold-d" value="${dd ?? d.days}" style="width:52px;" title="Business days to hold this division"> <span style="color:#888;font-size:12px;">days</span></div>`; }).join("");
   let ov = document.getElementById("hold-modal"); if (ov) ov.remove();
   ov = document.createElement("div"); ov.id = "hold-modal";
   ov.style.cssText = "position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:9000; display:flex; align-items:center; justify-content:center;";
   ov.innerHTML = `<div style="background:#fff; border-radius:10px; padding:18px 22px; width:min(560px,94%); max-height:86vh; overflow:auto;">
     <h3 style="margin-top:0;">EDM division hold</h3>
-    <div style="font-size:13px; margin-bottom:8px;">Hold for <input id="hold-days" type="number" min="1" max="30" value="${d.days}" style="width:56px;"> business days after the Created date; the order is given to a colleague on the next business day (weekends and holidays are not counted). Manual assignment by a Team Lead is still possible.</div>
+    <div style="font-size:13px; margin-bottom:8px;">Tick the divisions to hold and set the <b>business days</b> for each one (counted from the Created date; the order goes to a colleague on the next business day; weekends and holidays are not counted). Default for newly ticked divisions: <input id="hold-days" type="number" min="1" max="30" value="${d.days}" style="width:56px;"> days. Manual assignment by a Team Lead is still possible.</div>
     <div style="border:1px solid #dde; border-radius:6px; padding:6px 10px; max-height:300px; overflow:auto;">${rows || "<i>No EDM orders yet.</i>"}</div>
     <div style="margin-top:10px; display:flex; gap:8px; justify-content:flex-end;"><button class="action-btn" style="background:#888;" onclick="document.getElementById('hold-modal').remove()">Cancel</button><button class="action-btn" onclick="saveHold()">Save</button></div></div>`;
   document.body.appendChild(ov);
 }
 async function saveHold() {
-  const divisions = [...document.querySelectorAll(".hold-chk:checked")].map(c => c.value);
-  const r = await authFetch("/orders/edm-hold", {method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify({divisions, days: parseInt(document.getElementById("hold-days").value, 10)})});
+  const items = [...document.querySelectorAll(".hold-chk")].filter(c => c.checked).map(c => ({value: c.value, days: parseInt(c.closest("div").querySelector(".hold-d").value, 10)}));
+  const r = await authFetch("/orders/edm-hold", {method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify({items, days: parseInt(document.getElementById("hold-days").value, 10)})});
   if (!r.ok) { alert(await _errText(r)); return; }
-  document.getElementById("hold-modal").remove(); loadHoldSummary();
+  document.getElementById("hold-modal").remove(); loadHoldSummary(); if (typeof loadClients === "function" && document.getElementById("client-table-wrap")) loadClients();
 }
 async function clAuto() {
   const box = document.getElementById("cl-auto"); if (!box) return;
