@@ -534,6 +534,7 @@ td.not-started{color:#9aa3b2;background:#eceff3;opacity:.75;user-select:none;poi
         </div>
         <button class="nav-menu-item" id="nav-holidays-btn" onclick="navTo('holidays')">📅 Holidays</button>
         <button class="nav-menu-item" id="nav-profile-btn" style="display:none;" onclick="navTo('profile')">👤 My Profile</button>
+        <button class="nav-menu-item" id="nav-teamprof-btn" style="display:none;" onclick="navTo('teamprof')">&#128101; Team Profiles</button>
         <button class="nav-menu-item" id="nav-switch-process-btn" style="display:none;" onclick="navTo('switch')">Switch Process</button>
       </div>
       <div class="header-right">
@@ -1332,6 +1333,17 @@ td.not-started{color:#9aa3b2;background:#eceff3;opacity:.75;user-select:none;poi
       <button class="action-btn" onclick="saveProfileDates()">Save</button>
       <button class="action-btn" style="background:#888;" onclick="closeProfileModal()">Close</button>
     </div>
+  </div>
+</div>
+
+<div id="tp-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:100; align-items:center; justify-content:center;">
+  <div style="background:white; border-radius:8px; padding:20px; width:980px; max-width:96vw; max-height:90vh; overflow-y:auto;">
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+      <h3 style="margin:0;" id="tp-title">Team Profiles</h3>
+      <div><input id="tp-q" placeholder="Search name, ID, manager, process..." oninput="tpRender()" style="width:260px;"> <button class="action-btn" style="background:#888;" onclick="document.getElementById('tp-modal').style.display='none'">Close</button></div>
+    </div>
+    <div id="tp-detail" style="margin:12px 0 0;"></div>
+    <div id="tp-list" style="margin-top:12px; overflow-x:auto;"></div>
   </div>
 </div>
 
@@ -4979,6 +4991,7 @@ function showApp() {
   document.getElementById("nav-active-btn").style.display = (role === "quality" || isTeamRole()) ? "none" : "block";
   // Clients (view-only): colleague, Team Lead, Admin, Super Admin — not the Quality profile.
   document.getElementById("nav-profile-btn").style.display = role === "super_admin" ? "none" : "block";
+  document.getElementById("nav-teamprof-btn").style.display = ["team_lead", "admin", "manager", "super_admin"].includes(role) ? "block" : "none";
   document.getElementById("header-profile-btn").style.display = role === "super_admin" ? "none" : "inline-flex";
   document.getElementById("nav-clients-btn").style.display = (role === "quality" || isTeamRole()) ? "none" : "block";
   document.getElementById("nav-onshore-btn").style.display = (isTeamRole() || role === "admin" || role === "super_admin") ? "block" : "none";
@@ -5082,6 +5095,7 @@ function navTo(dest) {
   else if (dest === "admin") showAdminView();
   else if (dest === "switch") showProcessSwitcher();
   else if (dest === "profile") openProfileModal();
+  else if (dest === "teamprof") openTeamProfiles();
   else if (dest === "holidays") openHolidays();
   else if (dest === "performance") showPerformanceView();
   else if (dest === "p835") show835View();
@@ -5110,6 +5124,38 @@ async function openProfileModal() {
   document.getElementById("profile-modal").style.display = "flex";
   _setPhotoBox(document.getElementById("pf-photo"), "", u.full_name);
   try { const pr = await authFetch("/auth/me/photo"); if (pr.ok) _setPhotoBox(document.getElementById("pf-photo"), (await pr.json()).photo, u.full_name); } catch (e) {}
+}
+// ---- Team Profiles (read-only): Team Lead = their team members; Admin / Super Admin = everyone ----
+let tpData = {scope: "team", users: []};
+async function openTeamProfiles() {
+  const r = await authFetch("/team/profiles");
+  if (!r.ok) { alert(await _errText(r)); return; }
+  tpData = await r.json();
+  document.getElementById("tp-title").textContent = tpData.scope === "team" ? "My Team – Profiles (" + tpData.users.length + ")" : "All Profiles (" + tpData.users.length + ")";
+  document.getElementById("tp-q").value = ""; document.getElementById("tp-detail").innerHTML = "";
+  document.getElementById("tp-modal").style.display = "flex"; tpRender();
+}
+function tpRender() {
+  const q = document.getElementById("tp-q").value.trim().toLowerCase();
+  const us = tpData.users.filter(u => !q || [u.full_name, u.username, u.employee_id, u.reporting_manager, u.designation, u.role, (u.processes || []).join(" ")].join(" ").toLowerCase().includes(q));
+  document.getElementById("tp-list").innerHTML = us.length ? `<table><thead><tr><th>Name</th><th>Employee ID</th><th>Role</th><th>Designation</th><th>Reporting Manager</th><th>Shift</th><th>Processes</th><th>Status</th></tr></thead><tbody>` +
+    us.map(u => `<tr style="cursor:pointer;" onclick="tpShow(${u.id})"><td><b>${_esc(u.full_name)}</b></td><td>${_esc(u.employee_id)}</td><td>${_esc((u.role || "").replace("_", " "))}</td><td>${_esc(u.designation)}</td><td>${_esc(u.reporting_manager) || '<span style="color:#aaa;">&mdash;</span>'}</td><td>${_esc(u.shift)}</td><td>${_esc((u.processes || []).join(", "))}</td><td>${_esc(u.employment_status)}</td></tr>`).join("") + `</tbody></table>`
+    : `<div style="color:#777; padding:12px;">${tpData.scope === "team" ? "No team members report to you yet. A colleague appears here when their Reporting Manager is set to your name." : "No users match."}</div>`;
+}
+async function tpShow(id) {
+  const u = tpData.users.find(x => x.id === id); if (!u) return;
+  const f = (l, v) => `<div style="font-size:12px; color:#667;">${l}<div style="font-size:14px; color:#111;">${v ? _esc(v) : "&mdash;"}</div></div>`;
+  const d = document.getElementById("tp-detail");
+  d.innerHTML = `<div style="border:1px solid #d6dbe6; border-radius:8px; padding:12px; display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; background:#f8f9fc;">
+    <div id="tp-photo" style="width:72px; height:72px; border-radius:50%; background:#c9d2e3 center/cover no-repeat; display:flex; align-items:center; justify-content:center; font-size:24px; font-weight:700; color:#0b2545; flex:none;"></div>
+    <div style="flex:1; min-width:260px; display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); gap:8px 16px;">
+      ${f("Name", u.full_name)}${f("Username", u.username)}${f("Employee ID", u.employee_id)}${f("Role", (u.role || "").replace("_", " "))}
+      ${f("Designation", u.designation)}${f("Reporting Manager", u.reporting_manager)}${f("Email", u.email)}${f("Shift", u.shift)}
+      ${f("Date of Joining", u.doj)}${f("Date of Birth", u.dob)}${f("Anniversary Date", u.anniversary_date)}${f("Status", u.employment_status)}
+      ${f("Processes", (u.processes || []).join(", "))}</div></div>`;
+  _setPhotoBox(document.getElementById("tp-photo"), "", u.full_name);
+  d.scrollIntoView({block: "nearest"});
+  if (u.has_photo) { try { const pr = await authFetch(`/team/profiles/${id}/photo`); if (pr.ok) { const el = document.getElementById("tp-photo"); if (el) _setPhotoBox(el, (await pr.json()).photo, u.full_name); } } catch (e) {} }
 }
 function _initials(n) { return (n || "?").split(/\s+/).filter(Boolean).slice(0, 2).map(x => x[0].toUpperCase()).join(""); }
 function _setPhotoBox(el, photo, name) {
