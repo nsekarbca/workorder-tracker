@@ -4872,6 +4872,43 @@ def break_exceptions(
     return {"month": first.strftime("%B %Y"), "rows": rows, "adjustments": adjs, "summary": sorted(summ.values(), key=lambda x: (-x["exception_days"], x["employee"]))}
 
 
+def _profile_row(u):
+    return {"id": u.id, "full_name": u.full_name, "username": u.username, "role": u.role, "employee_id": u.employee_id or "", "email": u.email or "",
+            "designation": u.designation or "", "shift": u.shift or "", "reporting_manager": u.reporting_manager or "",
+            "doj": u.doj.isoformat() if u.doj else "", "dob": u.dob.isoformat() if u.dob else "",
+            "anniversary_date": u.anniversary_date.isoformat() if u.anniversary_date else "",
+            "employment_status": u.employment_status or "", "processes": [pr.name for pr in u.processes], "has_photo": bool(u.photo)}
+
+
+def _profile_scope(db: Session, current_user):
+    q = db.query(models.User)
+    if current_user.role == "team_lead":
+        q = q.filter(models.User.reporting_manager == current_user.full_name)      # a Team Lead sees their own team members
+    return q
+
+
+@app.get("/team/profiles")
+def team_profiles(
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Team Lead: the colleagues who report to them. Admin / Manager / Super Admin: every user. Read-only."""
+    users = _profile_scope(db, current_user).order_by(models.User.full_name).all()
+    return {"scope": "team" if current_user.role == "team_lead" else "all", "users": [_profile_row(u) for u in users]}
+
+
+@app.get("/team/profiles/{user_id}/photo")
+def team_profile_photo(
+    user_id: int,
+    current_user: models.User = Depends(auth.require_role("team_lead", "admin", "manager", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    u = _profile_scope(db, current_user).filter(models.User.id == user_id).first()
+    if not u:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"photo": u.photo or ""}
+
+
 @app.get("/auth/me/photo")
 def get_my_photo(current_user: models.User = Depends(auth.get_current_user)):
     return {"photo": current_user.photo or ""}
