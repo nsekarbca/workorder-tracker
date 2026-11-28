@@ -1092,12 +1092,14 @@ td.not-started{color:#9aa3b2;background:#eceff3;opacity:.75;user-select:none;poi
           <option>Day Shift (08:00 AM - 05:00 PM)</option><option>Day Shift (09:00 AM - 06:00 PM)</option>
           <option>Mid Shift (03:30 PM - 12:30 AM)</option>
           <option>Night Shift (05:30 PM - 02:30 AM)</option><option>Night Shift (06:30 PM - 03:30 AM)</option></select></label>
+        <label>Project <select id="nu-project" onchange="populateReportingManagerDropdown(document.getElementById('nu-reporting-manager').value)"></select></label>
+        <label>Department <select id="nu-department" onchange="populateSubDept('')"></select></label>
+        <div style="grid-column: span 1;"><span style="font-size:13px;">Sub department <span style="color:#888;">(tick one or more)</span></span>
+          <div id="nu-subdept" style="border:1px solid #ccd; border-radius:6px; padding:4px 8px; min-height:34px; background:#fff; font-size:13px;"></div></div>
         <label><span id="nu-rm-label">Reporting Manager</span>
           <select id="nu-reporting-manager"></select>
+          <span id="nu-rm-hint" style="font-size:11px; color:#667;"></span>
         </label>
-        <label>Project <select id="nu-project"></select></label>
-        <label>Department <select id="nu-department" onchange="populateSubDept('')"></select></label>
-        <label>Sub department <select id="nu-subdept"></select></label>
         <label>Employment Status
           <select id="nu-employment-status">
             <option value="Active">Active</option>
@@ -7436,11 +7438,13 @@ async function fillOrgSelects(proj, dept, sub) {
 function populateSubDept(sub) {
   const dep = document.getElementById("nu-department").value;
   const d = (orgOpts && orgOpts.departments.find(x => x.name === dep)) || null;
-  const sel = document.getElementById("nu-subdept");
-  const subs = d ? d.sub_departments : [];
-  sel.innerHTML = (subs.length ? '<option value="">(not set)</option>' : '<option value="">' + (dep ? "(none for this department)" : "(choose a department first)") + '</option>') + subs.map(x => `<option value="${_esc(x)}" ${x === sub ? "selected" : ""}>${_esc(x)}</option>`).join("");
-  sel.disabled = !subs.length;
+  const subs = d ? d.sub_departments : [], chosen = new Set(String(sub || "").split(",").map(x => x.trim()).filter(Boolean));
+  document.getElementById("nu-subdept").innerHTML = subs.length
+    ? subs.map(x => `<label style="display:inline-flex; gap:4px; align-items:center; margin:2px 10px 2px 0; font-weight:normal;"><input type="checkbox" class="nu-sub-chk" value="${_esc(x)}" ${chosen.has(x) ? "checked" : ""} onchange="populateReportingManagerDropdown(document.getElementById('nu-reporting-manager').value)"> ${_esc(x)}</label>`).join("")
+    : `<span style="color:#888;">${dep ? "(none for this department)" : "(choose a department first)"}</span>`;
+  populateReportingManagerDropdown(document.getElementById("nu-reporting-manager").value);
 }
+function getSubDepts() { return [...document.querySelectorAll(".nu-sub-chk:checked")].map(c => c.value).join(", "); }
 function onUserRoleChange() { populateReportingManagerDropdown(""); }
 
 function clearUserForm() {
@@ -7487,12 +7491,19 @@ function populateReportingManagerDropdown(selectedName) {
   const label = {team_lead: "Team Lead", manager: "Manager", admin: "Admin"};
   const lab = document.getElementById("nu-rm-label");
   if (role === "admin" || role === "super_admin") {
-    sel.innerHTML = '<option value="">\u2014 not applicable \u2014</option>'; sel.disabled = true; if (lab) lab.textContent = "Reports to"; return;
+    sel.innerHTML = '<option value="">\u2014 not applicable \u2014</option>'; sel.disabled = true; if (lab) lab.textContent = "Reports to"; const h0 = document.getElementById("nu-rm-hint"); if (h0) h0.textContent = ""; return;
   }
   sel.disabled = false;
   const src = need || "team_lead";           // Quality / Onshore / Recon / Calling keep the Team Lead list
   if (lab) lab.textContent = "Reports to (" + label[src] + ")";
-  const names = new Set(allUsers.filter(u => u.role === src && u.employment_status !== "Inactive").map(u => u.full_name));
+  // Only people of that role who work in the chosen Project / Department / Sub department (a blank on their profile does not exclude them).
+  const pj = document.getElementById("nu-project").value, dp = document.getElementById("nu-department").value;
+  const sb = getSubDepts().split(", ").filter(Boolean);
+  const fit = u => (!pj || !u.project || u.project === pj) && (!dp || !u.department || u.department === dp) &&
+    (!sb.length || !u.sub_department || u.sub_department.split(",").map(x => x.trim()).some(x => sb.includes(x)));
+  const names = new Set(allUsers.filter(u => u.role === src && u.employment_status !== "Inactive" && fit(u)).map(u => u.full_name));
+  const hint = document.getElementById("nu-rm-hint");
+  if (hint) hint.textContent = (pj || dp || sb.length) ? names.size + " " + label[src] + "(s) match " + [pj, dp, sb.join(" + ")].filter(Boolean).join(" / ") : "";
   if (selectedName) names.add(selectedName);
   sel.innerHTML = '<option value="">\u2014 None \u2014</option>' + Array.from(names).sort().map(n => `<option value="${_esc(n)}" ${n === selectedName ? "selected" : ""}>${_esc(n)}</option>`).join("");
 }
@@ -7518,7 +7529,7 @@ async function saveUser() {
     reporting_manager: document.getElementById("nu-reporting-manager").value || null,
     project: document.getElementById("nu-project").value || null,
     department: document.getElementById("nu-department").value || null,
-    sub_department: document.getElementById("nu-subdept").value || null,
+    sub_department: getSubDepts() || null,
     employment_status: document.getElementById("nu-employment-status").value,
     dob: document.getElementById("nu-dob").value || null,
     doj: document.getElementById("nu-doj").value || null,
