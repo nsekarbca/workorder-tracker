@@ -1088,18 +1088,19 @@ td.not-started{color:#9aa3b2;background:#eceff3;opacity:.75;user-select:none;poi
         <label>Employee ID <input id="nu-employee-id"></label>
         <label>Email <input id="nu-email" type="email"></label>
         <label>Designation <input id="nu-designation"></label>
-        <label>Shift <select id="nu-shift"><option value="">(not set)</option>
-          <option>Day Shift (08:00 AM - 05:00 PM)</option><option>Day Shift (09:00 AM - 06:00 PM)</option>
-          <option>Mid Shift (03:30 PM - 12:30 AM)</option>
-          <option>Night Shift (05:30 PM - 02:30 AM)</option><option>Night Shift (06:30 PM - 03:30 AM)</option></select></label>
         <label>Project <select id="nu-project" onchange="populateReportingManagerDropdown(document.getElementById('nu-reporting-manager').value)"></select></label>
         <label>Department <select id="nu-department" onchange="populateSubDept('')"></select></label>
-        <div style="grid-column: span 1;"><span style="font-size:13px;">Sub department <span style="color:#888;">(tick one or more)</span></span>
-          <div id="nu-subdept" style="border:1px solid #ccd; border-radius:6px; padding:4px 8px; min-height:34px; background:#fff; font-size:13px;"></div></div>
+        <label>Sub department (Ctrl/Cmd-click for multiple)
+          <select id="nu-subdept" multiple size="4" onchange="populateReportingManagerDropdown(document.getElementById('nu-reporting-manager').value)"></select>
+        </label>
         <label><span id="nu-rm-label">Reporting Manager</span>
           <select id="nu-reporting-manager"></select>
           <span id="nu-rm-hint" style="font-size:11px; color:#667;"></span>
         </label>
+        <label>Shift <select id="nu-shift"><option value="">(not set)</option>
+          <option>Day Shift (08:00 AM - 05:00 PM)</option><option>Day Shift (09:00 AM - 06:00 PM)</option>
+          <option>Mid Shift (03:30 PM - 12:30 AM)</option>
+          <option>Night Shift (05:30 PM - 02:30 AM)</option><option>Night Shift (06:30 PM - 03:30 AM)</option></select></label>
         <label>Employment Status
           <select id="nu-employment-status">
             <option value="Active">Active</option>
@@ -7439,12 +7440,13 @@ function populateSubDept(sub) {
   const dep = document.getElementById("nu-department").value;
   const d = (orgOpts && orgOpts.departments.find(x => x.name === dep)) || null;
   const subs = d ? d.sub_departments : [], chosen = new Set(String(sub || "").split(",").map(x => x.trim()).filter(Boolean));
-  document.getElementById("nu-subdept").innerHTML = subs.length
-    ? subs.map(x => `<label style="display:inline-flex; gap:4px; align-items:center; margin:2px 10px 2px 0; font-weight:normal;"><input type="checkbox" class="nu-sub-chk" value="${_esc(x)}" ${chosen.has(x) ? "checked" : ""} onchange="populateReportingManagerDropdown(document.getElementById('nu-reporting-manager').value)"> ${_esc(x)}</label>`).join("")
-    : `<span style="color:#888;">${dep ? "(none for this department)" : "(choose a department first)"}</span>`;
+  const el = document.getElementById("nu-subdept");
+  el.innerHTML = subs.length ? subs.map(x => `<option value="${_esc(x)}" ${chosen.has(x) ? "selected" : ""}>${_esc(x)}</option>`).join("")
+    : `<option value="" disabled>${dep ? "(none for this department)" : "(choose a department first)"}</option>`;
+  el.disabled = !subs.length;
   populateReportingManagerDropdown(document.getElementById("nu-reporting-manager").value);
 }
-function getSubDepts() { return [...document.querySelectorAll(".nu-sub-chk:checked")].map(c => c.value).join(", "); }
+function getSubDepts() { return Array.from(document.getElementById("nu-subdept").selectedOptions).map(o => o.value).filter(Boolean).join(", "); }
 function onUserRoleChange() { populateReportingManagerDropdown(""); }
 
 function clearUserForm() {
