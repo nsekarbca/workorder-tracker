@@ -221,6 +221,9 @@ class User(Base):
     anniversary_date = Column(Date, nullable=True)
     designation = Column(String, nullable=True)
     reporting_manager = Column(String, nullable=True)
+    project = Column(String, nullable=True)           # EMHM / SOUND / ANES / Radiology
+    department = Column(String, nullable=True)        # Cash Management / Account Receivables / Coding / Provider Enrolment
+    sub_department = Column(String, nullable=True)    # depends on the department
     shift = Column(String, nullable=True)        # Day / Mid / Night shift with its timings (set by Super Admin)
     employment_status = Column(String, nullable=False, default="Active")  # "Active" or "Inactive"
 

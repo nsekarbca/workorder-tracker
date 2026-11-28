@@ -144,6 +144,9 @@ class UserOut(BaseModel):
     anniversary_date: Optional[date] = None
     designation: Optional[str] = None
     reporting_manager: Optional[str] = None
+    project: Optional[str] = None
+    department: Optional[str] = None
+    sub_department: Optional[str] = None
     shift: Optional[str] = None
     employment_status: str = "Active"
     must_change_password: bool = True
@@ -161,6 +164,7 @@ class LoginResponse(BaseModel):
     full_name: str
     must_change_password: bool
     processes: List[ProcessOut] = []
+    break_only: bool = False
 
 
 class ChangePasswordRequest(BaseModel):
@@ -198,6 +202,9 @@ class CreateUserRequest(BaseModel):
     anniversary_date: Optional[date] = None
     designation: Optional[str] = None
     reporting_manager: Optional[str] = None
+    project: Optional[str] = None
+    department: Optional[str] = None
+    sub_department: Optional[str] = None
     shift: Optional[str] = None
     employment_status: str = "Active"
     employee_id: Optional[str] = None

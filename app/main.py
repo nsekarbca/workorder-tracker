@@ -49,6 +49,9 @@ TEAM_FOR_CATEGORY = {
 }
 
 _ADDED_COLUMNS = [
+    ("users", "project", "VARCHAR"),
+    ("users", "department", "VARCHAR"),
+    ("users", "sub_department", "VARCHAR"),
     ("users", "last_login_date", "DATE"),
     ("work_orders", "onshore_status", "VARCHAR"),
     ("onshore_messages", "track", "VARCHAR"),
@@ -379,9 +382,37 @@ def bootstrap_and_seed():
         db.close()
 
 
+BREAK_ONLY_KEY = "break_only_rules"
+
+
+def _break_only_rules(db: Session) -> list:
+    try:
+        v = json.loads(_setting(db, BREAK_ONLY_KEY, "[]"))
+        return v if isinstance(v, list) else []
+    except ValueError:
+        return []
+
+
+def _is_break_only(db: Session, user: models.User) -> bool:
+    """True when this person's Project / Department is set up for the Break module only (Super Admin is never limited)."""
+    if user is None or user.role == "super_admin":
+        return False
+    for r in _break_only_rules(db):
+        pr, dp = (r.get("project") or ""), (r.get("department") or "")
+        if not pr and not dp:
+            continue
+        if (not pr or (user.project or "") == pr) and (not dp or (user.department or "") == dp):
+            return True
+    return False
+
+
 def _user_has_process(user: models.User, process_id: int) -> bool:
     if user.role == "super_admin":
         return True
+    from sqlalchemy.orm import object_session
+    _db = object_session(user)
+    if _db is not None and _is_break_only(_db, user):
+        return False          # Break-module-only projects / departments have no order processes
     return any(p.id == process_id for p in user.processes)
 
 
@@ -622,10 +653,14 @@ def login(
     processes = db.query(models.Process).all() if user.role in ("super_admin", "quality") else user.processes
     if user.role in TEAM_ROLES:
         processes = []          # these queues span every process; no process picker
+    break_only = _is_break_only(db, user)
+    if break_only:
+        processes = []          # Break module only: no orders / processes
     if user.role == "colleague":
-        user.last_login_date = _work_today()     # logged in today -> eligible for auto-assignment
+        if not break_only:
+            user.last_login_date = _work_today()     # logged in today -> eligible for auto-assignment
         db.commit()
-        _record_login_day(db, user.id)
+        _record_login_day(db, user.id)               # break tracking needs these even for Break-only people
         _open_session(db, user.id)
         for p in processes:
             _auto_assign_open_slots(db, p.id)
@@ -637,6 +672,7 @@ def login(
         "full_name": user.full_name,
         "must_change_password": user.must_change_password,
         "processes": processes,
+        "break_only": break_only,
     }
 
 @app.post("/auth/change-password")
@@ -891,7 +927,7 @@ def list_breaks(
     q = db.query(models.BreakLog).filter(models.BreakLog.started_at >= lo, models.BreakLog.started_at < hi)
     if current_user.role == "colleague":
         q = q.filter(models.BreakLog.user_id == current_user.id)
-    elif current_user.role == "team_lead":
+    elif current_user.role in ("team_lead", "manager", "admin") and (current_user.role != "admin" or current_user.project):
         ids = [u.id for u in _batch_visible_colleagues(db, current_user)]
         q = q.filter(models.BreakLog.user_id.in_(ids or [-1]))
     rows = q.order_by(models.BreakLog.started_at.desc()).limit(5000).all()
@@ -1200,6 +1236,22 @@ def _digest_rows(db: Session, users: list, day_: date) -> list:
     return out
 
 
+def _users_in_my_processes(recipient, users: list) -> list:
+    """Super Admin: everyone. Admin / Manager: only colleagues who work on a process the recipient belongs to."""
+    if recipient.role == "super_admin":
+        return list(users)
+    from sqlalchemy.orm import object_session
+    _db = object_session(recipient)
+    cond_users = users
+    if _db is not None:
+        vis = {u.id for u in _batch_visible_colleagues(_db, recipient)}      # their project / reporting line
+        cond_users = [u for u in users if u.id in vis]
+    mine = {p.id for p in recipient.processes}
+    if not mine:
+        return cond_users                                                       # e.g. a Break-only project: no processes to match
+    return [u for u in cond_users if mine & {p.id for p in u.processes}]
+
+
 def _fmt_m(m: int) -> str:
     return f"{m // 60}h {m % 60:02d}m" if m >= 60 else f"{m}m"
 
@@ -1253,7 +1305,10 @@ def run_exception_digest(db: Session, day_: date = None, only_to: str = None) ->
     if cfg["admins"] and all_rows:
         for a in db.query(models.User).filter(models.User.role.in_(["admin", "manager", "super_admin"]), models.User.employment_status != "Inactive").all():
             if a.email:
-                send(a.email, "Break Tracker exceptions - all teams", all_rows, True)
+                names = {u.full_name for u in _users_in_my_processes(a, colleagues)}
+                rows = [r for r in all_rows if r["employee"] in names]
+                if rows:
+                    send(a.email, "Break Tracker exceptions - " + ("all teams" if a.role == "super_admin" else "your processes"), rows, True)
     return res
 
 
@@ -2023,7 +2078,7 @@ def run_weekly_summary(db: Session, week_start: date = None, only_to: str = None
     if _setting(db, DIGEST_KEYS["admins"], "1") == "1":
         for a in db.query(models.User).filter(models.User.role.in_(["admin", "manager", "super_admin"]), models.User.employment_status != "Inactive").all():
             if a.email:
-                send(a.email, "Weekly break and attendance summary - all teams", colleagues, True)
+                send(a.email, "Weekly break and attendance summary - " + ("all teams" if a.role == "super_admin" else "your processes"), _users_in_my_processes(a, colleagues), True)
     return res
 
 
@@ -2398,12 +2453,12 @@ def _scope_label(user):
     return "your team" if user.role == "team_lead" else "all teams"
 
 
-def _mgmt_summary(db: Session, user: models.User, d1: date, d2: date, process_id: Optional[int] = None) -> dict:
+def _mgmt_summary(db: Session, user: models.User, d1: date, d2: date, process_id: Optional[int] = None, own_processes_only: bool = False) -> dict:
     """Production summary for a date range, limited to what this user may see (Team Lead: own team; Admin / Manager / Super Admin: everything)."""
     W, E = models.WorkOrder, models.EscalationEvent
     today = datetime.now(IST).date()
     warn, late = _sla_days(db)
-    scoped = _orders_dash_scope(db, user, process_id)
+    scoped = _orders_dash_scope(db, user, process_id, None, own_processes_only)
     procs = {p.id: p.name for p in db.query(models.Process).all()}
     rows = {}
     def row(pid):
@@ -2422,6 +2477,8 @@ def _mgmt_summary(db: Session, user: models.User, d1: date, d2: date, process_id
         eq = eq.filter(E.process_id == process_id)
     if user.role == "team_lead":
         eq = eq.filter(E.team_lead_id == user.id)
+    elif own_processes_only and user.role != "super_admin":
+        eq = eq.filter(E.process_id.in_([p.id for p in user.processes]) if user.processes else sa_false())
     for pid, rd, cd, _tl in eq.filter(or_(and_(E.raised_date >= d1, E.raised_date <= d2), and_(E.closed_date >= d1, E.closed_date <= d2))).all():
         if rd and d1 <= rd <= d2:
             row(pid)["raised"] += 1
@@ -2535,7 +2592,7 @@ def run_management_summary(db: Session, kind: str = "daily", only_to: str = None
         name = "Daily"
     res = {"kind": kind, "from": d1.isoformat(), "to": d2.isoformat(), "sent": 0, "failed": [], "skipped_no_email": [], "note": ""}
     def send(user, to, title):
-        s = _mgmt_summary(db, user, d1, d2)
+        s = _mgmt_summary(db, user, d1, d2, None, True)
         t = s["total"]
         if not any(t[k] for k in ("received", "completed", "to_production", "raised", "closed")) and not t["late"]:
             return False
@@ -2557,7 +2614,7 @@ def run_management_summary(db: Session, kind: str = "daily", only_to: str = None
     if _setting(db, DIGEST_KEYS["admins"], "1") == "1":
         for a in db.query(models.User).filter(models.User.role.in_(["admin", "manager", "super_admin"]), models.User.employment_status != "Inactive").all():
             if a.email:
-                send(a, a.email, f"{name} production summary - all teams")
+                send(a, a.email, f"{name} production summary - " + ("all teams" if a.role == "super_admin" else "your processes"))
     return res
 
 
@@ -4829,7 +4886,7 @@ def break_exceptions(
     if last < first:
         return {"month": first.strftime("%B %Y"), "rows": [], "summary": []}
     users = {u.id: u for u in _batch_visible_colleagues(db, current_user)}
-    ids = None if current_user.role in ("admin", "manager", "super_admin") else list(users)
+    ids = None if (current_user.role == "super_admin" or (current_user.role == "admin" and not current_user.project)) else list(users)
     days = _collect_days(db, ids, first, last)
     hol = _hol_set(db, first, last)
     if ids is None:
@@ -4875,6 +4932,7 @@ def break_exceptions(
 def _profile_row(u):
     return {"id": u.id, "full_name": u.full_name, "username": u.username, "role": u.role, "employee_id": u.employee_id or "", "email": u.email or "",
             "designation": u.designation or "", "shift": u.shift or "", "reporting_manager": u.reporting_manager or "",
+            "project": u.project or "", "department": u.department or "", "sub_department": u.sub_department or "",
             "doj": u.doj.isoformat() if u.doj else "", "dob": u.dob.isoformat() if u.dob else "",
             "anniversary_date": u.anniversary_date.isoformat() if u.anniversary_date else "",
             "employment_status": u.employment_status or "", "processes": [pr.name for pr in u.processes], "has_photo": bool(u.photo)}
@@ -4884,6 +4942,11 @@ def _profile_scope(db: Session, current_user):
     q = db.query(models.User)
     if current_user.role == "team_lead":
         q = q.filter(models.User.reporting_manager == current_user.full_name)      # a Team Lead sees their own team members
+    elif current_user.role == "manager":
+        tl_names = [n for (n,) in db.query(models.User.full_name).filter(models.User.role == "team_lead", models.User.reporting_manager == current_user.full_name).all()]
+        q = q.filter(or_(models.User.reporting_manager == current_user.full_name, models.User.reporting_manager.in_(tl_names or ["\0"])))   # their Team Leads and those Team Leads' colleagues
+    elif current_user.role == "admin" and current_user.project:
+        q = q.filter(or_(models.User.project == current_user.project, models.User.reporting_manager == current_user.full_name))   # an Admin sees their own project
     return q
 
 
@@ -4894,7 +4957,7 @@ def team_profiles(
 ):
     """Team Lead: the colleagues who report to them. Admin / Manager / Super Admin: every user. Read-only."""
     users = _profile_scope(db, current_user).order_by(models.User.full_name).all()
-    return {"scope": "team" if current_user.role == "team_lead" else "all", "users": [_profile_row(u) for u in users]}
+    return {"scope": "team" if current_user.role in ("team_lead", "manager") else "all", "users": [_profile_row(u) for u in users]}
 
 
 @app.get("/team/profiles/{user_id}/photo")
@@ -5064,6 +5127,74 @@ def _send_account_email(user: models.User, temp_password: str):
     return False, "the email server refused or could not be reached \u2014 see the Render logs"
 
 
+# ---- Organisation: projects, departments, sub-departments and the reporting chain ----
+ORG_PROJECTS = ["EMHM", "SOUND", "ANES", "Radiology"]
+ORG_DEPARTMENTS = {
+    "Cash Management": ["Payment Posting", "Bank Reconciliation", "Correspondence"],
+    "Account Receivables": ["NPNP", "Denial", "Calling", "Non-calling"],
+    "Coding": ["Denial Coding", "Coding"],
+    "Provider Enrolment": [],
+}
+# Who a person reports to: colleague -> Team Lead -> Manager -> Admin.
+REPORTS_TO_ROLE = {"colleague": "team_lead", "team_lead": "manager", "manager": "admin"}
+_ROLE_LABEL = {"team_lead": "Team Lead", "manager": "Manager", "admin": "Admin"}
+
+
+@app.get("/org/options")
+def org_options(current_user: models.User = Depends(auth.get_current_user)):
+    return {"projects": ORG_PROJECTS, "departments": [{"name": d, "sub_departments": subs} for d, subs in ORG_DEPARTMENTS.items()], "reports_to": REPORTS_TO_ROLE}
+
+
+@app.get("/org/break-only")
+def get_break_only(current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    return {"rules": _break_only_rules(db)}
+
+
+@app.put("/org/break-only")
+def set_break_only(payload: dict, current_user: models.User = Depends(auth.require_role("super_admin")), db: Session = Depends(get_db)):
+    """Projects / departments that only get the Break module (no orders, dashboards, escalations...). Blank = any."""
+    rules, seen = [], set()
+    for r in payload.get("rules") or []:
+        pr, dp = str(r.get("project") or "").strip(), str(r.get("department") or "").strip()
+        if not pr and not dp:
+            raise HTTPException(status_code=400, detail="Each rule needs a Project, a Department or both")
+        if pr and pr not in ORG_PROJECTS:
+            raise HTTPException(status_code=400, detail=f"Unknown project {pr}")
+        if dp and dp not in ORG_DEPARTMENTS:
+            raise HTTPException(status_code=400, detail=f"Unknown department {dp}")
+        if (pr, dp) not in seen:
+            seen.add((pr, dp)); rules.append({"project": pr, "department": dp})
+    _set_setting(db, BREAK_ONLY_KEY, json.dumps(rules))
+    _audit(db, current_user, "Setting", "Break-module-only access changed", None, None, "; ".join(f"{r['project'] or 'any project'} / {r['department'] or 'any department'}" for r in rules) or "no rules")
+    db.commit()
+    return {"rules": rules}
+
+
+def _validate_org(db: Session, payload, existing=None):
+    """Project / department / sub-department must come from the lists, and the reporting person must hold the next role up."""
+    proj = (payload.project or "").strip() or None
+    dept = (payload.department or "").strip() or None
+    sub = (payload.sub_department or "").strip() or None
+    if proj and proj not in ORG_PROJECTS:
+        raise HTTPException(status_code=400, detail="Project must be one of: " + ", ".join(ORG_PROJECTS))
+    if dept and dept not in ORG_DEPARTMENTS:
+        raise HTTPException(status_code=400, detail="Department must be one of: " + ", ".join(ORG_DEPARTMENTS))
+    if sub and not dept:
+        raise HTTPException(status_code=400, detail="Choose the Department before the Sub department")
+    if sub and sub not in ORG_DEPARTMENTS.get(dept, []):
+        raise HTTPException(status_code=400, detail=f"{dept} has no sub department '{sub}'" + (f" (choose: {', '.join(ORG_DEPARTMENTS[dept])})" if ORG_DEPARTMENTS.get(dept) else " - it has no sub departments"))
+    payload.project, payload.department, payload.sub_department = proj, dept, sub
+    need = REPORTS_TO_ROLE.get(payload.role)
+    rm = (payload.reporting_manager or "").strip() or None
+    payload.reporting_manager = rm
+    if rm and need and not (existing is not None and (existing.reporting_manager or "") == rm and existing.role == payload.role):
+        boss = db.query(models.User).filter(models.User.full_name == rm, models.User.role == need).first()
+        if not boss:
+            raise HTTPException(status_code=400, detail=f"A {payload.role.replace('_', ' ').title()} reports to a {_ROLE_LABEL[need]} - '{rm}' is not a {_ROLE_LABEL[need]}")
+    if payload.role in ("admin", "super_admin"):
+        payload.reporting_manager = None          # top of the chain
+
+
 @app.post("/users", response_model=schemas.CreateUserResponse)
 def create_user(
     payload: schemas.CreateUserRequest,
@@ -5079,6 +5210,7 @@ def create_user(
         raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', 'admin', 'manager', 'quality', 'onshore', 'recon', 'calling', or 'super_admin'")
     if db.query(models.User).filter(models.User.username == payload.username).first():
         raise HTTPException(status_code=400, detail="username already exists")
+    _validate_org(db, payload)
 
     temp_password = auth.generate_temp_password()
     user = models.User(
@@ -5093,6 +5225,7 @@ def create_user(
         anniversary_date=payload.anniversary_date,
         designation=payload.designation,
         reporting_manager=payload.reporting_manager,
+        project=payload.project, department=payload.department, sub_department=payload.sub_department,
         shift=_clean_shift(payload.shift),
         employment_status=payload.employment_status,
         employee_id=payload.employee_id,
@@ -5122,7 +5255,9 @@ def update_user(
     if payload.role not in ("colleague", "team_lead", "admin", "manager", "quality", "onshore", "recon", "calling", "super_admin"):
         raise HTTPException(status_code=400, detail="role must be 'colleague', 'team_lead', 'admin', 'manager', 'quality', 'onshore', 'recon', 'calling', or 'super_admin'")
 
+    _validate_org(db, payload, user)
     _before = {"name": user.full_name, "role": user.role, "email": user.email or "", "designation": user.designation or "", "Team Lead": user.reporting_manager or "",
+               "project": user.project or "", "department": user.department or "", "sub department": user.sub_department or "",
                "shift": user.shift or "", "status": user.employment_status, "employee id": user.employee_id or "", "processes": ", ".join(sorted(p.name for p in user.processes))}
     user.full_name = payload.full_name
     user.role = payload.role
@@ -5132,6 +5267,7 @@ def update_user(
     user.anniversary_date = payload.anniversary_date
     user.designation = payload.designation
     user.reporting_manager = payload.reporting_manager
+    user.project, user.department, user.sub_department = payload.project, payload.department, payload.sub_department
     user.shift = _clean_shift(payload.shift)
     if payload.employment_status == "Inactive" and user.id == current_user.id:
         raise HTTPException(status_code=400, detail="You cannot make your own profile Inactive")
@@ -5145,6 +5281,7 @@ def update_user(
     user.employee_id = payload.employee_id
     user.processes = db.query(models.Process).filter(models.Process.id.in_(payload.process_ids)).all()
     _after = {"name": user.full_name, "role": user.role, "email": user.email or "", "designation": user.designation or "", "Team Lead": user.reporting_manager or "",
+              "project": user.project or "", "department": user.department or "", "sub department": user.sub_department or "",
               "shift": user.shift or "", "status": user.employment_status, "employee id": user.employee_id or "", "processes": ", ".join(sorted(p.name for p in user.processes))}
     _diff = [f"{k}: {_before[k] or '-'} -> {_after[k] or '-'}" for k in _after if _before[k] != _after[k]]
     if _diff:
@@ -8331,7 +8468,7 @@ def _tl_condition(db: Session, team_lead_id: int):
     )
 
 
-def _orders_dash_scope(db: Session, user: models.User, process_id: Optional[int], team_lead_id: Optional[int] = None):
+def _orders_dash_scope(db: Session, user: models.User, process_id: Optional[int], team_lead_id: Optional[int] = None, own_processes_only: bool = False):
     """
     Returns a function that narrows a WorkOrder query to what this user may
     see on the Orders Dashboard:
@@ -8341,11 +8478,15 @@ def _orders_dash_scope(db: Session, user: models.User, process_id: Optional[int]
       * Team Lead -> only the processes they have access to
     """
     all_access = user.role in ("admin", "manager", "super_admin")
+    if own_processes_only and user.role != "super_admin":
+        all_access = False          # e-mails: an Admin / Manager only gets the processes they belong to
+    if _is_break_only(db, user):
+        all_access = False          # Break-module-only project / department: no order data
     if process_id is not None and not all_access:
         _require_process_access(user, process_id)
     cond = _team_orders_condition(db, user, include_unowned=True)   # None for admin / super_admin
     tl_cond = _tl_condition(db, team_lead_id) if (team_lead_id is not None and user.role in ("admin", "manager", "super_admin")) else None
-    my_process_ids = [p.id for p in user.processes]
+    my_process_ids = [] if _is_break_only(db, user) else [p.id for p in user.processes]
 
     def scoped(q):
         if process_id is not None:
@@ -8774,6 +8915,20 @@ def save_client_assignments(
     return _client_payload(db, [client])[0]
 
 
+def _org_scope_cond(db: Session, user: models.User):
+    """Which colleagues a Manager / Admin may see. Manager: their Team Leads' teams. Admin: their project (plus the managers
+    that report to them). An Admin with no Project set keeps seeing everyone (old behaviour). None = no restriction."""
+    U = models.User
+    if user.role == "manager":
+        tl = [n for (n,) in db.query(U.full_name).filter(U.role == "team_lead", U.reporting_manager == user.full_name).all()]
+        return or_(U.reporting_manager == user.full_name, U.reporting_manager.in_(tl or ["\0"]))
+    if user.role == "admin" and user.project:
+        mgrs = [n for (n,) in db.query(U.full_name).filter(U.role == "manager", U.reporting_manager == user.full_name).all()]
+        tl = [n for (n,) in db.query(U.full_name).filter(U.role == "team_lead", or_(U.reporting_manager.in_(mgrs or ["\0"]), U.project == user.project)).all()]
+        return or_(U.project == user.project, U.reporting_manager.in_(tl or ["\0"]))
+    return None
+
+
 def _batch_visible_colleagues(db: Session, current_user: models.User):
     """Colleagues whose dashboard rows this user may see."""
     q = db.query(models.User).filter(models.User.role == "colleague")
@@ -8781,7 +8936,10 @@ def _batch_visible_colleagues(db: Session, current_user: models.User):
         return q.filter(models.User.id == current_user.id).all()
     if current_user.role == "team_lead":
         return q.filter(models.User.reporting_manager == current_user.full_name).all()
-    return q.all()  # admin / super_admin: every team
+    if current_user.role in ("manager", "admin"):
+        cond = _org_scope_cond(db, current_user)
+        return (q.filter(cond) if cond is not None else q).all()
+    return q.all()  # super_admin: every team
 
 
 def _batch_aggregate(group: list) -> dict:
