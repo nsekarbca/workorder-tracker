@@ -1065,6 +1065,7 @@ td.not-started{color:#9aa3b2;background:#eceff3;opacity:.75;user-select:none;poi
         <button class="od-tab" id="admin-tab-cleanup-btn" onclick="adminSetTab('cleanup')" style="display:none;">Data clean-up</button>
         <button class="od-tab" id="admin-tab-syslog-btn" onclick="adminSetTab('syslog')" style="display:none;">System log</button>
         <button class="od-tab" id="admin-tab-health-btn" onclick="adminSetTab('health')" style="display:none;">System health</button>
+        <button class="od-tab" id="admin-tab-access-btn" onclick="adminSetTab('access')" style="display:none;">Module access</button>
       </div>
       <div id="admin-tab-users" class="fbar">
       <h3 id="user-form-heading">Create User</h3>
@@ -1072,7 +1073,7 @@ td.not-started{color:#9aa3b2;background:#eceff3;opacity:.75;user-select:none;poi
         <label>Username <input id="nu-username"></label>
         <label>Full Name <input id="nu-full-name"></label>
         <label>Role
-          <select id="nu-role">
+          <select id="nu-role" onchange="onUserRoleChange()">
             <option value="colleague">Colleague</option>
             <option value="team_lead">Team Lead</option>
             <option value="admin">Admin</option>
@@ -1091,9 +1092,12 @@ td.not-started{color:#9aa3b2;background:#eceff3;opacity:.75;user-select:none;poi
           <option>Day Shift (08:00 AM - 05:00 PM)</option><option>Day Shift (09:00 AM - 06:00 PM)</option>
           <option>Mid Shift (03:30 PM - 12:30 AM)</option>
           <option>Night Shift (05:30 PM - 02:30 AM)</option><option>Night Shift (06:30 PM - 03:30 AM)</option></select></label>
-        <label>Reporting Manager
+        <label><span id="nu-rm-label">Reporting Manager</span>
           <select id="nu-reporting-manager"></select>
         </label>
+        <label>Project <select id="nu-project"></select></label>
+        <label>Department <select id="nu-department" onchange="populateSubDept('')"></select></label>
+        <label>Sub department <select id="nu-subdept"></select></label>
         <label>Employment Status
           <select id="nu-employment-status">
             <option value="Active">Active</option>
@@ -1150,6 +1154,16 @@ td.not-started{color:#9aa3b2;background:#eceff3;opacity:.75;user-select:none;poi
         <h4 style="margin:16px 0 4px;">Saved backups</h4>
         <div id="bk-list" class="od-scroll"></div>
         <p style="font-size:12px; color:#666; max-width:640px; margin-top:12px;"><b>To restore:</b> close the application window, copy the backup file you want into the application folder, delete (or rename) the current <b>workorders.db</b>, rename the copy to <b>workorders.db</b>, and start the application again.</p>
+      </div>
+      <div id="admin-tab-access" class="fbar" style="display:none;">
+        <h3 style="margin-top:0;">Break module only</h3>
+        <p style="font-size:13px; color:#555; max-width:760px;">People in these projects / departments get <b>only the Break Tracker</b> (login, breaks, lock screen, their team's break reports). They do not see orders, dashboards, escalations or production. Leave Project or Department on "Any" to match all of them. Applies to Colleagues, Team Leads, Managers and Admins of that project / department; Super Admin is never limited. People who are already logged in see the change after their next login.</p>
+        <div style="display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap; margin-bottom:10px;">
+          <label>Project <select id="bo-project"></select></label>
+          <label>Department <select id="bo-dept"></select></label>
+          <button class="action-btn" onclick="boAdd()">+ Add rule</button>
+        </div>
+        <div id="bo-list"></div>
       </div>
       <div id="admin-tab-health" class="fbar" style="display:none;">
         <h3>System health <button class="action-btn" style="margin-left:10px;" onclick="loadHealth()">Refresh</button></h3>
@@ -1323,6 +1337,9 @@ td.not-started{color:#9aa3b2;background:#eceff3;opacity:.75;user-select:none;poi
       <label>Designation <input id="pf-designation" disabled></label>
       <label>Shift <input id="pf-shift" disabled></label>
       <label>Reporting Manager <input id="pf-manager" disabled></label>
+      <label>Project <input id="pf-project" disabled></label>
+      <label>Department <input id="pf-dept" disabled></label>
+      <label>Sub department <input id="pf-subdept" disabled></label>
       <label>Date of Joining <input id="pf-doj" type="date" disabled></label>
       <label>Processes <input id="pf-processes" disabled></label>
       <span></span>
@@ -4709,7 +4726,7 @@ async function login() {
   // a Manager gets every Admin option
   token = data.access_token; role = data.role === "manager" ? "admin" : data.role; fullName = data.full_name; myUserId = data.id;
   myProcesses = data.processes || [];
-  if (role === "admin") {
+  if (role === "admin" && !data.break_only) {
     // Admin can VIEW every process (read-only); importing still needs the process to be assigned.
     try {
       const pr = await fetch(API + "/processes/public");
@@ -5048,7 +5065,7 @@ function noProcessUser() {
 function applyProcessMenu() {
   if (noProcessUser()) {
     document.querySelectorAll("#nav-menu .nav-menu-item").forEach(e => {
-      if (!e.classList.contains("nav-sub-item") && e.id !== "nav-break-group-btn") e.style.display = "none";
+      if (!e.classList.contains("nav-sub-item") && e.id !== "nav-break-group-btn" && e.id !== "nav-teamprof-btn") e.style.display = "none";
     });
     ["import-btn","run-assign-btn","clear-data-btn","production-btn","share-btn","submit-day-btn","active-tl-label"].forEach(id => { const e = document.getElementById(id); if (e) e.style.display = "none"; });
     return;
@@ -5116,7 +5133,7 @@ async function openProfileModal() {
   const set = (id, v) => { document.getElementById(id).value = v || ""; };
   set("pf-name", u.full_name); set("pf-username", u.username); set("pf-role", (u.role || "").replace("_", " "));
   set("pf-employee-id", u.employee_id); set("pf-email", u.email); set("pf-designation", u.designation);
-  set("pf-manager", u.reporting_manager); set("pf-shift", u.shift); set("pf-doj", u.doj);
+  set("pf-manager", u.reporting_manager); set("pf-project", u.project); set("pf-dept", u.department); set("pf-subdept", u.sub_department); set("pf-shift", u.shift); set("pf-doj", u.doj);
   set("pf-processes", (u.processes || []).map(p => p.name).join(", "));
   set("pf-dob", u.dob); set("pf-anniversary", u.anniversary_date);
   document.getElementById("pf-dob").max = _isoLocalDate(new Date());
@@ -5137,9 +5154,9 @@ async function openTeamProfiles() {
 }
 function tpRender() {
   const q = document.getElementById("tp-q").value.trim().toLowerCase();
-  const us = tpData.users.filter(u => !q || [u.full_name, u.username, u.employee_id, u.reporting_manager, u.designation, u.role, (u.processes || []).join(" ")].join(" ").toLowerCase().includes(q));
-  document.getElementById("tp-list").innerHTML = us.length ? `<table><thead><tr><th>Name</th><th>Employee ID</th><th>Role</th><th>Designation</th><th>Reporting Manager</th><th>Shift</th><th>Processes</th><th>Status</th></tr></thead><tbody>` +
-    us.map(u => `<tr style="cursor:pointer;" onclick="tpShow(${u.id})"><td><b>${_esc(u.full_name)}</b></td><td>${_esc(u.employee_id)}</td><td>${_esc((u.role || "").replace("_", " "))}</td><td>${_esc(u.designation)}</td><td>${_esc(u.reporting_manager) || '<span style="color:#aaa;">&mdash;</span>'}</td><td>${_esc(u.shift)}</td><td>${_esc((u.processes || []).join(", "))}</td><td>${_esc(u.employment_status)}</td></tr>`).join("") + `</tbody></table>`
+  const us = tpData.users.filter(u => !q || [u.full_name, u.username, u.employee_id, u.reporting_manager, u.project, u.department, u.sub_department, u.designation, u.role, (u.processes || []).join(" ")].join(" ").toLowerCase().includes(q));
+  document.getElementById("tp-list").innerHTML = us.length ? `<table><thead><tr><th>Name</th><th>Employee ID</th><th>Role</th><th>Designation</th><th>Project</th><th>Department</th><th>Reporting Manager</th><th>Shift</th><th>Processes</th><th>Status</th></tr></thead><tbody>` +
+    us.map(u => `<tr style="cursor:pointer;" onclick="tpShow(${u.id})"><td><b>${_esc(u.full_name)}</b></td><td>${_esc(u.employee_id)}</td><td>${_esc((u.role || "").replace("_", " "))}</td><td>${_esc(u.designation)}</td><td>${_esc(u.project)}</td><td>${_esc(u.department + (u.sub_department ? " / " + u.sub_department : ""))}</td><td>${_esc(u.reporting_manager) || '<span style="color:#aaa;">&mdash;</span>'}</td><td>${_esc(u.shift)}</td><td>${_esc((u.processes || []).join(", "))}</td><td>${_esc(u.employment_status)}</td></tr>`).join("") + `</tbody></table>`
     : `<div style="color:#777; padding:12px;">${tpData.scope === "team" ? "No team members report to you yet. A colleague appears here when their Reporting Manager is set to your name." : "No users match."}</div>`;
 }
 async function tpShow(id) {
@@ -5150,7 +5167,7 @@ async function tpShow(id) {
     <div id="tp-photo" style="width:72px; height:72px; border-radius:50%; background:#c9d2e3 center/cover no-repeat; display:flex; align-items:center; justify-content:center; font-size:24px; font-weight:700; color:#0b2545; flex:none;"></div>
     <div style="flex:1; min-width:260px; display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); gap:8px 16px;">
       ${f("Name", u.full_name)}${f("Username", u.username)}${f("Employee ID", u.employee_id)}${f("Role", (u.role || "").replace("_", " "))}
-      ${f("Designation", u.designation)}${f("Reporting Manager", u.reporting_manager)}${f("Email", u.email)}${f("Shift", u.shift)}
+      ${f("Designation", u.designation)}${f("Reporting Manager", u.reporting_manager)}${f("Project", u.project)}${f("Department", u.department)}${f("Sub department", u.sub_department)}${f("Email", u.email)}${f("Shift", u.shift)}
       ${f("Date of Joining", u.doj)}${f("Date of Birth", u.dob)}${f("Anniversary Date", u.anniversary_date)}${f("Status", u.employment_status)}
       ${f("Processes", (u.processes || []).join(", "))}</div></div>`;
   _setPhotoBox(document.getElementById("tp-photo"), "", u.full_name);
@@ -5625,7 +5642,7 @@ let clientSel = new Set();
 let clientEditId = null;
 
 function adminSetTab(tab) {
-  ["users", "processes", "session", "bday", "clients", "backup", "cleanup", "syslog", "health"].forEach(t => {
+  ["users", "processes", "session", "bday", "clients", "backup", "cleanup", "syslog", "health", "access"].forEach(t => {
     document.getElementById("admin-tab-" + t).style.display = tab === t ? "block" : "none";
     document.getElementById("admin-tab-" + t + "-btn").classList.toggle("active", tab === t);
   });
@@ -5633,6 +5650,7 @@ function adminSetTab(tab) {
   if (tab === "backup") loadBackup();
   if (tab === "cleanup") loadCleanup();
   if (tab === "health") loadHealth();
+  if (tab === "access") loadBreakOnly();
   if (tab === "syslog") { const d = document.getElementById("sl-day"); if (d && !d.value) d.value = new Date(Date.now() + 19800000).toISOString().slice(0, 10); loadSysLog(); }
 }
 
@@ -7312,7 +7330,7 @@ async function showAdminView() {
     document.getElementById("session-timeout-input").value = data.minutes;
   }
   loadBreakIdleInput(); loadDigest();
-  { const sa = role === "super_admin"; ["sa-sla-settings"].forEach(i => { const e = document.getElementById(i); if (e) e.style.display = sa ? "" : "none"; }); const bb = document.getElementById("admin-tab-backup-btn"); if (bb) bb.style.display = sa ? "" : "none"; const cb = document.getElementById("admin-tab-cleanup-btn"); if (cb) cb.style.display = sa ? "" : "none"; const sl = document.getElementById("admin-tab-syslog-btn"); if (sl) sl.style.display = sa ? "" : "none"; { const hb = document.getElementById("admin-tab-health-btn"); if (hb) hb.style.display = sa ? "" : "none"; } if (sa) { loadSla(); loadMgmt(); } }
+  { const sa = role === "super_admin"; ["sa-sla-settings"].forEach(i => { const e = document.getElementById(i); if (e) e.style.display = sa ? "" : "none"; }); const bb = document.getElementById("admin-tab-backup-btn"); if (bb) bb.style.display = sa ? "" : "none"; const cb = document.getElementById("admin-tab-cleanup-btn"); if (cb) cb.style.display = sa ? "" : "none"; const sl = document.getElementById("admin-tab-syslog-btn"); if (sl) sl.style.display = sa ? "" : "none"; { const hb = document.getElementById("admin-tab-health-btn"); if (hb) hb.style.display = sa ? "" : "none"; const ab = document.getElementById("admin-tab-access-btn"); if (ab) ab.style.display = sa ? "" : "none"; } if (sa) { loadSla(); loadMgmt(); } }
 
   const bdRes = await authFetch("/settings/business-day");
   if (bdRes.ok) {
@@ -7321,7 +7339,7 @@ async function showAdminView() {
   }
 
   await loadUserList();
-  populateReportingManagerDropdown();
+  if (!editingUserId) { populateReportingManagerDropdown(); fillOrgSelects("", "", ""); } else populateReportingManagerDropdown(document.getElementById("nu-reporting-manager").value);
 }
 
 async function saveBusinessDay() {
@@ -7366,9 +7384,9 @@ async function loadUserList() {
   const res = await authFetch("/users");
   if (!res.ok) return;
   allUsers = await res.json();
-  let html = '<div class="od-scroll"><table><thead><tr><th>Full Name</th><th>Username</th><th>Role</th><th>Email</th><th>Status</th><th>Processes</th><th>Action</th></tr></thead><tbody>';
+  let html = '<div class="od-scroll"><table><thead><tr><th>Full Name</th><th>Username</th><th>Role</th><th>Reports to</th><th>Project</th><th>Department</th><th>Sub department</th><th>Email</th><th>Status</th><th>Processes</th><th>Action</th></tr></thead><tbody>';
   allUsers.forEach(u => {
-    html += `<tr><td>${u.full_name}</td><td>${u.username}</td><td>${u.role}</td><td>${u.email || ""}</td><td>${u.employment_status}</td><td>${u.processes.map(p=>p.name).join(", ")}</td>`;
+    html += `<tr><td>${u.full_name}</td><td>${u.username}</td><td>${u.role}</td><td>${_esc(u.reporting_manager || "")}</td><td>${_esc(u.project || "")}</td><td>${_esc(u.department || "")}</td><td>${_esc(u.sub_department || "")}</td><td>${u.email || ""}</td><td>${u.employment_status}</td><td>${u.processes.map(p=>p.name).join(", ")}</td>`;
     html += `<td>
       <button class="action-btn" onclick="editUser(${u.id})">Edit</button>
       <button class="action-btn" onclick="resetUserPassword(${u.id})">Reset Password</button>
@@ -7378,10 +7396,58 @@ async function loadUserList() {
   document.getElementById("user-list").innerHTML = html;
 }
 
+let boRules = [];
+async function loadBreakOnly() {
+  const o = await loadOrgOptions();
+  document.getElementById("bo-project").innerHTML = '<option value="">Any</option>' + o.projects.map(p => `<option>${_esc(p)}</option>`).join("");
+  document.getElementById("bo-dept").innerHTML = '<option value="">Any</option>' + o.departments.map(d => `<option>${_esc(d.name)}</option>`).join("");
+  const r = await authFetch("/org/break-only"); if (!r.ok) return; boRules = (await r.json()).rules; boRender();
+}
+function boRender() {
+  document.getElementById("bo-list").innerHTML = boRules.length ? `<table><thead><tr><th>Project</th><th>Department</th><th>Gets</th><th></th></tr></thead><tbody>` +
+    boRules.map((r, i) => `<tr><td>${_esc(r.project || "Any")}</td><td>${_esc(r.department || "Any")}</td><td>Break Tracker only</td><td><button class="action-btn" style="background:var(--red);" onclick="boDel(${i})">Remove</button></td></tr>`).join("") + `</tbody></table>`
+    : '<div style="color:#777;">No rules - everyone gets every module they are assigned.</div>';
+}
+async function boSave() {
+  const r = await authFetch("/org/break-only", {method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify({rules: boRules})});
+  if (!r.ok) { alert(await _errText(r)); loadBreakOnly(); return; }
+  boRules = (await r.json()).rules; boRender();
+}
+function boAdd() {
+  const project = document.getElementById("bo-project").value, department = document.getElementById("bo-dept").value;
+  if (!project && !department) { alert("Choose a Project, a Department or both."); return; }
+  boRules.push({project, department}); boSave();
+}
+function boDel(i) { if (!confirm("Remove this rule? These people will get all their modules back at their next login.")) return; boRules.splice(i, 1); boSave(); }
+
+let orgOpts = null;
+async function loadOrgOptions() {
+  if (orgOpts) return orgOpts;
+  try { const r = await authFetch("/org/options"); if (r.ok) orgOpts = await r.json(); } catch (e) {}
+  return orgOpts || {projects: [], departments: [], reports_to: {}};
+}
+async function fillOrgSelects(proj, dept, sub) {
+  const o = await loadOrgOptions();
+  const opt = (v, cur) => `<option value="${_esc(v)}" ${v === cur ? "selected" : ""}>${_esc(v)}</option>`;
+  document.getElementById("nu-project").innerHTML = '<option value="">(not set)</option>' + o.projects.map(p => opt(p, proj)).join("");
+  document.getElementById("nu-department").innerHTML = '<option value="">(not set)</option>' + o.departments.map(d => opt(d.name, dept)).join("");
+  populateSubDept(sub || "");
+}
+function populateSubDept(sub) {
+  const dep = document.getElementById("nu-department").value;
+  const d = (orgOpts && orgOpts.departments.find(x => x.name === dep)) || null;
+  const sel = document.getElementById("nu-subdept");
+  const subs = d ? d.sub_departments : [];
+  sel.innerHTML = (subs.length ? '<option value="">(not set)</option>' : '<option value="">' + (dep ? "(none for this department)" : "(choose a department first)") + '</option>') + subs.map(x => `<option value="${_esc(x)}" ${x === sub ? "selected" : ""}>${_esc(x)}</option>`).join("");
+  sel.disabled = !subs.length;
+}
+function onUserRoleChange() { populateReportingManagerDropdown(""); }
+
 function clearUserForm() {
   ["nu-username","nu-full-name","nu-employee-id","nu-email","nu-designation",
    "nu-reporting-manager","nu-shift","nu-dob","nu-doj","nu-anniversary"].forEach(id => document.getElementById(id).value = "");
   document.getElementById("nu-role").value = "colleague";
+  fillOrgSelects("", "", ""); populateReportingManagerDropdown("");
   document.getElementById("nu-employment-status").value = "Active";
   Array.from(document.getElementById("nu-processes").options).forEach(o => o.selected = false);
 }
@@ -7399,6 +7465,7 @@ function editUser(userId) {
   document.getElementById("nu-designation").value = u.designation || "";
   document.getElementById("nu-shift").value = u.shift || "";
   populateReportingManagerDropdown(u.reporting_manager || "");
+  fillOrgSelects(u.project || "", u.department || "", u.sub_department || "");
   document.getElementById("nu-employment-status").value = u.employment_status;
   document.getElementById("nu-dob").value = u.dob || "";
   document.getElementById("nu-doj").value = u.doj || "";
@@ -7413,19 +7480,23 @@ function editUser(userId) {
   document.getElementById("user-form-heading").scrollIntoView({behavior: "smooth"});
 }
 
-  function populateReportingManagerDropdown(selectedName) {
-  const sel = document.getElementById("nu-reporting-manager");
-  const names = new Set(allUsers.filter(u => u.role === "team_lead").map(u => u.full_name));
-  if (selectedName) names.add(selectedName); // keep an existing value visible even if that person is no longer a team lead
-  sel.innerHTML = '<option value="">\u2014 None \u2014</option>';
-  Array.from(names).sort().forEach(name => {
-    const opt = document.createElement("option");
-    opt.value = name; opt.textContent = name;
-    if (name === selectedName) opt.selected = true;
-    sel.appendChild(opt);
-  });
+function populateReportingManagerDropdown(selectedName) {
+  // Colleague -> Team Lead, Team Lead -> Manager, Manager -> Admin. Admin / Super Admin are at the top.
+  const sel = document.getElementById("nu-reporting-manager"), role = document.getElementById("nu-role").value;
+  const need = {colleague: "team_lead", team_lead: "manager", manager: "admin"}[role];
+  const label = {team_lead: "Team Lead", manager: "Manager", admin: "Admin"};
+  const lab = document.getElementById("nu-rm-label");
+  if (role === "admin" || role === "super_admin") {
+    sel.innerHTML = '<option value="">\u2014 not applicable \u2014</option>'; sel.disabled = true; if (lab) lab.textContent = "Reports to"; return;
+  }
+  sel.disabled = false;
+  const src = need || "team_lead";           // Quality / Onshore / Recon / Calling keep the Team Lead list
+  if (lab) lab.textContent = "Reports to (" + label[src] + ")";
+  const names = new Set(allUsers.filter(u => u.role === src && u.employment_status !== "Inactive").map(u => u.full_name));
+  if (selectedName) names.add(selectedName);
+  sel.innerHTML = '<option value="">\u2014 None \u2014</option>' + Array.from(names).sort().map(n => `<option value="${_esc(n)}" ${n === selectedName ? "selected" : ""}>${_esc(n)}</option>`).join("");
 }
-  
+
 function cancelEditUser() {
   editingUserId = null;
   document.getElementById("nu-username").disabled = false;
@@ -7445,6 +7516,9 @@ async function saveUser() {
     designation: document.getElementById("nu-designation").value || null,
     shift: document.getElementById("nu-shift").value || null,
     reporting_manager: document.getElementById("nu-reporting-manager").value || null,
+    project: document.getElementById("nu-project").value || null,
+    department: document.getElementById("nu-department").value || null,
+    sub_department: document.getElementById("nu-subdept").value || null,
     employment_status: document.getElementById("nu-employment-status").value,
     dob: document.getElementById("nu-dob").value || null,
     doj: document.getElementById("nu-doj").value || null,
