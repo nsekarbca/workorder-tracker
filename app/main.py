@@ -5174,15 +5174,21 @@ def _validate_org(db: Session, payload, existing=None):
     """Project / department / sub-department must come from the lists, and the reporting person must hold the next role up."""
     proj = (payload.project or "").strip() or None
     dept = (payload.department or "").strip() or None
-    sub = (payload.sub_department or "").strip() or None
+    subs = []
+    for x in (payload.sub_department or "").split(","):          # several sub departments are saved as "A, B"
+        x = x.strip()
+        if x and x not in subs:
+            subs.append(x)
     if proj and proj not in ORG_PROJECTS:
         raise HTTPException(status_code=400, detail="Project must be one of: " + ", ".join(ORG_PROJECTS))
     if dept and dept not in ORG_DEPARTMENTS:
         raise HTTPException(status_code=400, detail="Department must be one of: " + ", ".join(ORG_DEPARTMENTS))
-    if sub and not dept:
+    if subs and not dept:
         raise HTTPException(status_code=400, detail="Choose the Department before the Sub department")
-    if sub and sub not in ORG_DEPARTMENTS.get(dept, []):
-        raise HTTPException(status_code=400, detail=f"{dept} has no sub department '{sub}'" + (f" (choose: {', '.join(ORG_DEPARTMENTS[dept])})" if ORG_DEPARTMENTS.get(dept) else " - it has no sub departments"))
+    for x in subs:
+        if x not in ORG_DEPARTMENTS.get(dept, []):
+            raise HTTPException(status_code=400, detail=f"{dept} has no sub department '{x}'" + (f" (choose from: {', '.join(ORG_DEPARTMENTS[dept])})" if ORG_DEPARTMENTS.get(dept) else " - it has no sub departments"))
+    sub = ", ".join(subs) or None
     payload.project, payload.department, payload.sub_department = proj, dept, sub
     need = REPORTS_TO_ROLE.get(payload.role)
     rm = (payload.reporting_manager or "").strip() or None
